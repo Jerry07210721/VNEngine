@@ -55,9 +55,12 @@ class VNGameRuntime:
         self._choice_targets: list[int | str] = []
         self._menu_bg: pygame.Surface | None = None
         self._menu_bg_path: str = ""
+        self._menu_video_path: str = ""
+        self._menu_video_loop: bool = False
         self._menu_bgm_path: str | None = None
         self._menu_bgm_loop: bool = True
         self._menu_title = "VNEngine"
+        self._menu_overlay_alpha: int = 0
         self.dialogues = self._load_dialogues()
         self.current_index = 0
         self.current_visible_len = 0
@@ -314,8 +317,14 @@ class VNGameRuntime:
     def _apply_menu_config(self, cfg: dict):
         self._menu_title = cfg.get("menu_title") or (self.project_path.stem if self.project_path else "VNEngine")
         self._menu_bg_path = cfg.get("menu_background") or ""
+        self._menu_video_path = cfg.get("menu_video") or ""
+        self._menu_video_loop = bool(cfg.get("menu_video_loop", False))
         self._menu_bgm_path = cfg.get("menu_bgm") or None
         self._menu_bgm_loop = bool(cfg.get("menu_bgm_loop", True))
+        try:
+            self._menu_overlay_alpha = max(0, min(255, int(cfg.get("menu_overlay_alpha", 0))))
+        except Exception:
+            self._menu_overlay_alpha = 0
 
     def _enter_menu(self):
         self.mode = "menu"
@@ -327,6 +336,7 @@ class VNGameRuntime:
         self._overlay_return_mode = None
         self._menu_selected = 0
         self._stop_voice_playback()
+        self._stop_video()
         # stop current bgm before menu bgm
         try:
             if pygame.mixer.get_init():
@@ -476,6 +486,21 @@ class VNGameRuntime:
                 bgm_path = str(p)
                 break
         self._menu_bgm_path = bgm_path
+
+        candidates_video: list[str] = []
+        if self._menu_video_path:
+            candidates_video.append(self._menu_video_path)
+        candidates_video.extend([
+            "resources/videos/menu.mp4",
+            "resources/videos/title.mp4",
+        ])
+        video_path = None
+        for rel in candidates_video:
+            p = self._resolve_path(rel)
+            if p.exists():
+                video_path = str(p)
+                break
+        self._menu_video_path = video_path or ""
 
     def start_game(self):
         """启动游戏（进入事件循环）"""
@@ -823,16 +848,28 @@ class VNGameRuntime:
         self.render_surface.blit(overlay, (0, 0))
 
     def _render_menu(self, dt: float):
-        # background
-        if self._menu_bg:
-            self.render_surface.blit(self._menu_bg, (0, 0))
+        # background (video > image > solid)
+        if self._menu_video_path:
+            self._update_video(self._menu_video_path, self._menu_video_loop, dt)
+            if self._video_surface is not None:
+                self.render_surface.blit(self._video_surface, (0, 0))
+            elif self._menu_bg:
+                self.render_surface.blit(self._menu_bg, (0, 0))
+            else:
+                self.render_surface.fill((20, 24, 30))
         else:
-            self.render_surface.fill((20, 24, 30))
+            if self._video_clip:
+                self._stop_video()
+            if self._menu_bg:
+                self.render_surface.blit(self._menu_bg, (0, 0))
+            else:
+                self.render_surface.fill((20, 24, 30))
 
-        # dim overlay
-        overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 120))
-        self.render_surface.blit(overlay, (0, 0))
+        # optional dim overlay
+        if self._menu_overlay_alpha > 0:
+            overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, self._menu_overlay_alpha))
+            self.render_surface.blit(overlay, (0, 0))
 
         title = self._menu_title or (self.project_path.stem if self.project_path else "VNEngine")
         title_surf = self.name_font.render(title, True, (240, 240, 255))

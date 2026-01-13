@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QFormLayout,
     QLineEdit,
+    QSpinBox,
     QPushButton,
     QHBoxLayout,
     QMessageBox,
@@ -37,6 +38,19 @@ class MainMenuDesigner(QDialog):
         bg_row = self._make_file_row(self.bg_edit, self._pick_bg, True)
         form.addRow("背景图", bg_row)
 
+        self.video_edit = QLineEdit(data.get("menu_video", ""))
+        video_row = self._make_file_row(self.video_edit, self._pick_video, True)
+        form.addRow("背景视频", video_row)
+
+        self.video_loop_chk = QCheckBox("视频循环播放")
+        self.video_loop_chk.setChecked(data.get("menu_video_loop", False))
+        form.addRow("", self.video_loop_chk)
+
+        self.overlay_alpha = QSpinBox()
+        self.overlay_alpha.setRange(0, 255)
+        self.overlay_alpha.setValue(int(data.get("menu_overlay_alpha", 0)))
+        form.addRow("遮罩透明度 (0-255)", self.overlay_alpha)
+
         self.bgm_edit = QLineEdit(data.get("menu_bgm", ""))
         bgm_row = self._make_file_row(self.bgm_edit, self._pick_bgm, True)
         form.addRow("BGM", bgm_row)
@@ -47,7 +61,7 @@ class MainMenuDesigner(QDialog):
 
         layout.addLayout(form)
 
-        hint = QLabel("说明：选择的背景/BGM 会复制到工程目录 (resources/images / resources/audios)。")
+        hint = QLabel("说明：选择的背景/视频/BGM 会复制到工程目录 (resources/images / resources/videos / resources/audios)。遮罩透明度 0 表示不加深背景，255 为全黑。")
         layout.addWidget(hint)
 
         btn_row = QHBoxLayout()
@@ -88,6 +102,13 @@ class MainMenuDesigner(QDialog):
         stored = self._store_into_project(path, "resources/audios")
         self.bgm_edit.setText(stored)
 
+    def _pick_video(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择视频", str(self.project_dir or ""), "视频 (*.mp4 *.mov *.mkv *.avi)")
+        if not path:
+            return
+        stored = self._store_into_project(path, "resources/videos")
+        self.video_edit.setText(stored)
+
     def _store_into_project(self, src_path: str, subfolder: str) -> str:
         if not src_path:
             return ""
@@ -112,6 +133,9 @@ class MainMenuDesigner(QDialog):
         cfg = self.project_manager.project_data.setdefault("game_config", {}) if self.project_manager else {}
         cfg["menu_title"] = self.title_edit.text()
         cfg["menu_background"] = self.bg_edit.text()
+        cfg["menu_video"] = self.video_edit.text()
+        cfg["menu_video_loop"] = self.video_loop_chk.isChecked()
+        cfg["menu_overlay_alpha"] = int(self.overlay_alpha.value())
         cfg["menu_bgm"] = self.bgm_edit.text()
         cfg["menu_bgm_loop"] = self.bgm_loop_chk.isChecked()
         QMessageBox.information(self, "已保存", "主菜单配置已写入工程，保存工程文件后生效。")

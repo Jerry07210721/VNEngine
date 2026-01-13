@@ -27,6 +27,9 @@ class VNProjectManager:
                 "menu_background": "",
                 "menu_bgm": "",
                 "menu_bgm_loop": True,
+                "menu_video": "",
+                "menu_video_loop": False,
+                    "menu_overlay_alpha": 0,
             },
             "resources": {
                 "images": [],
