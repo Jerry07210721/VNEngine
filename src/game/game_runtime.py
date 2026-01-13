@@ -34,6 +34,9 @@ class VNGameRuntime:
         self.text_margin = 24
         self.text_area = None
         self.name_area = None
+        self._portrait_cache = {}
+        self._portrait_scaled_cache = {}
+        self.portrait_scale = 1.0
         self._ui_layout_cache: dict[Path, dict] = {}
         self._active_ui_layout: dict | None = None
         self._apply_window_size(self.window_size)
@@ -61,6 +64,13 @@ class VNGameRuntime:
         self._menu_bgm_loop: bool = True
         self._menu_title = "VNEngine"
         self._menu_overlay_alpha: int = 0
+        self._menu_title_pos: tuple[int, int] = (60, 60)
+        self._menu_title_color: tuple[int, int, int] = (240, 240, 255)
+        self._menu_option_pos: tuple[int, int] = (80, 140)
+        self._menu_option_color: tuple[int, int, int] = (255, 255, 255)
+        self._menu_title_image_path: str = ""
+        self._menu_title_image_surface: pygame.Surface | None = None
+        self._menu_title_image_pos: tuple[int, int] = (400, 80)
         self.dialogues = self._load_dialogues()
         self.current_index = 0
         self.current_visible_len = 0
@@ -70,7 +80,6 @@ class VNGameRuntime:
         self._sub_index = 0
         self._bg_cache = {}
         self._current_bg_path = None
-        self._portrait_cache = {}
         self._portrait_surface = None
         self._portrait_target_surface = None
         self._portrait_current_path = None
@@ -123,6 +132,8 @@ class VNGameRuntime:
         self._menu_selected = 0
         self._history: list[dict] = []
         self._history_overlay: bool = False
+        self._splash_time: float = 2.5
+        self._splash_elapsed: float = 0.0
 
     def _load_dialogues(self):
         """Load dialogues from project flow_nodes (YAML), else fallback samples."""
@@ -325,6 +336,12 @@ class VNGameRuntime:
             self._menu_overlay_alpha = max(0, min(255, int(cfg.get("menu_overlay_alpha", 0))))
         except Exception:
             self._menu_overlay_alpha = 0
+        self._menu_title_pos = self._pair_from_cfg(cfg.get("menu_title_pos"), (60, 60))
+        self._menu_option_pos = self._pair_from_cfg(cfg.get("menu_option_pos"), (80, 140))
+        self._menu_title_color = self._color_from_cfg(cfg.get("menu_title_color"), (240, 240, 255))
+        self._menu_option_color = self._color_from_cfg(cfg.get("menu_option_color"), (255, 255, 255))
+        self._menu_title_image_path = cfg.get("menu_title_image") or ""
+        self._menu_title_image_pos = self._pair_from_cfg(cfg.get("menu_title_image_pos"), (400, 80))
 
     def _enter_menu(self):
         self.mode = "menu"
@@ -356,6 +373,7 @@ class VNGameRuntime:
         self._choice_overlay = False
         self._history = []
         self._history_overlay = False
+        self._stop_bgm()
         self._stop_video()
         self._init_variables_from_defs()
         self.fast_skip = False
@@ -502,11 +520,58 @@ class VNGameRuntime:
                 break
         self._menu_video_path = video_path or ""
 
+        # title image
+        self._menu_title_image_surface = None
+        img_path = None
+        if self._menu_title_image_path:
+            img_path = self._resolve_path(self._menu_title_image_path)
+        if img_path and img_path.exists():
+            try:
+                self._menu_title_image_surface = pygame.image.load(str(img_path)).convert_alpha()
+            except Exception:
+                self._menu_title_image_surface = None
+
+    def _preload_menu_media(self):
+        """预加载主菜单媒体，避免进入时黑屏或卡顿。"""
+        self._load_menu_assets()
+        # 预取视频首帧
+        if self._menu_video_path:
+            self._video_time = 0.0
+            self._update_video(self._menu_video_path, self._menu_video_loop, 0.0)
+        # 预加载BGM到缓冲（不播放）
+        if self._menu_bgm_path:
+            try:
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init()
+                pygame.mixer.music.load(self._menu_bgm_path)
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+
+    def _start_splash(self):
+        self.mode = "splash"
+        self._splash_elapsed = 0.0
+        self._preload_menu_media()
+
+    def _render_splash(self, dt: float):
+        self._splash_elapsed += dt
+        self.render_surface.fill((16, 18, 26))
+        title = "VNEngine"
+        sub = "Loading..."
+        title_surf = self.name_font.render(title, True, (220, 230, 255))
+        sub_surf = self.font.render(sub, True, (200, 200, 200))
+        cx = self.render_size[0] // 2
+        cy = self.render_size[1] // 2
+        self.render_surface.blit(title_surf, (cx - title_surf.get_width() // 2, cy - title_surf.get_height()))
+        self.render_surface.blit(sub_surf, (cx - sub_surf.get_width() // 2, cy + 12))
+        if self._splash_elapsed >= self._splash_time:
+            self._enter_menu()
+
     def start_game(self):
         """启动游戏（进入事件循环）"""
         self.running = True
         print("游戏预览窗口已启动，点击关闭按钮或按ESC退出")
-        self._enter_menu()
+        self._start_splash()
 
         while self.running:
             dt = self.clock.tick(60) / 1000.0
@@ -517,6 +582,13 @@ class VNGameRuntime:
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 if event.type == pygame.KEYDOWN:
+                    if self.mode == "splash":
+                        if event.key == pygame.K_ESCAPE:
+                            self.quit_game()
+                            break
+                        else:
+                            self._enter_menu()
+                            continue
                     # global overlay handling (works in menu or game)
                     if event.key == pygame.K_ESCAPE and (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay):
                         self._save_overlay = False
@@ -671,7 +743,9 @@ class VNGameRuntime:
             if not self.running:
                 break
 
-            if self.mode == "menu":
+            if self.mode == "splash":
+                self._render_splash(dt)
+            elif self.mode == "menu":
                 self._render_menu(dt)
                 if self._save_overlay or self._load_overlay or self._settings_overlay:
                     self._render_overlay()
@@ -778,7 +852,9 @@ class VNGameRuntime:
             name_surface.fill((0, 0, 0, 180))
             self.render_surface.blit(name_surface, (self.name_area.x, self.name_area.y))
             name_text = self.name_font.render(speaker, True, (220, 220, 220))
-            self.render_surface.blit(name_text, (self.name_area.x + 8, self.name_area.y + 4))
+            left_pad = min(self.text_margin, max(4, self.name_area.width - 10))
+            vert_pad = max(4, (self.name_area.height - name_text.get_height()) // 2)
+            self.render_surface.blit(name_text, (self.name_area.x + left_pad, self.name_area.y + vert_pad))
 
             # render dialogue text with simple wrapping
             shown_text = content[: self.current_visible_len] if content else ""
@@ -872,16 +948,28 @@ class VNGameRuntime:
             self.render_surface.blit(overlay, (0, 0))
 
         title = self._menu_title or (self.project_path.stem if self.project_path else "VNEngine")
-        title_surf = self.name_font.render(title, True, (240, 240, 255))
-        self.render_surface.blit(title_surf, (60, 60))
-
+        title_pos = self._menu_title_pos
         menu_font = self._load_font(26)
-        start_y = 140
+        title_color = self._menu_title_color
+        option_color = self._menu_option_color
+
+        if self._menu_title_image_surface:
+            img = self._menu_title_image_surface
+            x = self._menu_title_image_pos[0]
+            y = self._menu_title_image_pos[1]
+            self.render_surface.blit(img, (x - img.get_width() // 2, y - img.get_height() // 2))
+        else:
+            title_surf = self.name_font.render(title, True, title_color)
+            self.render_surface.blit(title_surf, (title_pos[0], title_pos[1]))
+
+        start_x, start_y = self._menu_option_pos
         for idx, item in enumerate(self._menu_items):
             label = item.get("label", "")
-            color = (255, 255, 255) if idx == self._menu_selected else (190, 190, 190)
+            sel = idx == self._menu_selected
+            base = option_color
+            color = base if sel else (int(base[0] * 0.75), int(base[1] * 0.75), int(base[2] * 0.75))
             surf = menu_font.render(label, True, color)
-            x = 80
+            x = start_x
             y = start_y + idx * (menu_font.get_linesize() + 10)
             self.render_surface.blit(surf, (x, y))
 
@@ -1226,6 +1314,10 @@ class VNGameRuntime:
             abs_path = self._portrait_current_path
         else:
             abs_path = self._resolve_path(portrait_path)
+            if not abs_path.exists() and self.project_path:
+                alt = (self.project_path.parent / "resources" / "portraits" / Path(portrait_path).name)
+                if alt.exists():
+                    abs_path = alt
             if not abs_path.exists():
                 return
         if abs_path is None:
@@ -1237,9 +1329,23 @@ class VNGameRuntime:
                 max_h = int(self.render_size[1] * 0.7)
                 img = self._scale_to_fit(img, max_w, max_h)
                 self._portrait_cache[abs_path] = img
+                self._portrait_scaled_cache.pop(abs_path, None)
             except Exception:
                 return
-        target_img = self._portrait_cache[abs_path]
+
+        base_img = self._portrait_cache[abs_path]
+        scale = getattr(self, "portrait_scale", 1.0) or 1.0
+        scale = max(0.1, min(5.0, float(scale)))
+        if scale != 1.0:
+            key = (abs_path, scale)
+            target_img = self._portrait_scaled_cache.get(key)
+            if target_img is None:
+                w = max(1, int(base_img.get_width() * scale))
+                h = max(1, int(base_img.get_height() * scale))
+                target_img = pygame.transform.smoothscale(base_img, (w, h))
+                self._portrait_scaled_cache[key] = target_img
+        else:
+            target_img = base_img
 
         # manage fade state
         if self._portrait_current_path != abs_path:
@@ -1308,6 +1414,27 @@ class VNGameRuntime:
             return p
         base = self.project_path.parent if self.project_path else Path.cwd()
         return (base / p).resolve()
+
+    def _pair_from_cfg(self, val, default: tuple[int, int]) -> tuple[int, int]:
+        if isinstance(val, (list, tuple)) and len(val) >= 2:
+            try:
+                return (int(val[0]), int(val[1]))
+            except Exception:
+                return default
+        return default
+
+    def _color_from_cfg(self, val, default: tuple[int, int, int]) -> tuple[int, int, int]:
+        if isinstance(val, (list, tuple)) and len(val) >= 3:
+            try:
+                r, g, b = int(val[0]), int(val[1]), int(val[2])
+                return (
+                    max(0, min(255, r)),
+                    max(0, min(255, g)),
+                    max(0, min(255, b)),
+                )
+            except Exception:
+                return default
+        return default
 
     def _current_entry(self) -> dict:
         if self.graph_mode:
@@ -1643,6 +1770,15 @@ class VNGameRuntime:
         else:
             self.portrait_pos = None
 
+        ps = 1.0
+        if isinstance(layout, dict):
+            try:
+                ps = float(layout.get("portrait_scale", 1.0) or 1.0)
+            except Exception:
+                ps = 1.0
+        self.portrait_scale = max(0.1, min(5.0, ps))
+        self._portrait_scaled_cache.clear()
+
     def _append_history(self, entry: dict | None):
         if not entry:
             return
@@ -1753,6 +1889,15 @@ class VNGameRuntime:
             self._pending_voice_path = None
             self._pending_voice_delay = 0.0
 
+    def _stop_bgm(self):
+        """Stop current BGM playback and clear state."""
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self._bgm_current = None
+
     def _stop_voice_playback(self):
         """Stop any playing voice and clear pending schedule."""
         self._pending_voice_path = None
@@ -1818,6 +1963,7 @@ class VNGameRuntime:
             if isinstance(size_data, (list, tuple)) and len(size_data) == 2:
                 self.screen = pygame.display.set_mode(size_data)
                 self._apply_window_size(tuple(size_data))
+            self._stop_bgm()
             self._voice_played_index = None
             self._on_enter_node()
             self._reset_typing_state()

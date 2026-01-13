@@ -92,16 +92,19 @@ class PropertiesDock(QDockWidget):
         btn_row = QHBoxLayout()
         self.add_sub_btn = QPushButton("新增子节点")
         self.del_sub_btn = QPushButton("删除")
+        self.copy_sub_btn = QPushButton("复制")
         self.up_sub_btn = QPushButton("上移")
         self.down_sub_btn = QPushButton("下移")
-        for btn in (self.add_sub_btn, self.del_sub_btn, self.up_sub_btn, self.down_sub_btn):
+        for btn in (self.add_sub_btn, self.del_sub_btn, self.copy_sub_btn, self.up_sub_btn, self.down_sub_btn):
             btn.setMinimumWidth(60)
         self.add_sub_btn.clicked.connect(self._on_add_sub)
         self.del_sub_btn.clicked.connect(self._on_delete_sub)
+        self.copy_sub_btn.clicked.connect(self._on_copy_sub)
         self.up_sub_btn.clicked.connect(self._on_move_sub_up)
         self.down_sub_btn.clicked.connect(self._on_move_sub_down)
         btn_row.addWidget(self.add_sub_btn)
         btn_row.addWidget(self.del_sub_btn)
+        btn_row.addWidget(self.copy_sub_btn)
         btn_row.addWidget(self.up_sub_btn)
         btn_row.addWidget(self.down_sub_btn)
         btn_row.addStretch(1)
@@ -457,6 +460,7 @@ class PropertiesDock(QDockWidget):
             self.sub_list,
             self.add_sub_btn,
             self.del_sub_btn,
+            self.copy_sub_btn,
             self.up_sub_btn,
             self.down_sub_btn,
             self.sub_speaker_edit,
@@ -828,6 +832,28 @@ class PropertiesDock(QDockWidget):
         self._refresh_sub_list(select_index=new_index)
         self._commit_sub_dialogues()
 
+    def _on_copy_sub(self):
+        if len(self._sub_dialogues) >= self.MAX_SUB_DIALOGUES:
+            self._update_add_button_state()
+            return
+        row = self.sub_list.currentRow()
+        if row < 0 or row >= len(self._sub_dialogues):
+            return
+        src = self._sub_dialogues[row]
+        copied = {
+            "speaker": src.get("speaker", ""),
+            "text": src.get("text", ""),
+            "voice": src.get("voice", ""),
+            "portrait": src.get("portrait", ""),
+            "hide_textbox": bool(src.get("hide_textbox", False)),
+            "portrait_fade": bool(src.get("portrait_fade", False)),
+            "portrait_fade_out": bool(src.get("portrait_fade_out", False)),
+        }
+        insert_at = min(row + 1, len(self._sub_dialogues))
+        self._sub_dialogues.insert(insert_at, copied)
+        self._refresh_sub_list(select_index=insert_at)
+        self._commit_sub_dialogues()
+
     def _on_move_sub_up(self):
         row = self.sub_list.currentRow()
         if row <= 0:
@@ -1115,6 +1141,13 @@ class PropertiesDock(QDockWidget):
             return
         stored = self._store_into_project(path, subfolder)
         target_edit.setText(stored)
+        # 主动触发对应字段的保存逻辑，避免仅设置文本但未调用 setter
+        if target_edit in (getattr(self, "choice_voice_edit", None), getattr(self, "choice_portrait_edit", None)):
+            self._on_choice_info_changed()
+        elif target_edit in (getattr(self, "cond_voice_edit", None), getattr(self, "cond_portrait_edit", None)):
+            self._on_cond_info_changed()
+        elif target_edit in (getattr(self, "sub_voice_edit", None), getattr(self, "sub_portrait_edit", None)):
+            self._on_sub_detail_changed()
 
     def _store_into_project(self, src_path: str, subfolder: str) -> str:
         if not src_path:
