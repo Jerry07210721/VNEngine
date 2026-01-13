@@ -1,0 +1,15 @@
+# Core dependencies
+PyQt6>=6.6.0
+pygame>=2.5.2
+pyyaml>=6.0.1
+PyInstaller>=6.3.0
+# Optional helpers
+Pillow>=10.1.0
+numpy>=1.26.0
+typing_extensions>=4.8.0
+platformdirs>=3.11.0
+more-itertools>=10.1.0
+importlib-metadata>=6.8.0
+zipp>=3.17.0
+moviepy>=1.0.3
+imageio-ffmpeg>=0.4.10

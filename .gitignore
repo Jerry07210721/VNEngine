@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.dylib
+
+# Virtual environments
+.venv/
+venv/
+venv_pack/
+venv1/
+pack_venv/
+
+# Packaging / build
+build/
+dist/
+*.spec
+_game_launcher.py
+
+# Logs / caches
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.cache/
+
+# IDE / tooling
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Runtime artifacts
+saves/
+*.vngsave

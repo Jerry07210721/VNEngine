@@ -1,0 +1,25 @@
+python -m PyInstaller `
+  --name VNEngineDesigner `
+  --onedir `
+  --windowed `
+  --icon icon.ico `
+  --add-data "src;src" `
+  --add-data "requirements.txt;." `
+  --add-data "icon.ico;." `
+  --paths . `
+  --collect-submodules src `
+  --collect-submodules PyQt6 `
+  --collect-submodules pygame `
+  --collect-all numpy `
+  --collect-all imageio `
+  --collect-all imageio_ffmpeg `
+  --collect-all moviepy `
+  --hidden-import numpy `
+  --hidden-import PyQt6 `
+  --hidden-import PyQt6.QtCore `
+  --hidden-import PyQt6.QtGui `
+  --hidden-import PyQt6.QtWidgets `
+  --hidden-import pygame `
+  --noconfirm `
+  --clean `
+  main.py
