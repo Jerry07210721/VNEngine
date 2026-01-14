@@ -30,6 +30,7 @@ from src.designer.properties_panel import PropertiesDock
 from src.designer.ui_designer import UILayoutDesigner
 from src.designer.menu_designer import MainMenuDesigner
 from src.designer.global_vars_dialog import GlobalVarsDialog
+from src.designer.ai_generation_dialog import AIGenerationDialog
 from src.packager.packager_manager import PackagerManager
 from src.packager.packager_dialog import PackagerDialog
 
@@ -193,6 +194,13 @@ class VNDesignerMainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         self.menuBar().addMenu(file_menu)
+
+        # AI生成菜单
+        ai_menu = QMenu("AI生成(&A)", self)
+        ai_generate_action = QAction("AI自动生成游戏...", self)
+        ai_generate_action.triggered.connect(self.open_ai_generation_dialog)
+        ai_menu.addAction(ai_generate_action)
+        self.menuBar().addMenu(ai_menu)
 
         pack_menu = QMenu("打包(&P)", self)
         pack_config_action = QAction("打包配置...", self)
@@ -641,6 +649,29 @@ class VNDesignerMainWindow(QMainWindow):
             return
         node = next((i for i in selected if hasattr(i, "set_title")), None)
         self.properties_dock.bind_node(node)
+    
+    def open_ai_generation_dialog(self):
+        """打开AI游戏生成对话框"""
+        try:
+            dialog = AIGenerationDialog(self)
+            dialog.generation_completed.connect(self._on_ai_generation_completed)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"无法打开AI生成对话框：{str(exc)}")
+    
+    def _on_ai_generation_completed(self, project_file: str):
+        """AI生成完成后加载工程"""
+        try:
+            project_path = Path(project_file)
+            if project_path.exists():
+                self._load_project_file(project_path)
+                QMessageBox.information(
+                    self,
+                    "AI生成完成",
+                    f"游戏已自动生成并加载！\n工程路径：{project_path}"
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"加载AI生成的工程失败：{str(exc)}")
 
     def closeEvent(self, event):  # noqa: N802
         # 关闭前终止预览进程，避免孤儿进程

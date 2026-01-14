@@ -377,7 +377,9 @@ class PropertiesDock(QDockWidget):
         self._load_sub_dialogues(getattr(node, "sub_dialogues", []))
         self._load_options(getattr(node, "options", []))
         self.cond_var_edit.setText(getattr(node, "condition_var", ""))
-        self.cond_value_edit.setText(getattr(node, "condition_value", ""))
+        # 将condition_value转换为字符串（可能是float或其他类型）
+        cond_value = getattr(node, "condition_value", "")
+        self.cond_value_edit.setText(str(cond_value) if cond_value != "" else "")
         self.cond_op_combo.setCurrentText(getattr(node, "condition_op", "=="))
         self.cond_const_chk.setChecked(bool(getattr(node, "condition_const", False)))
         self._load_var_ops(getattr(node, "var_ops", []))
