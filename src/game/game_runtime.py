@@ -14,11 +14,20 @@ class VNGameRuntime:
     """视觉小说游戏运行时，负责游戏窗口的初始化和事件循环"""
 
     def __init__(self, game_title: str = "我的视觉小说", window_size=(800, 600), project_path: str | None = None):
+        self.project_path = Path(project_path).resolve() if project_path else None
+        cfg = self._probe_game_config(self.project_path) if self.project_path else {}
+        init_w = int(cfg.get("window_width", window_size[0])) if isinstance(cfg, dict) else window_size[0]
+        init_h = int(cfg.get("window_height", window_size[1])) if isinstance(cfg, dict) else window_size[1]
+        init_size = (max(320, init_w), max(240, init_h))
+        self.project_resolution = init_size  # logical render resolution driven by project
+        self.windowed_size = init_size  # remember windowed size for exiting fullscreen
+        resolved_title = cfg.get("game_title") if isinstance(cfg, dict) else None
+
         pygame.init()
-        pygame.display.set_caption(game_title)
-        self.base_window_size = window_size
-        self.window_size = window_size
-        self.render_size = window_size  # logical 4:3 render surface size
+        pygame.display.set_caption(resolved_title or game_title)
+        self.base_window_size = init_size
+        self.window_size = init_size
+        self.render_size = self.project_resolution
         self.render_surface = pygame.Surface(self.render_size)
         self.is_fullscreen = False
         self.screen = pygame.display.set_mode(self.window_size)
@@ -36,12 +45,11 @@ class VNGameRuntime:
         self.name_area = None
         self._portrait_cache = {}
         self._portrait_scaled_cache = {}
+        self._bg_cache = {}
         self.portrait_scale = 1.0
         self._ui_layout_cache: dict[Path, dict] = {}
         self._active_ui_layout: dict | None = None
         self._apply_window_size(self.window_size)
-
-        self.project_path = Path(project_path) if project_path else None
         self.branch_strategy = "first"
         self.save_dir = (self.project_path.parent / "saves") if self.project_path else Path.cwd() / "saves"
         self.settings_path = (self.project_path.parent / "settings.yaml") if self.project_path else Path.cwd() / "settings.yaml"
@@ -78,7 +86,6 @@ class VNGameRuntime:
         self.typing_progress = 0.0
         self._triangle_phase = 0.0
         self._sub_index = 0
-        self._bg_cache = {}
         self._current_bg_path = None
         self._portrait_surface = None
         self._portrait_target_surface = None
@@ -134,6 +141,17 @@ class VNGameRuntime:
         self._history_overlay: bool = False
         self._splash_time: float = 2.5
         self._splash_elapsed: float = 0.0
+
+    def _probe_game_config(self, path: Path | None) -> dict:
+        if not path or not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            cfg = data.get("game_config", {}) if isinstance(data, dict) else {}
+            return cfg if isinstance(cfg, dict) else {}
+        except Exception:
+            return {}
 
     def _load_dialogues(self):
         """Load dialogues from project flow_nodes (YAML), else fallback samples."""
@@ -1613,7 +1631,7 @@ class VNGameRuntime:
         return pygame.transform.smoothscale(img, new_size)
 
     def _blit_to_window(self):
-        """Letterbox 4:3 render_surface to the actual window while preserving aspect."""
+        """Letterbox project render surface到真实窗口，保持工程分辨率的宽高比。"""
         screen_w, screen_h = self.screen.get_size()
         target_w, target_h = self.render_size
         scale = min(screen_w / target_w, screen_h / target_h)
@@ -1743,10 +1761,16 @@ class VNGameRuntime:
 
     def _apply_window_size(self, size: tuple[int, int]):
         """Recalculate layout based on current window size."""
-        self.window_size = size
-        # maintain 4:3 logical render surface
-        # lock logical surface to 4:3 (base 800 width)
-        self.render_size = (800, 600)
+        try:
+            w = max(320, int(size[0]))
+            h = max(240, int(size[1]))
+        except Exception:
+            w, h = self.window_size
+
+        self.window_size = (w, h)
+        if not self.is_fullscreen:
+            self.windowed_size = (w, h)
+        self.render_size = self.project_resolution
         self.render_surface = pygame.Surface(self.render_size)
         layout = self._active_ui_layout or {}
 
@@ -1777,6 +1801,7 @@ class VNGameRuntime:
             except Exception:
                 ps = 1.0
         self.portrait_scale = max(0.1, min(5.0, ps))
+        self._bg_cache.clear()
         self._portrait_scaled_cache.clear()
 
     def _append_history(self, entry: dict | None):
@@ -1799,10 +1824,11 @@ class VNGameRuntime:
     def toggle_fullscreen(self):
         """Toggle fullscreen mode with F11."""
         if not self.is_fullscreen:
+            self.windowed_size = self.window_size
             self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
             self.is_fullscreen = True
         else:
-            self.screen = pygame.display.set_mode(self.base_window_size)
+            self.screen = pygame.display.set_mode(self.windowed_size)
             self.is_fullscreen = False
 
         new_size = self.screen.get_size()

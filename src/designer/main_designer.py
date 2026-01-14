@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QToolBar,
     QTextEdit,
     QVBoxLayout,
+    QSpinBox,
     QWidget,
 )
 from pathlib import Path
@@ -62,6 +64,37 @@ class StartDialog(QDialog):
     def _choose_open(self):
         self.mode = "open"
         self.accept()
+
+
+class ProjectResolutionDialog(QDialog):
+    """弹窗：创建工程时选择窗口长宽像素。"""
+
+    def __init__(self, default_size: tuple[int, int] = (800, 600), parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择游戏分辨率")
+        self._width = QSpinBox()
+        self._height = QSpinBox()
+        for sp in (self._width, self._height):
+            sp.setRange(320, 4096)
+        self._width.setValue(int(default_size[0]))
+        self._height.setValue(int(default_size[1]))
+
+        form = QFormLayout(self)
+        form.addRow("宽度 (px)", self._width)
+        form.addRow("高度 (px)", self._height)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch(1)
+        form.addRow(btn_row)
+
+    def get_resolution(self) -> tuple[int, int]:
+        return int(self._width.value()), int(self._height.value())
 
 
 class PackagerLogDialog(QDialog):
@@ -151,6 +184,10 @@ class VNDesignerMainWindow(QMainWindow):
         save_project_action.triggered.connect(self.save_project)
         file_menu.addAction(save_project_action)
 
+        edit_resolution_action = QAction("修改分辨率", self)
+        edit_resolution_action.triggered.connect(self.edit_resolution)
+        file_menu.addAction(edit_resolution_action)
+
         exit_action = QAction("退出(&E)", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -215,6 +252,15 @@ class VNDesignerMainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.properties_dock)
         self.properties_dock.set_graph_view(self.graph_view)
 
+    def _current_resolution(self) -> tuple[int, int]:
+        cfg = self.project_manager.project_data.get("game_config", {}) if self.project_manager else {}
+        try:
+            w = int(cfg.get("window_width", 800))
+            h = int(cfg.get("window_height", 600))
+        except Exception:
+            w, h = 800, 600
+        return max(320, w), max(240, h)
+
     def new_project(self):
         """交互式新建工程：询问名称和目录，创建隔离文件夹。"""
         name, _ = QFileDialog.getSaveFileName(self, "输入工程名并选择保存位置", "", "VNEngine工程文件 (*.vngproj)")
@@ -225,8 +271,15 @@ class VNDesignerMainWindow(QMainWindow):
             file_path = file_path.with_suffix(".vngproj")
         project_dir = file_path.parent
         project_name = file_path.stem
+        # 选择项目分辨率（创建后不可修改）
+        default_res = self._current_resolution()
+        res_dialog = ProjectResolutionDialog(default_res, self)
+        if res_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        width, height = res_dialog.get_resolution()
+
         self._create_project_structure(project_dir, project_name)
-        self._create_or_overwrite_project(project_dir, project_name, file_path)
+        self._create_or_overwrite_project(project_dir, project_name, file_path, width, height)
 
     def open_project(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -235,6 +288,20 @@ class VNDesignerMainWindow(QMainWindow):
         if not file_path:
             return
         self._load_project_file(Path(file_path))
+
+    def edit_resolution(self):
+        if not self.project_manager or not self.project_manager.project_data:
+            QMessageBox.information(self, "提示", "请先新建或打开工程后再修改分辨率。")
+            return
+        current_w, current_h = self._current_resolution()
+        dlg = ProjectResolutionDialog((current_w, current_h), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_w, new_h = dlg.get_resolution()
+        cfg = self.project_manager.project_data.setdefault("game_config", {})
+        cfg["window_width"] = int(new_w)
+        cfg["window_height"] = int(new_h)
+        self.statusBar().showMessage(f"分辨率已更新：{new_w}x{new_h}（请保存工程后生效）")
 
     def save_project(self):
         if not self.current_project_path:
@@ -280,14 +347,14 @@ class VNDesignerMainWindow(QMainWindow):
         if not self.project_dir:
             QMessageBox.warning(self, "提示", "请先新建或加载工程后再设计UI。")
             return
-        dlg = UILayoutDesigner(self.project_dir, self)
+        dlg = UILayoutDesigner(self.project_dir, self._current_resolution(), self)
         dlg.exec()
 
     def open_menu_designer(self):
         if not self.project_dir:
             QMessageBox.warning(self, "提示", "请先新建或加载工程后再设计主菜单。")
             return
-        dlg = MainMenuDesigner(self.project_dir, self.project_manager, self)
+        dlg = MainMenuDesigner(self.project_dir, self.project_manager, self._current_resolution(), self)
         dlg.exec()
 
     def open_global_vars(self):
@@ -303,17 +370,17 @@ class VNDesignerMainWindow(QMainWindow):
         (project_dir / "ui").mkdir(parents=True, exist_ok=True)
         (project_dir / "saves").mkdir(parents=True, exist_ok=True)
 
-    def _create_or_overwrite_project(self, project_dir: Path, project_name: str, project_file: Path):
+    def _create_or_overwrite_project(self, project_dir: Path, project_name: str, project_file: Path, width: int, height: int):
         try:
-            self.project_manager.new_project(project_name)
+            self.project_manager.new_project(project_name, width, height)
             self.current_project_path = str(project_file)
             self._apply_project_dir(project_dir)
             self.graph_view.clear_scene()
             self.resource_dock.clear_all()
             self.properties_dock.bind_node(None)
             self.project_manager.save_project(self.current_project_path)
-            self.statusBar().showMessage(f"已新建工程：{project_name} - {project_file}")
-            QMessageBox.information(self, "提示", f"工程「{project_name}」已创建。")
+            self.statusBar().showMessage(f"已新建工程：{project_name} ({width}x{height}) - {project_file}")
+            QMessageBox.information(self, "提示", f"工程「{project_name}」已创建。\n分辨率：{width}x{height}")
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"新建工程失败：{str(exc)}")
 
@@ -326,7 +393,8 @@ class VNDesignerMainWindow(QMainWindow):
             self._load_resources_from_data(data)
             self.properties_dock.bind_node(None)
             project_name = self.project_manager.project_data["project_info"].get("name", path.stem)
-            self.statusBar().showMessage(f"已打开工程：{project_name} - {path}")
+            w, h = self._current_resolution()
+            self.statusBar().showMessage(f"已打开工程：{project_name} ({w}x{h}) - {path}")
             QMessageBox.information(self, "提示", f"工程「{project_name}」打开成功。")
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"打开工程失败：{str(exc)}")

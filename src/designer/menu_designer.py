@@ -29,9 +29,10 @@ from PyQt6.QtCore import Qt, QRect
 class MenuPreview(QWidget):
     """Lightweight rectangle-based preview for main menu layout."""
 
-    def __init__(self, project_dir: Optional[Path], parent: Optional[QWidget] = None):
+    def __init__(self, project_dir: Optional[Path], base_size: tuple[int, int] = (800, 600), parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.project_dir = project_dir
+        self._base_size = (max(1, int(base_size[0])), max(1, int(base_size[1])))
         self.setMinimumSize(520, 320)
         self._state: dict[str, Any] = {}
         self._bg_pixmap: Optional[QPixmap] = None
@@ -80,9 +81,9 @@ class MenuPreview(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # logical canvas 800x600 scaled to widget
+        # logical canvas scaled to widget based on project resolution
         target_rect = self.rect()
-        base_w, base_h = 800, 600
+        base_w, base_h = self._base_size
         scale = min(target_rect.width() / base_w, target_rect.height() / base_h)
         view_w, view_h = int(base_w * scale), int(base_h * scale)
         offset_x = (target_rect.width() - view_w) // 2
@@ -160,11 +161,12 @@ class MenuPreview(QWidget):
 
 
 class MainMenuDesigner(QDialog):
-    def __init__(self, project_dir: Optional[Path] = None, project_manager=None, parent: Optional[QWidget] = None):
+    def __init__(self, project_dir: Optional[Path] = None, project_manager=None, base_resolution: tuple[int, int] | None = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.project_manager = project_manager
         self.project_dir = Path(project_dir) if project_dir else (Path(project_manager.project_dir) if project_manager and project_manager.project_dir else None)
         data = (project_manager.project_data.get("game_config", {}) if project_manager else {}) or {}
+        self.base_resolution = base_resolution or (int(data.get("window_width", 800)), int(data.get("window_height", 600)))
 
         self.setWindowTitle("主菜单设计器")
         self.resize(980, 640)
@@ -250,7 +252,7 @@ class MainMenuDesigner(QDialog):
         form.addRow("遮罩透明度 (0-255)", self.overlay_alpha)
 
         # 预览
-        self.preview = MenuPreview(self.project_dir, self)
+        self.preview = MenuPreview(self.project_dir, self.base_resolution, self)
         preview_wrap = QVBoxLayout()
         preview_wrap.addWidget(QLabel("主菜单预览 (矩形示意)", self))
         preview_wrap.addWidget(self.preview)

@@ -51,12 +51,15 @@ class VNProjectManager:
             "flow_nodes": {"nodes": [], "connections": []},
         }
 
-    def new_project(self, project_name: str = "未命名工程"):
-        """新建空工程"""
+    def new_project(self, project_name: str = "未命名工程", window_width: int = 800, window_height: int = 600):
+        """新建空工程并固定窗口分辨率。"""
         self.project_data["project_info"]["name"] = project_name
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.project_data["project_info"]["create_time"] = now
         self.project_data["project_info"]["last_modify_time"] = now
+        # 记录用户选择的窗口分辨率（项目创建后不再修改）
+        self.project_data["game_config"]["window_width"] = int(max(320, window_width))
+        self.project_data["game_config"]["window_height"] = int(max(240, window_height))
         self.project_data["flow_nodes"] = {"nodes": [], "connections": []}
         return self.project_data
 

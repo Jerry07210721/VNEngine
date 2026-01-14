@@ -22,9 +22,10 @@ from PyQt6.QtCore import Qt
 class LayoutPreview(QWidget):
     """Simple 2D preview for text/name/portrait positions."""
 
-    def __init__(self, parent=None):
+    def __init__(self, base_size: tuple[int, int] = (800, 600), parent=None):
         super().__init__(parent)
         self.setMinimumSize(520, 360)
+        self._base_size = (max(1, int(base_size[0])), max(1, int(base_size[1])))
         self._text_rect = [40, 380, 720, 160]
         self._name_rect = [40, 340, 200, 32]
         self._portrait = [0, 0]
@@ -44,12 +45,19 @@ class LayoutPreview(QWidget):
             pass
         self.update()
 
+    def set_base_size(self, size: tuple[int, int]):
+        try:
+            self._base_size = (max(1, int(size[0])), max(1, int(size[1])))
+        except Exception:
+            return
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor(24, 28, 36))
 
-        base_w, base_h = 800, 600
+        base_w, base_h = self._base_size
         sx = self.width() / base_w
         sy = self.height() / base_h
 
@@ -78,9 +86,10 @@ class LayoutPreview(QWidget):
 class UILayoutDesigner(QDialog):
     """Very lightweight UI layout editor saving to JSON under project ui/ folder."""
 
-    def __init__(self, project_dir: Path, parent=None):
+    def __init__(self, project_dir: Path, base_size: tuple[int, int] | None = None, parent=None):
         super().__init__(parent)
         self.project_dir = project_dir
+        self.base_size = base_size or (800, 600)
         self.setWindowTitle("UI 设计器")
         self.setMinimumWidth(720)
         self.layout_path: Path | None = None
@@ -118,8 +127,9 @@ class UILayoutDesigner(QDialog):
         form.addRow("立绘缩放", self.portrait_scale)
 
         preview_wrap = QVBoxLayout()
-        preview_label = QLabel("预览（基于 800x600，立绘点为中心）")
-        self.preview = LayoutPreview()
+        w, h = self.base_size
+        preview_label = QLabel(f"预览（基于 {w}x{h}，立绘点为中心）")
+        self.preview = LayoutPreview(base_size=self.base_size)
         preview_wrap.addWidget(preview_label)
         preview_wrap.addWidget(self.preview)
 
