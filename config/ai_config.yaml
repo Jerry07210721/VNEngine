@@ -1,0 +1,102 @@
+agent_settings:
+  concurrent_tasks:
+    background: 3
+    bgm: 2
+    cg: 2
+    portrait: 3
+    voice: 5
+  enable_agents:
+    background_agent: false
+    bgm_api: false
+    cg_agent: false
+    plot_agent: true
+    portrait_agent: false
+    voice_api: false
+  retry_settings:
+    max_retries: 3
+    retry_delay: 5
+api_keys:
+  claude:
+    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    base_url: https://llm-api.mmchat.xyz
+    fallback_model: claude-sonnet-4-5-20250929
+    primary_model: claude-sonnet-4-20250514
+  flux:
+    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    app_id: 5c80d2bc149d17f136152c771d5ba7cb
+    base_url: https://api.mmchat.xyz
+    fallback_model: flux-2-pro
+    primary_model: flux-kontext
+  gptsovits:
+    api_key: 0rCx53AWbYJ9cIwFVPMhdWuEqBinUiaX
+    base_url: https://openapi.lipvoice.cn
+    fallback_model: ''
+    primary_model: ''
+    sign: 0rCx53AWbYJ9cIwFVPMhdWuEqBinUiaX
+  kimi:
+    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    base_url: https://llm-api.mmchat.xyz
+    fallback_model: anthropic/kimi-k2-thinking
+    primary_model: anthropic/kimi-k2-0905-preview
+  midjourney:
+    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    app_id: 5c80d2bc149d17f136152c771d5ba7cb
+    base_url: https://api.mmchat.xyz
+    fallback_model: mj-v61
+    primary_model: mj-v7
+  suno:
+    api_key: sk-4c22a8401da4401b8ea91e87f79ac413
+    base_url: https://dzwlai.com/apiuser
+    fallback_model: chirp-v4-5+
+    primary_model: chirp-v5
+    token: sk-4c22a8401da4401b8ea91e87f79ac413
+    user_id: '17328098894'
+character_config:
+- char_id: 夏栀
+  char_name: 夏栀
+  is_first_person: false
+  persona_keywords: 我的同班同学，开朗温柔，喜欢绘画，是班级里的文艺委员，笑起来有两个浅浅的梨涡
+  role: 女主角
+  voice_model_id: ABuUZoqCrNhK3YS8UQEsKTdPRo
+- char_id: 林屿
+  char_name: 林屿
+  is_first_person: true
+  persona_keywords: 高二学生，性格略显内向，喜欢摄影，习惯用相机记录生活点滴，对夏日的校园有着特殊的眷恋。
+  role: 男主角
+  voice_model_id: 语音模型ID
+material_settings:
+  background:
+    format: jpg
+  bgm:
+    format: mp3
+  cg:
+    format: png
+  portrait:
+    format: png
+  voice:
+    format: mp3
+project_settings:
+  auto_save_interval: 300
+  default_window_height: 720
+  default_window_width: 1280
+  engine_version: V2.0-AI
+  project_name: AItest
+  resource_root: C:/Users/jerry/Desktop/test
+story_config:
+  character_hint_weight: 0.7
+  first_person_cg_notes: ''
+  first_person_cg_presence: false
+  first_person_has_portrait: false
+  first_person_has_voice: false
+  first_person_name: 林屿
+  narrative_pov: first
+  plot_outline: '角色设定
+
+    1. （我）男主：林屿 - 高二学生，性格略显内向，喜欢摄影，习惯用相机记录生活点滴，对夏日的校园有着特殊的眷恋。
+
+    2. 女主：夏栀 - 林屿的同班同学，开朗温柔，喜欢绘画，是班级里的文艺委员，笑起来有两个浅浅的梨涡。
+
+    高二学生林屿（我）（内向摄影爱好者）与同班开朗温柔的绘画爱好者夏栀，在教学楼后的梧桐树荫下因意外碰撞相识。两人因对夏日校园光影的共同喜爱产生共鸣，夏栀推荐林屿去天台拍夕阳，两人一同前往天台创作。林屿忍不住拍下晚霞中作画的夏栀，这份青涩的欣赏让彼此心生悸动，林屿借此鼓起勇气邀请夏栀暑假一同去海边看晚霞拍照，夏栀欣然应允并赠送手绘约定信物。暑假第一天，两人带着各自的创作工具在校园大门相遇，怀揣着期待并肩前往海边，开启属于他们的夏日独家回忆。'
+  style: 青春校园恋爱
+  text_volume: 1000
+  title: 夏日回忆

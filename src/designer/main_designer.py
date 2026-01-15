@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 )
 from pathlib import Path
 from PyQt6.QtGui import QAction, QTextCursor, QIcon
-from PyQt6.QtCore import Qt, QProcess
+from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal
 from src.core.project_manager import VNProjectManager
 from src.game.game_runtime import VNGameRuntime
 from src.designer.graph_canvas import GraphView
@@ -30,6 +30,20 @@ from src.designer.properties_panel import PropertiesDock
 from src.designer.ui_designer import UILayoutDesigner
 from src.designer.menu_designer import MainMenuDesigner
 from src.designer.global_vars_dialog import GlobalVarsDialog
+from src.designer.ai_assist_dialog import AIAssistDialog, APIConfigDialog
+from src.designer.ai_progress_dialog import AIProgressDialog
+from src.ai.core.config_manager import ConfigManager
+from src.ai.core.master_agent import MasterAgent
+from src.ai.core.models import (
+    UserConfig,
+    ProjectConfig,
+    StoryConfig,
+    CharacterConfig,
+    EnableAgentsConfig,
+    MaterialConfig,
+)
+from src.ai.agents import PlotAgent, PortraitAgent, BackgroundAgent, CGAgent, VoiceAgent, BGMAgent, IntegratorAgent
+from src.designer.ai_worker import AITaskWorker
 from src.packager.packager_manager import PackagerManager
 from src.packager.packager_dialog import PackagerDialog
 
@@ -132,6 +146,10 @@ class VNDesignerMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.project_manager = VNProjectManager()
+        self.config_manager = ConfigManager()
+        self.master_agent: MasterAgent | None = None
+        self.ai_worker: "AITaskWorker" | None = None
+        self.ai_progress_dialog: AIProgressDialog | None = None
         self.current_project_path = None
         self.packager_manager = PackagerManager()
         self.packager_process: QProcess | None = None
@@ -218,6 +236,24 @@ class VNDesignerMainWindow(QMainWindow):
         ui_menu.addAction(menu_design_action)
         self.menuBar().addMenu(ui_menu)
 
+        ai_menu = QMenu("AI 辅助(&A)", self)
+        ai_new_project = QAction("新建 AI 工程", self)
+        ai_new_project.triggered.connect(self.open_ai_assist)
+        ai_menu.addAction(ai_new_project)
+
+        ai_run = QAction("启动 AI 生成", self)
+        ai_run.triggered.connect(self.start_ai_generation)
+        ai_menu.addAction(ai_run)
+
+        ai_api = QAction("API 配置", self)
+        ai_api.triggered.connect(self.open_api_config)
+        ai_menu.addAction(ai_api)
+
+        ai_help = QAction("使用帮助", self)
+        ai_help.triggered.connect(self.open_ai_help)
+        ai_menu.addAction(ai_help)
+        self.menuBar().addMenu(ai_menu)
+
     def init_tool_bar(self):
         tool_bar = QToolBar("常用工具", self)
         self.addToolBar(tool_bar)
@@ -252,6 +288,49 @@ class VNDesignerMainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.properties_dock)
         self.properties_dock.set_graph_view(self.graph_view)
 
+    def open_ai_assist(self):
+        dlg = AIAssistDialog(config_manager=self.config_manager, parent=self)
+        dlg.exec()
+
+    def open_api_config(self):
+        dlg = APIConfigDialog(config_manager=self.config_manager, parent=self)
+        dlg.exec()
+
+    def open_ai_help(self):
+        QMessageBox.information(
+            self,
+            "AI 辅助使用帮助",
+            "在“AI 辅助”菜单中配置 API、工程和角色信息，然后通过进度对话框观察任务状态。更多细节见 docs/STAGE1_COMPLETED.md。",
+        )
+
+    def start_ai_generation(self):
+        """读取 ai_config 并启动 MasterAgent，进度联动到 AIProgressDialog。"""
+
+        try:
+            cfg = self.config_manager.load_config() or {}
+            user_config = self._build_user_config_from_ai_cfg(cfg)
+        except Exception as exc:
+            QMessageBox.critical(self, "配置错误", f"无法解析 ai_config.yaml：{exc}")
+            return
+
+        self.master_agent = MasterAgent(config_manager=self.config_manager)
+        self._register_agents_for_master(user_config)
+
+        progress = self.master_agent.start_task(user_config)
+
+        # 展示进度对话框
+        self.ai_progress_dialog = AIProgressDialog(self)
+        self.ai_progress_dialog.update_progress(progress)
+        self.ai_progress_dialog.canceled.connect(self._cancel_ai_tasks)
+        self.ai_progress_dialog.show()
+
+        # 后台线程执行任务并实时回调
+        self.ai_worker = AITaskWorker(self.master_agent)
+        self.ai_worker.progress_signal.connect(self.ai_progress_dialog.update_progress)
+        self.ai_worker.log_signal.connect(self.ai_progress_dialog.append_log)
+        self.ai_worker.finished_signal.connect(self._on_ai_finished)
+        self.ai_worker.start()
+
     def _current_resolution(self) -> tuple[int, int]:
         cfg = self.project_manager.project_data.get("game_config", {}) if self.project_manager else {}
         try:
@@ -260,6 +339,116 @@ class VNDesignerMainWindow(QMainWindow):
         except Exception:
             w, h = 800, 600
         return max(320, w), max(240, h)
+
+    def _build_user_config_from_ai_cfg(self, cfg: dict) -> UserConfig:
+        proj_cfg = cfg.get("project_settings", {})
+        story_cfg = cfg.get("story_config", {})
+        material_cfg = cfg.get("material_settings", {})
+        agent_cfg = (cfg.get("agent_settings") or {}).get("enable_agents", {})
+        chars = cfg.get("character_config", []) or []
+
+        project_name = proj_cfg.get("project_name") or story_cfg.get("title") or "AIProject"
+        resource_root = proj_cfg.get("resource_root", "output/projects")
+        project_path = str(Path(resource_root) / project_name)
+
+        project_info = ProjectConfig(
+            project_path=project_path,
+            project_name=project_name,
+            window_width=int(proj_cfg.get("default_window_width", 1280)),
+            window_height=int(proj_cfg.get("default_window_height", 720)),
+            engine_version=proj_cfg.get("engine_version", "V2.0-AI"),
+        )
+
+        story = StoryConfig(
+            title=story_cfg.get("title", project_name),
+            style=story_cfg.get("style", ""),
+            plot_outline=story_cfg.get("plot_outline", ""),
+            text_volume=int(story_cfg.get("text_volume", 5000)),
+            enable_choice_node=True,
+            enable_condition_node=True,
+            condition_type="favorability",
+            character_hint_weight=float(story_cfg.get("character_hint_weight", 0.7)),
+            narrative_pov=story_cfg.get("narrative_pov", "third"),
+            first_person_name=story_cfg.get("first_person_name", "我"),
+            first_person_has_portrait=bool(story_cfg.get("first_person_has_portrait", False)),
+            first_person_has_voice=bool(story_cfg.get("first_person_has_voice", False)),
+            first_person_cg_presence=bool(story_cfg.get("first_person_cg_presence", True)),
+            first_person_cg_notes=story_cfg.get("first_person_cg_notes", ""),
+        )
+
+        characters: list[CharacterConfig] = []
+        for ch in chars:
+            if not (ch.get("char_name") or ch.get("name")):
+                continue
+            characters.append(
+                CharacterConfig(
+                    char_id=ch.get("char_id") or ch.get("char_name", "").lower().replace(" ", "_"),
+                    char_name=ch.get("char_name") or ch.get("name", "角色"),
+                    is_player=ch.get("is_player", False),
+                    is_first_person=ch.get("is_first_person", False),
+                    persona_keywords=ch.get("persona_keywords", ""),
+                    reference_image=ch.get("reference_image"),
+                    voice_tone=ch.get("voice_tone"),
+                    voice_model_id=ch.get("voice_model_id"),
+                )
+            )
+
+        enable_agents = EnableAgentsConfig(
+            plot_agent=bool(agent_cfg.get("plot_agent", True)),
+            portrait_agent=bool(agent_cfg.get("portrait_agent", True)),
+            background_agent=bool(agent_cfg.get("background_agent", True)),
+            cg_agent=bool(agent_cfg.get("cg_agent", True)),
+            voice_api=bool(agent_cfg.get("voice_api", True)),
+            bgm_api=bool(agent_cfg.get("bgm_api", True)),
+        )
+
+        material = MaterialConfig(
+            portrait_format=material_cfg.get("portrait", {}).get("format", "png"),
+            background_format=material_cfg.get("background", {}).get("format", "jpg"),
+            cg_format=material_cfg.get("cg", {}).get("format", "png"),
+            voice_format=material_cfg.get("voice", {}).get("format", "mp3"),
+            bgm_format=material_cfg.get("bgm", {}).get("format", "mp3"),
+        )
+
+        return UserConfig(
+            project_info=project_info,
+            story_config=story,
+            character_config=characters,
+            enable_agents=enable_agents,
+            material_config=material,
+        )
+
+    def _register_agents_for_master(self, user_config: UserConfig):
+        if not self.master_agent:
+            return
+        try:
+            if user_config.enable_agents.plot_agent:
+                self.master_agent.register_agent("plot_agent", PlotAgent(self.config_manager, self.master_agent.api_manager))
+            if user_config.enable_agents.portrait_agent:
+                self.master_agent.register_agent("portrait_agent", PortraitAgent(self.config_manager, self.master_agent.api_manager))
+            if user_config.enable_agents.background_agent:
+                self.master_agent.register_agent("background_agent", BackgroundAgent(self.config_manager, self.master_agent.api_manager))
+            if user_config.enable_agents.cg_agent:
+                self.master_agent.register_agent("cg_agent", CGAgent(self.config_manager, self.master_agent.api_manager))
+            if user_config.enable_agents.voice_api:
+                self.master_agent.register_agent("voice_agent", VoiceAgent(self.config_manager, self.master_agent.api_manager))
+            if user_config.enable_agents.bgm_api:
+                self.master_agent.register_agent("bgm_agent", BGMAgent(self.config_manager, self.master_agent.api_manager))
+            # 整合 Agent 始终注册，作为收尾步骤
+            self.master_agent.register_agent("integrator_agent", IntegratorAgent(self.config_manager))
+        except Exception as exc:
+            QMessageBox.warning(self, "Agent 注册", f"部分 Agent 注册失败：{exc}")
+
+    def _cancel_ai_tasks(self):
+        if self.ai_worker:
+            self.ai_worker.request_cancel()
+            self.ai_progress_dialog.append_log("已请求取消，等待当前任务结束...")
+
+    def _on_ai_finished(self):
+        if self.ai_progress_dialog:
+            self.ai_progress_dialog.append_log("AI 任务已结束。")
+            self.ai_progress_dialog.update_progress(self.master_agent.get_progress() if self.master_agent else None)
+        self.statusBar().showMessage("AI 生成完成")
 
     def new_project(self):
         """交互式新建工程：询问名称和目录，创建隔离文件夹。"""
