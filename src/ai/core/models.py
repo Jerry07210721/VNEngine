@@ -26,6 +26,7 @@ class StoryConfig(BaseModel):
     style: str = Field(..., description="故事风格（如：日系校园、纯爱、治愈）")
     plot_outline: str = Field(..., description="剧情梗概")
     text_volume: int = Field(..., description="文本量（字数）", ge=1000, le=100000)
+    chapter_count: int = Field(5, description="章节数量", ge=1, le=100)
     enable_choice_node: bool = Field(True, description="是否开启选择节点")
     enable_condition_node: bool = Field(True, description="是否开启条件节点")
     condition_type: str = Field("favorability", description="条件类型（如：好感度）")
@@ -202,6 +203,136 @@ class GlobalVariable(BaseModel):
     name: str = Field(..., description="变量名")
     initial: float = Field(0.0, description="初始值")
     type: str = Field("float", description="变量类型")
+
+
+# ==================== AI工程文件专属模型 ====================
+
+class AIProjectInfo(BaseModel):
+    """AI辅助工程基础信息"""
+    name: str = Field("", description="AI工程名称")
+    created_time: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    last_modified_time: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    vng_project_path: Optional[str] = Field(None, description="关联的VNG工程文件路径")
+    description: str = Field("", description="工程描述")
+
+
+class GenerationStep(BaseModel):
+    """单个生成步骤记录"""
+    step_name: str = Field(..., description="步骤名称，如generate_personas")
+    timestamp: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    instruction: str = Field("", description="发送给Agent的指令")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="调用参数")
+    result: Optional[Dict[str, Any]] = Field(None, description="生成结果")
+    status: Literal["pending", "success", "failed"] = Field(default="pending", description="执行状态")
+    error_message: Optional[str] = Field(None, description="错误信息")
+
+
+class GenerationHistory(BaseModel):
+    """生成历史记录（分步存储）"""
+    step1_personas: Optional[Dict[str, Any]] = Field(None, description="步骤1：角色人设")
+    step2_outline: Optional[Dict[str, Any]] = Field(None, description="步骤2：故事大纲")
+    # 章节列表使用结构化字典（包含 raw_response/structured/parameters 等），而非纯列表，便于保存上下文
+    step3_chapters: Optional[Dict[str, Any]] = Field(None, description="步骤3：章节列表")
+    step4_chapter_details: Optional[List[Dict[str, Any]]] = Field(None, description="步骤4：章节详细内容")
+    step5_full_script: Optional[Dict[str, Any]] = Field(None, description="步骤5：完整剧本")
+    step5_flow_nodes: Optional[Dict[str, Any]] = Field(None, description="步骤5：流程节点数据")
+    
+    agent_instructions: List[GenerationStep] = Field(default_factory=list, description="所有Agent调用记录")
+
+
+class PortraitPendingItem(BaseModel):
+    """待生成立绘项"""
+    item_id: str = Field(..., description="项目ID")
+    char_id: str = Field(..., description="角色ID")
+    char_name: str = Field(..., description="角色名称")
+    description: str = Field("", description="立绘描述")
+    expressions: List[str] = Field(default_factory=list, description="表情列表，如['happy', 'sad']")
+    poses: List[str] = Field(default_factory=list, description="动作列表，如['stand', 'sit']")
+    status: Literal["pending", "generated"] = Field(default="pending", description="生成状态")
+    prompt: Optional[str] = Field(None, description="生成提示词")
+    model: Optional[str] = Field(None, description="使用的模型，如midjourney/flux")
+    file_paths: List[str] = Field(default_factory=list, description="生成的文件路径列表")
+    base_image_path: Optional[str] = Field(None, description="基准图路径（Flux多表情生成用）")
+
+
+class BackgroundPendingItem(BaseModel):
+    """待生成背景项"""
+    item_id: str = Field(..., description="项目ID")
+    bg_id: str = Field(..., description="背景ID")
+    description: str = Field(..., description="背景描述")
+    atmosphere: str = Field("", description="氛围关键词")
+    time_weather: str = Field("", description="时间/天气，如'午后晴天'")
+    status: Literal["pending", "generated"] = Field(default="pending")
+    prompt: Optional[str] = Field(None, description="生成提示词")
+    model: Optional[str] = Field(None, description="使用的模型")
+    file_path: str = Field("", description="文件路径，按命名规则")
+
+
+class CGPendingItem(BaseModel):
+    """待生成CG项"""
+    item_id: str = Field(..., description="项目ID")
+    cg_id: str = Field(..., description="CG ID")
+    node_id: str = Field(..., description="关联的流程节点ID")
+    description: str = Field(..., description="CG场景描述")
+    characters: List[str] = Field(default_factory=list, description="涉及角色ID列表")
+    atmosphere: str = Field("", description="氛围关键词")
+    status: Literal["pending", "generated"] = Field(default="pending")
+    prompt: Optional[str] = Field(None, description="生成提示词")
+    model: Optional[str] = Field(None, description="使用的模型")
+    file_path: str = Field("", description="文件路径，按命名规则")
+
+
+class VoicePendingItem(BaseModel):
+    """待生成语音项"""
+    item_id: str = Field(..., description="项目ID")
+    voice_id: str = Field(..., description="语音ID")
+    node_id: str = Field(..., description="关联的节点ID")
+    sub_id: Optional[int] = Field(None, description="子对话ID（若为子对话）")
+    speaker: str = Field(..., description="说话人")
+    char_id: str = Field(..., description="角色ID")
+    text: str = Field(..., description="对白文本")
+    emotion: str = Field("平静", description="语气情绪")
+    voice_model_id: Optional[str] = Field(None, description="音色模型ID")
+    status: Literal["pending", "generated"] = Field(default="pending")
+    prompt: Optional[str] = Field(None, description="生成提示/参数")
+    file_path: str = Field("", description="文件路径，按命名规则")
+
+
+class BGMPendingItem(BaseModel):
+    """待生成BGM项"""
+    item_id: str = Field(..., description="项目ID")
+    bgm_id: str = Field(..., description="BGM ID")
+    description: str = Field(..., description="BGM描述")
+    mood: str = Field("", description="情绪关键词，如'欢快、悲伤'")
+    style: str = Field("", description="曲风，如'钢琴、管弦乐'")
+    duration: int = Field(120, description="时长（秒）")
+    loop: bool = Field(True, description="是否循环")
+    status: Literal["pending", "generated"] = Field(default="pending")
+    prompt: Optional[str] = Field(None, description="生成提示词")
+    model: Optional[str] = Field(None, description="使用的模型")
+    file_path: str = Field("", description="文件路径，按命名规则")
+
+
+class PendingLists(BaseModel):
+    """所有待生成列表"""
+    portraits: List[PortraitPendingItem] = Field(default_factory=list)
+    backgrounds: List[BackgroundPendingItem] = Field(default_factory=list)
+    cgs: List[CGPendingItem] = Field(default_factory=list)
+    voices: List[VoicePendingItem] = Field(default_factory=list)
+    bgms: List[BGMPendingItem] = Field(default_factory=list)
+
+
+class AIProject(BaseModel):
+    """AI辅助工程完整数据模型（.vnai文件格式）"""
+    ai_project_info: AIProjectInfo = Field(default_factory=AIProjectInfo)
+    story_config: StoryConfig = Field(default_factory=StoryConfig)
+    character_config: List[CharacterConfig] = Field(default_factory=list)
+    generation_history: GenerationHistory = Field(default_factory=GenerationHistory)
+    pending_lists: PendingLists = Field(default_factory=PendingLists)
+    
+    def update_modified_time(self):
+        """更新最后修改时间"""
+        self.ai_project_info.last_modified_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ==================== 配置验证辅助 ====================

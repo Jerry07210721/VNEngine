@@ -25,7 +25,8 @@ class PortraitAgent:
     def __init__(
         self,
         config_manager: Optional[ConfigManager] = None,
-        api_manager: Optional[APIManager] = None
+        api_manager: Optional[APIManager] = None,
+        prefer_midjourney: bool = False,
     ):
         """
         初始化立绘Agent
@@ -37,9 +38,10 @@ class PortraitAgent:
         self.config_manager = config_manager or ConfigManager()
         self.api_manager = api_manager or APIManager(self.config_manager)
         self.logger = get_logger("PortraitAgent")
+        self.prefer_midjourney = prefer_midjourney
         
         # 获取图像生成客户端（优先FLUX）
-        self.image_client = self.api_manager.get_image_client(prefer_midjourney=False)
+        self.image_client = self.api_manager.get_image_client(prefer_midjourney=self.prefer_midjourney)
         
         if not self.image_client:
             raise RuntimeError("无法获取图像生成客户端，请检查配置")
@@ -63,6 +65,12 @@ class PortraitAgent:
         try:
             if task.task_type == "generate_portrait":
                 result = self._generate_portrait(task.parameters)
+            elif task.task_type == "generate_design_sheet":
+                result = self._generate_design_sheet(task.parameters)
+            elif task.task_type == "generate_base_portrait":
+                result = self._generate_base_portrait(task.parameters)
+            elif task.task_type == "generate_expression_batch":
+                result = self._generate_expression_batch(task.parameters)
             else:
                 raise ValueError(f"不支持的任务类型: {task.task_type}")
             
@@ -91,20 +99,15 @@ class PortraitAgent:
             )
     
     def _generate_portrait(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        生成角色立绘
-        
-        Args:
-            parameters: 任务参数
-        
-        Returns:
-            生成结果
-        """
         char_name = parameters.get("character_name", "角色")
         description = parameters.get("description", parameters.get("persona", ""))
         expressions = parameters.get("expressions", ["neutral", "happy", "sad", "angry"])
         project_root = Path(parameters.get("project_root", "output/project"))
         aspect = parameters.get("aspect", "2:3")
+        model_choice = parameters.get("model")
+        prefer_midjourney = parameters.get("prefer_midjourney")
+
+        self._ensure_image_client(prefer_midjourney, model_choice)
 
         # 用于一致性生成的参考图列表（基础立绘生成后再填充）
         reference_images: List[Dict[str, Any]] = []
@@ -161,12 +164,95 @@ class PortraitAgent:
             "character_name": char_name,
             "expression_count": len(expressions),
             "expressions": expressions,
-            "generation_time": datetime.now().isoformat()
+            "generation_time": datetime.now().isoformat(),
+            "model": type(self.image_client).__name__,
         }
 
         return {
             "files": output_files,
             "metadata": metadata
+        }
+
+    def _generate_design_sheet(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """仅生成设定图，不遵循命名规则，保存到指定路径。"""
+        char_name = parameters.get("character_name", "角色")
+        prompt = parameters.get("prompt") or self.build_design_prompt(char_name, parameters.get("description", ""))
+        save_path = Path(parameters.get("save_path", "design.png"))
+        aspect = parameters.get("aspect", "3:2")
+        model_choice = parameters.get("model") or "midjourney"
+        self._ensure_image_client(None, model_choice)
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path = self._generate_and_download(prompt=prompt, output_path=save_path, params={"aspect": aspect}, images=None)
+        if not file_path:
+            raise RuntimeError("设定图生成失败")
+
+        return {
+            "files": [file_path.as_posix()],
+            "metadata": {"mode": "design_sheet", "model": type(self.image_client).__name__},
+        }
+
+    def _generate_base_portrait(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """生成基准立绘（neutral）。"""
+        char_id = parameters.get("char_id") or parameters.get("character_name", "role")
+        char_name = parameters.get("character_name", char_id)
+        prompt = parameters.get("prompt") or self._build_portrait_prompt(char_name, parameters.get("description", ""), "neutral")
+        output_path = Path(parameters.get("output_path", "base.png"))
+        aspect = parameters.get("aspect", "2:3")
+        model_choice = parameters.get("model") or "flux"
+        self._ensure_image_client(None, model_choice)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path = self._generate_and_download(prompt=prompt, output_path=output_path, params={"aspect": aspect}, images=None)
+        if not file_path:
+            raise RuntimeError("基准立绘生成失败")
+
+        return {
+            "files": [file_path.as_posix()],
+            "metadata": {"mode": "base", "model": type(self.image_client).__name__},
+        }
+
+    def _generate_expression_batch(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """基于基准图批量生成表情差分（一次最多4张视具体接口而定）。"""
+        char_id = parameters.get("char_id") or parameters.get("character_name", "role")
+        char_name = parameters.get("character_name", char_id)
+        description = parameters.get("description", "")
+        expressions: List[str] = parameters.get("expressions", [])
+        aspect = parameters.get("aspect", "2:3")
+        model_choice = parameters.get("model") or "flux"
+        base_image = parameters.get("base_image_path")
+        output_dir = Path(parameters.get("output_dir", "output/portraits"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not expressions:
+            return {"files": [], "metadata": {"mode": "expression_batch", "model": model_choice}}
+
+        self._ensure_image_client(None, model_choice)
+        support_reference = "FluxClient" in type(self.image_client).__name__
+        if not support_reference:
+            raise RuntimeError("表情差分仅支持Flux客户端，请选择Flux")
+        ref_images = []
+        if base_image and support_reference:
+            ref = self._prepare_reference_image(Path(base_image))
+            if ref:
+                ref_images = [ref]
+
+        output_files: List[str] = []
+        for exp in expressions:
+            prompt = self._build_portrait_prompt(char_name, description, exp, use_reference=support_reference)
+            out_path = output_dir / f"{char_id}_{exp}.png"
+            file_path = self._generate_and_download(
+                prompt=prompt,
+                output_path=out_path,
+                params={"aspect": aspect},
+                images=ref_images if support_reference else None,
+            )
+            if file_path:
+                output_files.append(file_path.as_posix())
+
+        return {
+            "files": output_files,
+            "metadata": {"mode": "expression_batch", "model": type(self.image_client).__name__, "count": len(output_files)},
         }
     
     def _build_portrait_prompt(
@@ -201,6 +287,14 @@ class PortraitAgent:
         )
         
         return prompt
+
+    def build_design_prompt(self, char_name: str, description: str) -> str:
+        """生成设定图提示词模板。"""
+        desc = description or ""
+        return (
+            f"anime character design sheet, {char_name}, full body front and side, outfit variants, clear partition layout, "
+            f"5 expression close-ups, {desc}, ultra high detail, clean white background, professional reference sheet"
+        )
     
     def _prepare_reference_image(self, image_path: Path) -> Optional[Dict[str, Any]]:
         """准备参考图，迭代压缩到安全体积，返回FLUX可接受的b64结构。"""
@@ -274,6 +368,26 @@ class PortraitAgent:
             self._ensure_transparency(final_path)
 
         return final_path
+
+    def _ensure_image_client(self, prefer_midjourney: Optional[bool], model_choice: Optional[str]):
+        """根据用户选择切换图像客户端。"""
+        target_midjourney = None
+        if model_choice:
+            target_midjourney = model_choice.lower() == "midjourney"
+        elif prefer_midjourney is not None:
+            target_midjourney = bool(prefer_midjourney)
+
+        if target_midjourney is None:
+            return
+
+        current_is_mj = "MidjourneyClient" in type(self.image_client).__name__
+        if current_is_mj == target_midjourney and self.image_client:
+            return
+
+        client = self.api_manager.get_image_client(prefer_midjourney=target_midjourney)
+        if client:
+            self.image_client = client
+            self.logger.info(f"已切换图像客户端: {type(client).__name__}")
     
     def cleanup(self):
         """清理资源"""

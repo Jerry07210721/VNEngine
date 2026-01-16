@@ -44,6 +44,7 @@ from src.ai.core.models import (
 )
 from src.ai.agents import PlotAgent, PortraitAgent, BackgroundAgent, CGAgent, VoiceAgent, BGMAgent, IntegratorAgent
 from src.designer.ai_worker import AITaskWorker
+from src.designer.ai_project_window import AIProjectWindow
 from src.packager.packager_manager import PackagerManager
 from src.packager.packager_dialog import PackagerDialog
 
@@ -158,6 +159,9 @@ class VNDesignerMainWindow(QMainWindow):
         self.preview_process: QProcess | None = None
         self.preview_output: list[str] = []
         self.project_dir: Path | None = None
+        
+        # AI辅助工程窗口
+        self.ai_project_window: AIProjectWindow | None = None
 
         self.init_window()
         self.init_menu_bar()
@@ -237,13 +241,24 @@ class VNDesignerMainWindow(QMainWindow):
         self.menuBar().addMenu(ui_menu)
 
         ai_menu = QMenu("AI 辅助(&A)", self)
-        ai_new_project = QAction("新建 AI 工程", self)
+        
+        # 新的AI辅助工程入口
+        ai_project_action = QAction("AI辅助生成", self)
+        ai_project_action.triggered.connect(self.open_ai_project_window)
+        ai_menu.addAction(ai_project_action)
+        
+        ai_menu.addSeparator()
+        
+        # 保留旧的入口（兼容）
+        ai_new_project = QAction("新建 AI 工程（旧版）", self)
         ai_new_project.triggered.connect(self.open_ai_assist)
         ai_menu.addAction(ai_new_project)
 
-        ai_run = QAction("启动 AI 生成", self)
+        ai_run = QAction("启动 AI 生成（旧版）", self)
         ai_run.triggered.connect(self.start_ai_generation)
         ai_menu.addAction(ai_run)
+        
+        ai_menu.addSeparator()
 
         ai_api = QAction("API 配置", self)
         ai_api.triggered.connect(self.open_api_config)
@@ -291,6 +306,15 @@ class VNDesignerMainWindow(QMainWindow):
     def open_ai_assist(self):
         dlg = AIAssistDialog(config_manager=self.config_manager, parent=self)
         dlg.exec()
+    
+    def open_ai_project_window(self):
+        """打开AI辅助工程窗口（新架构）"""
+        if self.ai_project_window is None:
+            self.ai_project_window = AIProjectWindow(self)
+        
+        self.ai_project_window.show()
+        self.ai_project_window.raise_()
+        self.ai_project_window.activateWindow()
 
     def open_api_config(self):
         dlg = APIConfigDialog(config_manager=self.config_manager, parent=self)
@@ -364,6 +388,7 @@ class VNDesignerMainWindow(QMainWindow):
             style=story_cfg.get("style", ""),
             plot_outline=story_cfg.get("plot_outline", ""),
             text_volume=int(story_cfg.get("text_volume", 5000)),
+            chapter_count=int(story_cfg.get("chapter_count", 5)),
             enable_choice_node=True,
             enable_condition_node=True,
             condition_type="favorability",

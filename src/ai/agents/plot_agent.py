@@ -533,7 +533,7 @@ class PlotAgent:
                     if speaker == first_person_name and not first_person_has_voice:
                         voice_path = ""
                     else:
-                        voice_path = f"resources/voice/{speaker}/{bg_slug}_{dlg_idx}.mp3"
+                        voice_path = f"resources/voices/{speaker}/{bg_slug}_{dlg_idx}.mp3"
 
                     content_parts = []
                     if dialogue.get("action"):

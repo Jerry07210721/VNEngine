@@ -102,7 +102,7 @@ class Integrator:
         self.portraits_dir = self.resources_dir / "portraits"
         self.backgrounds_dir = self.resources_dir / "backgrounds"
         self.cg_dir = self.resources_dir / "cg"
-        self.voice_dir = self.resources_dir / "voice"
+        self.voice_dir = self.resources_dir / "voices"
         self.bgm_dir = self.resources_dir / "bgm"
         
         for dir_path in [self.portraits_dir, self.backgrounds_dir, 
@@ -736,7 +736,7 @@ class Integrator:
         self.portraits_dir = self.resources_dir / "portraits"
         self.backgrounds_dir = self.resources_dir / "backgrounds"
         self.cg_dir = self.resources_dir / "cg"
-        self.voice_dir = self.resources_dir / "voice"
+        self.voice_dir = self.resources_dir / "voices"
         self.bgm_dir = self.resources_dir / "bgm"
 
         # 记录数据
@@ -749,7 +749,7 @@ class Integrator:
         self._assign_voice_from_files()
 
         # 预置常见资源子目录
-        for sub in ["portraits", "backgrounds", "cg", "voice", "bgm", "plot"]:
+        for sub in ["portraits", "backgrounds", "cg", "voices", "bgm", "plot"]:
             (self.resources_dir / sub).mkdir(parents=True, exist_ok=True)
 
         return self.generate_project_file(user_config)
