@@ -200,7 +200,8 @@ class FluxClient(BaseAPIClient):
         save_dir: str,
         params: Optional[Dict[str, Any]] = None,
         images: Optional[List[Dict[str, Any]]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> tuple[bool, List[str], List[str]]:
         """
         生成图像并下载（一站式接口）
@@ -209,7 +210,7 @@ class FluxClient(BaseAPIClient):
             (是否成功, 本地文件路径列表, 图像URL列表)
         """
         try:
-            task_info = self.generate(prompt, params, images)
+            task_info = self.generate(prompt, params, images, model=model)
             task_id = task_info["id"]
 
             result = self.wait_for_completion(task_id, timeout)
@@ -240,7 +241,8 @@ class FluxClient(BaseAPIClient):
         save_dir: str,
         params: Optional[Dict[str, Any]] = None,
         images: Optional[List[Dict[str, Any]]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> List[tuple[bool, str, List[str]]]:
         """
         批量生成图像
@@ -265,7 +267,8 @@ class FluxClient(BaseAPIClient):
                 save_dir=save_dir,
                 params=params,
                 images=images,
-                timeout=timeout
+                timeout=timeout,
+                model=model,
             )
             
             results.append((success, prompt, image_urls))

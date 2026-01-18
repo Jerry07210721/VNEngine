@@ -22,7 +22,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QSplitter,
     QDialog,
-    QInputDialog,
 )
 from PyQt6.QtCore import Qt
 
@@ -30,7 +29,7 @@ from src.designer.ai_base_panel import AIBasePanelWidget
 from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
 from src.ai.core.models import CharacterConfig
-from src.ai.api.gptsovits_client import GPTSoVITSClient
+from src.designer.voice_model_dialog import VoiceModelPickerDialog, get_gptsovits_client
 
 
 class AICharacterConfigPanel(AIBasePanelWidget):
@@ -156,7 +155,7 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         ref_layout.addWidget(self.browse_button)
         
         self.clear_ref_button = QPushButton("清除")
-        self.clear_ref_button.clicked.connect(lambda: self.ref_image_edit.clear())
+        self.clear_ref_button.clicked.connect(self._clear_reference_image)
         ref_layout.addWidget(self.clear_ref_button)
         
         ref_group.setLayout(ref_layout)
@@ -179,12 +178,7 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         voice_btn_row.addWidget(self.voice_model_id_edit)
         query_btn = QPushButton("查询模型ID")
         query_btn.clicked.connect(self.query_voice_model)
-        create_btn = QPushButton("创建模型")
-        create_btn.clicked.connect(self.create_voice_model)
-        delete_btn = QPushButton("删除模型")
-        delete_btn.clicked.connect(self.delete_voice_model)
-        for btn in (query_btn, create_btn, delete_btn):
-            voice_btn_row.addWidget(btn)
+        voice_btn_row.addWidget(query_btn)
         voice_layout.addRow("音色模型ID:", voice_btn_row)
         
         voice_group.setLayout(voice_layout)
@@ -250,6 +244,27 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         bottom_layout.addWidget(self.refresh_button)
         
         main_layout.addLayout(bottom_layout)
+
+    def _set_form_signals_blocked(self, blocked: bool):
+        widgets = [
+            self.char_id_edit,
+            self.char_name_edit,
+            self.role_edit,
+            self.is_player_check,
+            self.persona_edit,
+            self.ref_image_edit,
+            self.voice_tone_edit,
+            self.voice_model_id_edit,
+        ]
+        for w in widgets:
+            try:
+                w.blockSignals(blocked)
+            except Exception:
+                pass
+
+    def _clear_reference_image(self):
+        self.ref_image_edit.clear()
+        self.on_char_data_changed()
         
     def add_character(self):
         """添加新角色"""
@@ -313,9 +328,9 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         # 加载角色数据到编辑区
         item = self.char_list.item(row)
         char = item.data(Qt.ItemDataRole.UserRole)
-        
-        # 阻止信号（避免触发修改）
-        self.blockSignals(True)
+
+        # 阻止控件信号（避免加载时触发 on_char_data_changed 覆盖原数据）
+        self._set_form_signals_blocked(True)
         
         self.char_id_edit.setText(char.char_id)
         self.char_name_edit.setText(char.char_name)
@@ -325,8 +340,8 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         self.ref_image_edit.setText(char.reference_image or "")
         self.voice_tone_edit.setText(char.voice_tone or "")
         self.voice_model_id_edit.setText(char.voice_model_id or "")
-        
-        self.blockSignals(False)
+
+        self._set_form_signals_blocked(False)
     
     def on_char_data_changed(self):
         """角色数据改变"""
@@ -373,131 +388,16 @@ class AICharacterConfigPanel(AIBasePanelWidget):
             self.ref_image_edit.setText(file_path)
             self.on_char_data_changed()
 
-    def _get_gptsovits_client(self) -> GPTSoVITSClient | None:
-        cfg = self.config_manager.load_config() or {}
-        gpt_cfg = (cfg.get("api_keys") or {}).get("gptsovits", {})
-        sign = gpt_cfg.get("sign", "")
-        base_url = gpt_cfg.get("base_url", "https://openapi.lipvoice.cn")
-
-        if not sign:
-            QMessageBox.warning(self, "缺少签名", "请先在 API 配置中填写 gptsovits 的 sign")
-            return None
-
-        try:
-            return GPTSoVITSClient(sign=sign, base_url=base_url)
-        except Exception as exc:
-            QMessageBox.critical(self, "初始化失败", f"无法创建 gptsovits 客户端：{exc}")
-            return None
-
     def query_voice_model(self):
-        client = self._get_gptsovits_client()
+        client = get_gptsovits_client(self.config_manager, self)
         if not client:
             return
 
-        try:
-            data = client.list_reference_models(page=1, page_size=20)
-        except Exception as exc:
-            QMessageBox.critical(self, "获取失败", f"无法获取模型列表：{exc}")
-            return
-
-        models = data.get("list", []) if isinstance(data, dict) else []
-        if not models:
-            QMessageBox.information(self, "无数据", "未获取到模型列表")
-            return
-
-        picker = QDialog(self)
-        picker.setWindowTitle("选择语音模型")
-        vbox = QVBoxLayout(picker)
-        list_widget = QListWidget()
-        for m in models:
-            audio_id = m.get("audioId", "")
-            name = m.get("name", "")
-            desc = m.get("describe", "")
-            text = f"{name} | {audio_id} | {desc}"
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, audio_id)
-            list_widget.addItem(item)
-        vbox.addWidget(list_widget)
-        btns = QHBoxLayout()
-        ok_btn = QPushButton("确定")
-        cancel_btn = QPushButton("取消")
-        btns.addStretch(1)
-        btns.addWidget(ok_btn)
-        btns.addWidget(cancel_btn)
-        vbox.addLayout(btns)
-
-        def apply_selection():
-            item = list_widget.currentItem()
-            if item:
-                self.voice_model_id_edit.setText(str(item.data(Qt.ItemDataRole.UserRole)))
-            picker.accept()
-
-        list_widget.itemDoubleClicked.connect(lambda _: apply_selection())
-        ok_btn.clicked.connect(apply_selection)
-        cancel_btn.clicked.connect(picker.reject)
-
-        picker.exec()
-
-    def create_voice_model(self):
-        client = self._get_gptsovits_client()
-        if not client:
-            return
-
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择语音样本 (2-60秒, <50MB)",
-            str(Path.cwd()),
-            "Audio Files (*.mp3 *.wav *.m4a)"
-        )
-        if not file_path:
-            return
-
-        name, ok = QInputDialog.getText(self, "模型名称", "请输入模型名称：")
-        if not ok or not name.strip():
-            return
-        describe, _ = QInputDialog.getText(self, "模型描述", "可选描述：")
-
-        try:
-            data = client.upload_reference_model(file_path=file_path, name=name.strip(), describe=describe.strip())
-        except Exception as exc:
-            QMessageBox.critical(self, "创建失败", f"模型创建失败：{exc}")
-            return
-
-        audio_id = data.get("audioId") if isinstance(data, dict) else None
-        if audio_id:
-            self.voice_model_id_edit.setText(str(audio_id))
-            QMessageBox.information(self, "创建成功", f"模型已创建：{audio_id}")
-        else:
-            QMessageBox.warning(self, "创建结果", "模型创建成功但未返回 audioId")
-
-    def delete_voice_model(self):
-        client = self._get_gptsovits_client()
-        if not client:
-            return
-
-        audio_id = self.voice_model_id_edit.text().strip()
-        if not audio_id:
-            QMessageBox.warning(self, "缺少ID", "请先填入要删除的模型ID")
-            return
-
-        confirm = QMessageBox.question(
-            self,
-            "确认删除",
-            f"确定删除模型 {audio_id} 吗？删除后不可恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            client.delete_reference_model(audio_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "删除失败", f"删除失败：{exc}")
-            return
-
-        self.voice_model_id_edit.clear()
-        QMessageBox.information(self, "已删除", "模型已删除")
+        dlg = VoiceModelPickerDialog(client, self, allow_manage=False)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            audio_id = dlg.selected_audio_id()
+            if audio_id:
+                self.voice_model_id_edit.setText(str(audio_id))
     
     def refresh(self):
         """刷新界面，从工程加载数据"""
@@ -512,8 +412,12 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         self.edit_widget.setEnabled(False)
         self.remove_button.setEnabled(False)
     
-    def save_to_project(self):
-        """保存所有角色到工程"""
+    def save_to_project(self, silent: bool = False):
+        """保存所有角色到工程
+
+        Args:
+            silent: 为 True 时不弹出“保存成功”提示框（用于主控面板自动同步）。
+        """
         if not self.project_manager.current_project:
             QMessageBox.warning(self, "提示", "没有打开的工程")
             return
@@ -528,5 +432,6 @@ class AICharacterConfigPanel(AIBasePanelWidget):
         # 更新到工程
         self.project_manager.update_character_config(chars)
         
-        QMessageBox.information(self, "成功", f"已保存 {len(chars)} 个角色到工程")
+        if not silent:
+            QMessageBox.information(self, "成功", f"已保存 {len(chars)} 个角色到工程")
         self.mark_modified()

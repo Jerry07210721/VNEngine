@@ -5,6 +5,7 @@ VNEngine 多智能体协作系统 - 语音Agent
 """
 
 from typing import Dict, Any, List, Optional
+import re
 from pathlib import Path
 import time
 from datetime import datetime
@@ -14,6 +15,7 @@ from ..api.api_manager import APIManager
 from ..core.config_manager import ConfigManager
 from ..core.models import TaskAssignment, AgentResponse
 from ..log.logger import get_logger
+from ..utils.voice_emotion import emotion_to_ext, normalize_ext
 
 
 class VoiceAgent:
@@ -140,14 +142,53 @@ class VoiceAgent:
         text = parameters.get("text") or parameters.get("content") or ""
         emotion = parameters.get("emotion", "neutral")
         audio_id = parameters.get("voice_model_id") or parameters.get("audio_id")
+        tts_style = parameters.get("tts_style") or parameters.get("style")
+        tts_genre = parameters.get("tts_genre") if parameters.get("tts_genre") is not None else parameters.get("genre")
+        use_emotion_ext = parameters.get("use_emotion_ext")
+        emotion_strength = parameters.get("emotion_strength")
         retries = int(parameters.get("retries", 2))
         output_path = self._resolve_output_path(parameters, project_root)
 
+        text = self._strip_emotion_prefix(text)
         if not text:
             raise ValueError("文本为空，无法生成语音")
 
-        ext = self._map_emotion(emotion)
+        # ext（语气参数）通过接口字段传递；不再依赖把情绪拼进文本。
+        if use_emotion_ext is None:
+            use_emotion_ext = True
+        use_emotion_ext = bool(use_emotion_ext)
+
+        explicit_ext = parameters.get("tts_ext")
+        if explicit_ext is None:
+            explicit_ext = parameters.get("ext")
+
+        ext = None
+        if isinstance(explicit_ext, dict) and explicit_ext:
+            ext = self._normalize_ext(explicit_ext)
+        elif use_emotion_ext:
+            ext = self._normalize_ext(self._map_emotion(emotion))
+
+        try:
+            strength = float(emotion_strength) if emotion_strength is not None else 1.0
+        except Exception:
+            strength = 1.0
+        if strength < 0.0:
+            strength = 0.0
+        if strength > 1.0:
+            strength = 1.0
+        if ext and strength != 1.0:
+            ext = {k: max(0.0, min(1.0, float(v) * strength)) for k, v in ext.items()}
+
         audio_id = self._get_audio_id_for_character(speaker, audio_id)
+
+        # 允许从 UI/任务参数覆盖 style/genre
+        if tts_style is not None:
+            tts_style = str(tts_style)
+        if tts_genre is not None:
+            try:
+                tts_genre = int(tts_genre)
+            except Exception:
+                tts_genre = None
 
         last_error = None
         for attempt in range(1, retries + 1):
@@ -157,13 +198,19 @@ class VoiceAgent:
                     audio_id=audio_id,
                     save_path=str(output_path),
                     ext=ext,
+                    style=tts_style,
+                    genre=tts_genre,
                 )
                 if success:
                     rel = self._to_relative(output_path, project_root)
                     metadata = {
                         "speaker": speaker,
                         "emotion": emotion,
+                        "use_emotion_ext": use_emotion_ext,
+                        "emotion_strength": strength,
                         "audio_id": audio_id,
+                        "tts_style": tts_style,
+                        "tts_genre": tts_genre,
                         "voice_url": voice_url,
                         "generation_time": datetime.now().isoformat(),
                         "retries": attempt - 1,
@@ -174,6 +221,28 @@ class VoiceAgent:
                 last_error = str(exc)
                 self.logger.warning(f"尝试{attempt}/{retries}失败: {exc}")
         raise RuntimeError(last_error or "语音合成失败")
+
+    def _strip_emotion_prefix(self, text: str) -> str:
+        """去掉对白开头的情绪提示词，避免被 TTS 朗读。
+
+        支持格式：
+        - [开心] 你好
+        - 【平静】你好
+        - (愤怒) 你好
+        - （惊讶）你好
+        - 情绪:开心 你好 / 情绪：开心 你好
+        """
+        if not isinstance(text, str):
+            return ""
+        s = text.strip()
+        if not s:
+            return s
+
+        # 方括号/书名号/圆括号前缀
+        s = re.sub(r"^(?:\[[^\]]{1,12}\]|【[^】]{1,12}】|\([^)]{1,12}\)|（[^）]{1,12}）)\s*", "", s)
+        # 显式“情绪/语气”前缀
+        s = re.sub(r"^(?:情绪|语气|情感)\s*[:：]\s*[^\s]{1,12}\s*", "", s)
+        return s.strip()
 
     def _synthesize_batch(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """批量生成，逐条容错继续。"""
@@ -243,19 +312,14 @@ class VoiceAgent:
         ]
     
     def _map_emotion(self, emotion: str) -> Dict[str, float]:
-        """映射情绪到GPT-SoVITS参数"""
+        """映射情绪到 GPT-SoVITS ext（支持中文/英文输入）。"""
 
-        emotion_mapping = {
-            "happy": {"happy": 0.8, "calm": 0.2},
-            "sad": {"melancholic": 0.7, "calm": 0.3},
-            "angry": {"angry": 0.8, "afraid": 0.2},
-            "surprised": {"surprised": 0.9, "happy": 0.1},
-            "embarrassed": {"afraid": 0.3, "happy": 0.3, "calm": 0.4},
-            "neutral": {"calm": 1.0},
-            "worried": {"afraid": 0.5, "melancholic": 0.3, "calm": 0.2},
-        }
+        return emotion_to_ext(emotion)
 
-        return emotion_mapping.get(emotion, {"calm": 1.0})
+    def _normalize_ext(self, ext: Dict[str, Any]) -> Dict[str, float]:
+        """把 ext 规范成 8 维并 clamp 到 0-1。"""
+
+        return normalize_ext(ext)
     
     def _get_audio_id_for_character(self, char_name: str, configured_id: Optional[str]) -> str:
         """优先使用角色配置中的audio_id，fallback到示例值"""

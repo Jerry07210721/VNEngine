@@ -17,39 +17,39 @@ agent_settings:
     retry_delay: 5
 api_keys:
   claude:
-    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    api_key: ENC::gAAAAABpbFzYDDVTh9rauMn6JKMuJuyDxEG-Ij5bb97iz94fLQYI4qAlGTM7E8ovn3y90lpOV9E5h3YfrJsObMOUkK-BMVQKtXVZ2TzADnd9V1y0r7v6Zs9MzalLN7DFeAEperTC4uUClQZ1lTVm2c44bq8jsJa0-1yvuJV9TyA9LsPui6HHlT0NreOY-xD76Mhl7UnynXHammostpry6oqrakkFn-G1qGBNkoBboy7eNP-TCNTa-QazTNTuiy4tBlIHqRGJByZTlDUKUyJ8wIcJ5wRFLAnqbRKRSKlkK29TUqfMTqKrmHdkrDiZ--W75rT9W2eBf4EB3UDdemjA_F-xpnlvV6IGpVMOTq4pOzGpppduU24ILlnHHW99yuqhbKblMeYv3KFbKy_b1XyMP4wBWoC2ZFJg-dEYRsUIZkDHuo3UF8EybZV-v6TjhbFDCdLogYLyl9B-
     base_url: https://llm-api.mmchat.xyz
     fallback_model: claude-sonnet-4-5-20250929
     primary_model: claude-sonnet-4-20250514
   flux:
-    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    api_key: ENC::gAAAAABpbFzYToGIIDENoacRg3r8hUcYRc3jbT2s5UUpbyBcjGNe5RyTI6DLkiHOy2hMRIj2LmXrUYoGh4WJ9gtcii9oThxkQSwrGb532K2Y96ETig_YWLRG-hFfcC0ki-yFX1RSDgi50ucfxkVcbjenkg4L7uVsM4Gur4lUEWBW2kbZ_1MHoDdTdcUGPLmhoCdRw8GkVaIguujuwcXgHa7SZM82prL2IALmmeIS88mcTJq8JP4FGx4H6peXyoSm3qzDymNS6BRg6NFvL4_wZ0BTHBPbTG4IIMxoTKnHVve5XrIwK4qwZVtEHoqZzoyCH6lBrCe_QcTBWNMciR_DTmY8xs-GyG7iH_9EeFet0ECIay5hOPzO1bTn5DYIRGeBI0LdDynaFkypsbGP115JcGpLP5-aellzlEOWhvMLw6N0rPp9YgOyx0Epn3Ob0ZTyia9e3-Zpwyqy
     app_id: 5c80d2bc149d17f136152c771d5ba7cb
     base_url: https://api.mmchat.xyz
     fallback_model: flux-2-pro
     primary_model: flux-kontext
   gptsovits:
-    api_key: 0rCx53AWbYJ9cIwFVPMhdWuEqBinUiaX
+    api_key: ENC::gAAAAABpbFzYjtbDT7-dxW3MXJrTtAECbNkudJjDPkW09v_IckCESwsASPB6NoPDmqw6MWVc7qObSrTlLhaL1l1oqd7qvlXlpSdm6RjoOTF-S9P-rPNc7VpTrhZCjl_KB52BvCxrp8my
     base_url: https://openapi.lipvoice.cn
     fallback_model: ''
     primary_model: ''
-    sign: 0rCx53AWbYJ9cIwFVPMhdWuEqBinUiaX
+    sign: ENC::gAAAAABpbFzY_-0aORBz08TEtQ8kGzTKiJ9tCcMm4IdmuyVik3bZ5uSHJ0cw98AUycIM1KWWI59DpmbBhhO-Xxvb69bdwFn-BZRZjA4g7BTJHQp_h-7ZMaHvOKY-MZQTrpkRM1bIP0g_
   kimi:
-    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    api_key: ENC::gAAAAABpbFzYZt55KlmM76Fd5SzHashDlGC3HCP0dcgtOJ6BKx9moVF3MTs1scLwO222d4Kb1rUb5n3c8DisoX4rmZ6G-1Ue0prA_H1TMNkWZjaccWWsrarwLBo0NY-I9yP__z-EOPbDWqJyj9dG55lAroCw-6NAn4ODeF1d2zlUZ1uD8hQGT7s6iF0q0WMXcS505whNdO_zoBwV3ZxSB8fDD74uHB_gsBxdekb7N-R7xyMV8pU591hP3CcC-CSOn5Eqz3m32KNic1v3D82JT7dVxeXAVYnqrXIMzceOvaFBCmBncpHLZ6zZySJxMXGNq5vE0pN-RWrXMds88m20ZUB16BRtnSlkPj-5KiJszt5Ngw-GPo6ra6h2cT22avuEC0NUD4sZC76EdulQW7TvlhkfLYp4WB4XmuGV8h0WYxgL5h6jpsFG9CbpZqNTHmxZeB62BF-7v4xG
     base_url: https://llm-api.mmchat.xyz
     fallback_model: anthropic/kimi-k2-thinking
     primary_model: anthropic/kimi-k2-0905-preview
   midjourney:
-    api_key: sk-live-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJNZXRhQ2hhdCIsInN1YiI6IjY5Njc4MTcxMzA3OGQwNGE2MDhhMTJjNCIsImNsaWVudF9pZCI6IjVjODBkMmJjMTQ5ZDE3ZjEzNjE1MmM3NzFkNWJhN2NiIiwic2NvcGUiOiJtaWRqb3VybmV5IGFnZW50IiwiaWF0IjoxNzY4MzkxMzAwfQ.dosAbLhzF5I52vZDpGgQiOdyLkIfhKktTEugmCL8V7k
+    api_key: ENC::gAAAAABpbFzYIp2hWlVGHTfEBGeFN1FqvZtC25FB8KfL0EqJD4JKUE7k32QO2QbDgSdF4YkK-tSuffqi0YiytAchjcKYnqSpMHX0M7tQwP8YvXxBlg8a-fn817KENm0py1Q4iUPTexdu1wdWVkMP2CX1fPgdCTdgD6dCRrsZoJAFVU582sT8Hfz728JItv20YXm2p5lZUU3_glnD2fhBAgTZlDOzD2JT2u19kdG_3_ZpGSvIGQ7_SDUw7yp7NJiwdYwY4IFCg5EnODvuSlTz2TcWKm27IkDAynH6zVTjoj0PtBLghkYnw9uS3l09EgWpuLfA01BKvXDgFU10q3J8oEKfG8LMEtDyMy2QoZJyUnHQoPOetQae4v6Gorw8vFyHMyl6f3wSBDsayByviTfNisbqYEZ72E3hoSftap2In68Nehi35-PiMe1DG5txGG10kHaMID6yEmqV
     app_id: 5c80d2bc149d17f136152c771d5ba7cb
     base_url: https://api.mmchat.xyz
     fallback_model: mj-v61
     primary_model: mj-v7
   suno:
-    api_key: sk-4c22a8401da4401b8ea91e87f79ac413
+    api_key: ENC::gAAAAABpbFzY16oOufn6V1x7vP9RAbcn-T37lM2qhhoL_Fo9QLYNMECcI-POle4Tmb5ww__KbQvXTS8UXSfs3n3GqdWc9oNXqc9YZq6GFSnA3xMJaqoCAfPj_4TQDLF0vOTwwWNOess1
     base_url: https://dzwlai.com/apiuser
     fallback_model: chirp-v4-5+
     primary_model: chirp-v5
-    token: sk-4c22a8401da4401b8ea91e87f79ac413
+    token: ENC::gAAAAABpbFzY6-ZnLf0tZRWS9dMPXVJBgoJqsDGaqb6LoB8ygx58hkLii5I56xzhvUXmcfLQQM26ZHyYA5hlCz8Mr_QceO9_bTdWkYWhg38sHg73ekdMQk-zrprj78z-QkWC_f5zEJLa
     user_id: '17328098894'
 character_config:
 - char_id: 夏栀

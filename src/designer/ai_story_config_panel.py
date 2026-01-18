@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QWidget,
     QDoubleSpinBox,
+    QComboBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -101,9 +102,53 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         self.chapter_count_spin.setSuffix(" 章")
         self.chapter_count_spin.valueChanged.connect(self.mark_modified)
         scale_layout.addRow("章节数量:", self.chapter_count_spin)
+
+        self.cg_count_spin = QSpinBox()
+        self.cg_count_spin.setRange(0, 20)
+        self.cg_count_spin.setValue(0)
+        self.cg_count_spin.setSuffix(" 张/章")
+        self.cg_count_spin.valueChanged.connect(self.mark_modified)
+        scale_layout.addRow("每章CG数量:", self.cg_count_spin)
         
         scale_group.setLayout(scale_layout)
         layout.addWidget(scale_group)
+
+        # ========== 视角设置组 ==========
+        pov_group = QGroupBox("叙述视角（POV）")
+        pov_layout = QFormLayout()
+
+        self.pov_combo = QComboBox()
+        self.pov_combo.addItem("第三人称", "third")
+        self.pov_combo.addItem("第一人称", "first")
+        self.pov_combo.currentIndexChanged.connect(self._on_pov_changed)
+        self.pov_combo.currentIndexChanged.connect(self.mark_modified)
+        pov_layout.addRow("视角:", self.pov_combo)
+
+        self.first_person_name_edit = QLineEdit()
+        self.first_person_name_edit.setPlaceholderText("如：我")
+        self.first_person_name_edit.textChanged.connect(self.mark_modified)
+        pov_layout.addRow("第一人称代称:", self.first_person_name_edit)
+
+        self.fp_has_portrait_check = QCheckBox("第一人称有立绘")
+        self.fp_has_portrait_check.stateChanged.connect(self.mark_modified)
+        pov_layout.addRow("立绘:", self.fp_has_portrait_check)
+
+        self.fp_has_voice_check = QCheckBox("第一人称有配音")
+        self.fp_has_voice_check.stateChanged.connect(self.mark_modified)
+        pov_layout.addRow("语音:", self.fp_has_voice_check)
+
+        self.fp_cg_presence_check = QCheckBox("第一人称会出现在CG中")
+        self.fp_cg_presence_check.setChecked(True)
+        self.fp_cg_presence_check.stateChanged.connect(self.mark_modified)
+        pov_layout.addRow("CG出镜:", self.fp_cg_presence_check)
+
+        self.fp_cg_notes_edit = QLineEdit()
+        self.fp_cg_notes_edit.setPlaceholderText("如：只出现手/背影；不露脸等")
+        self.fp_cg_notes_edit.textChanged.connect(self.mark_modified)
+        pov_layout.addRow("CG说明:", self.fp_cg_notes_edit)
+
+        pov_group.setLayout(pov_layout)
+        layout.addWidget(pov_group)
         
         # ========== 节点类型组 ==========
         node_group = QGroupBox("节点类型")
@@ -192,6 +237,43 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         
         scroll_area.setWidget(content_widget)
         main_layout.addWidget(scroll_area)
+
+        # 初始化POV可用性
+        self._on_pov_changed()
+
+    def _set_form_signals_blocked(self, blocked: bool):
+        widgets = [
+            self.title_edit,
+            self.style_edit,
+            self.outline_edit,
+            self.text_volume_spin,
+            self.chapter_count_spin,
+            self.cg_count_spin,
+            self.enable_choice_check,
+            self.enable_condition_check,
+            self.condition_type_edit,
+            self.char_hint_weight_spin,
+            self.pov_combo,
+            self.first_person_name_edit,
+            self.fp_has_portrait_check,
+            self.fp_has_voice_check,
+            self.fp_cg_presence_check,
+            self.fp_cg_notes_edit,
+        ]
+        for w in widgets:
+            try:
+                w.blockSignals(blocked)
+            except Exception:
+                pass
+
+    def _on_pov_changed(self, *_):
+        pov = self.pov_combo.currentData() if hasattr(self, "pov_combo") else "third"
+        enabled = (pov == "first")
+        self.first_person_name_edit.setEnabled(enabled)
+        self.fp_has_portrait_check.setEnabled(enabled)
+        self.fp_has_voice_check.setEnabled(enabled)
+        self.fp_cg_presence_check.setEnabled(enabled)
+        self.fp_cg_notes_edit.setEnabled(enabled)
         
     def on_condition_check_changed(self, state):
         """条件节点复选框状态改变"""
@@ -202,9 +284,9 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         """刷新界面，从工程加载数据"""
         if self.project_manager.current_project:
             story_config = self.project_manager.current_project.story_config
-            
-            # 阻止信号触发（避免标记为已修改）
-            self.blockSignals(True)
+
+            # 阻止控件信号触发（避免刷新时触发 mark_modified）
+            self._set_form_signals_blocked(True)
             
             self.title_edit.setText(story_config.title)
             self.style_edit.setText(story_config.style)
@@ -214,18 +296,39 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             # 章节数量（如果有的话）
             if hasattr(story_config, 'chapter_count'):
                 self.chapter_count_spin.setValue(story_config.chapter_count)
+
+            if hasattr(story_config, 'cg_count'):
+                self.cg_count_spin.setValue(getattr(story_config, 'cg_count', 0) or 0)
             
             self.enable_choice_check.setChecked(story_config.enable_choice_node)
             self.enable_condition_check.setChecked(story_config.enable_condition_node)
             self.condition_type_edit.setText(story_config.condition_type)
             self.char_hint_weight_spin.setValue(story_config.character_hint_weight)
+
+            # POV
+            pov = getattr(story_config, 'narrative_pov', 'third')
+            idx = 0 if pov == 'third' else 1
+            self.pov_combo.setCurrentIndex(idx)
+            self.first_person_name_edit.setText(getattr(story_config, 'first_person_name', '我') or '我')
+            self.fp_has_portrait_check.setChecked(bool(getattr(story_config, 'first_person_has_portrait', False)))
+            self.fp_has_voice_check.setChecked(bool(getattr(story_config, 'first_person_has_voice', False)))
+            self.fp_cg_presence_check.setChecked(bool(getattr(story_config, 'first_person_cg_presence', True)))
+            self.fp_cg_notes_edit.setText(getattr(story_config, 'first_person_cg_notes', '') or '')
+
+            self._on_pov_changed()
             
-            self.blockSignals(False)
+            self._set_form_signals_blocked(False)
     
-    def save_to_project(self):
-        """保存到工程"""
+    def save_to_project(self, silent: bool = False):
+        """保存到工程
+
+        Args:
+            silent: 为 True 时不弹出“保存成功”提示框（用于主控面板自动同步）。
+        """
         if not self.project_manager.current_project:
             return
+
+        current = self.project_manager.current_project.story_config
         
         # 创建新的故事配置
         story_config = StoryConfig(
@@ -234,18 +337,26 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             plot_outline=self.outline_edit.toPlainText().strip(),
             text_volume=self.text_volume_spin.value(),
             chapter_count=self.chapter_count_spin.value(),
+            cg_count=self.cg_count_spin.value(),
             enable_choice_node=self.enable_choice_check.isChecked(),
             enable_condition_node=self.enable_condition_check.isChecked(),
             condition_type=self.condition_type_edit.text().strip(),
-            character_hint_weight=self.char_hint_weight_spin.value()
+            character_hint_weight=self.char_hint_weight_spin.value(),
+            narrative_pov=self.pov_combo.currentData() or getattr(current, 'narrative_pov', 'third'),
+            first_person_name=self.first_person_name_edit.text().strip() or getattr(current, 'first_person_name', '我'),
+            first_person_has_portrait=self.fp_has_portrait_check.isChecked(),
+            first_person_has_voice=self.fp_has_voice_check.isChecked(),
+            first_person_cg_presence=self.fp_cg_presence_check.isChecked(),
+            first_person_cg_notes=self.fp_cg_notes_edit.text().strip(),
         )
         
         # 更新到工程
         self.project_manager.update_story_config(story_config)
         
         # 提示保存成功
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(self, "成功", "剧情配置已保存到工程")
+        if not silent:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "成功", "剧情配置已保存到工程")
         
         # 触发修改信号（通知主窗口）
         self.mark_modified()

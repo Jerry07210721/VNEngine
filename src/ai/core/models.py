@@ -37,6 +37,13 @@ class StoryConfig(BaseModel):
     first_person_has_voice: bool = Field(False, description="第一人称是否有配音")
     first_person_cg_presence: bool = Field(True, description="第一人称是否会出现在CG中")
     first_person_cg_notes: str = Field("", description="第一人称在CG中的表现说明")
+    cg_count: int = Field(0, description="每章目标CG数量（用于章节详稿标注）", ge=0, le=20)
+
+    # 语音合成（GPT-SoVITS）相关配置
+    voice_tts_style: str = Field("2", description="语音模型版本 style：1=普遍模型, 2=专业模型, 3=多语言模型")
+    voice_tts_genre: int = Field(1, description="语音模型类别 genre：0=参考原音频, 1=语气参考模式", ge=0, le=1)
+    voice_use_emotion_ext: bool = Field(True, description="是否根据对白情绪发送 ext 语气参数")
+    voice_emotion_strength: float = Field(1.0, description="情绪强度缩放(0-1)，用于 ext 参数", ge=0.0, le=1.0)
 
 
 class CharacterConfig(BaseModel):
@@ -253,6 +260,8 @@ class PortraitPendingItem(BaseModel):
     model: Optional[str] = Field(None, description="使用的模型，如midjourney/flux")
     file_paths: List[str] = Field(default_factory=list, description="生成的文件路径列表")
     base_image_path: Optional[str] = Field(None, description="基准图路径（Flux多表情生成用）")
+    mj_state: Dict[str, Any] = Field(default_factory=dict, description="Midjourney三步工作流状态(任务ID/参数/保存路径等)")
+    flux_state: Dict[str, Any] = Field(default_factory=dict, description="FLUX工作流状态(模型/参数/参考图/保存设置等)")
 
 
 class BackgroundPendingItem(BaseModel):
@@ -266,6 +275,8 @@ class BackgroundPendingItem(BaseModel):
     prompt: Optional[str] = Field(None, description="生成提示词")
     model: Optional[str] = Field(None, description="使用的模型")
     file_path: str = Field("", description="文件路径，按命名规则")
+    mj_state: Dict[str, Any] = Field(default_factory=dict, description="Midjourney三步工作流状态(任务ID/参数/保存路径等)")
+    flux_state: Dict[str, Any] = Field(default_factory=dict, description="FLUX工作流状态(模型/参数/参考图/保存设置等)")
 
 
 class CGPendingItem(BaseModel):
@@ -280,6 +291,8 @@ class CGPendingItem(BaseModel):
     prompt: Optional[str] = Field(None, description="生成提示词")
     model: Optional[str] = Field(None, description="使用的模型")
     file_path: str = Field("", description="文件路径，按命名规则")
+    mj_state: Dict[str, Any] = Field(default_factory=dict, description="Midjourney三步工作流状态(任务ID/参数/保存路径等)")
+    flux_state: Dict[str, Any] = Field(default_factory=dict, description="FLUX工作流状态(模型/参数/参考图/保存设置等)")
 
 
 class VoicePendingItem(BaseModel):
@@ -293,6 +306,18 @@ class VoicePendingItem(BaseModel):
     text: str = Field(..., description="对白文本")
     emotion: str = Field("平静", description="语气情绪")
     voice_model_id: Optional[str] = Field(None, description="音色模型ID")
+
+    # 逐条可覆盖的 TTS 参数（对齐 /api/third/tts/create）
+    # - audio_id: 覆盖音色模型ID（audioId）；若为空则使用 voice_model_id
+    # - tts_style: 模型版本（style）
+    # - tts_genre: 模型类别（genre）
+    # - tts_ext: 8维语气参数 ext
+    audio_id: Optional[str] = Field(None, description="覆盖 audioId（优先于 voice_model_id）")
+    tts_style: Optional[str] = Field(None, description="逐条覆盖 style（1/2/3）")
+    tts_genre: Optional[int] = Field(None, description="逐条覆盖 genre（0/1）")
+    tts_ext: Optional[Dict[str, float]] = Field(None, description="逐条覆盖 ext（8维情绪参数）")
+    use_emotion_ext: Optional[bool] = Field(None, description="逐条覆盖：是否根据对白情绪发送 ext")
+
     status: Literal["pending", "generated"] = Field(default="pending")
     prompt: Optional[str] = Field(None, description="生成提示/参数")
     file_path: str = Field("", description="文件路径，按命名规则")
@@ -307,6 +332,13 @@ class BGMPendingItem(BaseModel):
     style: str = Field("", description="曲风，如'钢琴、管弦乐'")
     duration: int = Field(120, description="时长（秒）")
     loop: bool = Field(True, description="是否循环")
+
+    # Suno 自定义/歌词模式参数（对齐 /_open/suno/music/generate）
+    mv_version: Optional[str] = Field(None, description="Suno 模型版本 mvVersion（如 chirp-v4/chirp-v5）")
+    input_type: str = Field("20", description="输入类型 inputType（10=灵感模式, 20=自定义/歌词模式）")
+    make_instrumental: bool = Field(True, description="是否纯音乐 makeInstrumental")
+    tags: str = Field("", description="风格标签 tags")
+
     status: Literal["pending", "generated"] = Field(default="pending")
     prompt: Optional[str] = Field(None, description="生成提示词")
     model: Optional[str] = Field(None, description="使用的模型")

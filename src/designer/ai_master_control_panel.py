@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QMessageBox,
     QFileDialog,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QElapsedTimer
 
@@ -208,11 +209,13 @@ class AIMasterControlPanel(QWidget):
         self.step4_instruction = QTextEdit()
         self.step4_instruction.setPlaceholderText("章节指令，生成后可手动编辑...")
         self.step4_instruction.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(self.step4_instruction, 7)
         step4_layout.addWidget(self.step4_instruction)
 
         self.step4_result = QTextEdit()
         self.step4_result.setPlaceholderText("章节详细内容（可编辑）")
         self.step4_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(self.step4_result, 12)
         step4_layout.addWidget(self.step4_result)
 
         self.step4_status = QLabel("状态：等待指令")
@@ -236,6 +239,7 @@ class AIMasterControlPanel(QWidget):
         self.step5_result = QTextEdit()
         self.step5_result.setPlaceholderText("待生成列表摘要将显示在这里，可手动调整后保存。")
         self.step5_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(self.step5_result, 10)
         step5_layout.addWidget(self.step5_result)
         self.step5_status = QLabel("状态：等待生成")
         step5_layout.addWidget(self.step5_status)
@@ -254,6 +258,7 @@ class AIMasterControlPanel(QWidget):
         self.step6_result = QTextEdit()
         self.step6_result.setPlaceholderText("生成的工程路径与摘要将显示在这里。")
         self.step6_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(self.step6_result, 8)
         step6_layout.addWidget(self.step6_result)
         self.step6_status = QLabel("状态：等待生成")
         step6_layout.addWidget(self.step6_status)
@@ -283,11 +288,13 @@ class AIMasterControlPanel(QWidget):
         instruction = QTextEdit()
         instruction.setPlaceholderText("生成的指令会显示在这里，发送前可自由修改...")
         instruction.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(instruction, 7)
         vbox.addWidget(instruction)
 
         result = QTextEdit()
         result.setPlaceholderText(result_placeholder)
         result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._set_textedit_min_lines(result, 10)
         vbox.addWidget(result)
 
         status = QLabel("状态：等待指令")
@@ -299,6 +306,16 @@ class AIMasterControlPanel(QWidget):
         box._result = result
         box._status = status
         return box
+
+    @staticmethod
+    def _set_textedit_min_lines(edit: QTextEdit, min_lines: int) -> None:
+        """按行数设置 QTextEdit 最小高度，提升可读性。"""
+        min_lines = max(1, int(min_lines))
+        line_h = edit.fontMetrics().lineSpacing()
+        # 经验值：额外 padding + 文档边距，避免恰好卡住最后一行
+        min_h = int(line_h * min_lines + 24)
+        edit.setMinimumHeight(min_h)
+        edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
     # ==================== 数据与状态 ====================
 
@@ -419,6 +436,25 @@ class AIMasterControlPanel(QWidget):
         if self.step_generator_error:
             QMessageBox.critical(self, "错误", f"主控Agent初始化失败: {self.step_generator_error}")
             return False
+
+    def _sync_project_configs(self):
+        """将配置面板当前编辑内容静默同步回工程。
+
+        目的：避免用户未点击“保存配置”导致 Step4/Step5 读取到旧的 story_config/character_config。
+        """
+        try:
+            parent = self.parent()
+            story_panel = getattr(parent, "story_panel", None) if parent else None
+            if story_panel and hasattr(story_panel, "save_to_project"):
+                story_panel.save_to_project(silent=True)
+            char_panel = getattr(parent, "character_panel", None) if parent else None
+            if char_panel and hasattr(char_panel, "save_current_character"):
+                char_panel.save_current_character()
+            if char_panel and hasattr(char_panel, "save_to_project"):
+                char_panel.save_to_project(silent=True)
+        except Exception:
+            # 自动同步失败不应阻塞主流程
+            return
         try:
             self.step_generator = StepGenerator(self.config_manager)
             return True
@@ -592,6 +628,7 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
+        self._sync_project_configs()
         story_config = self._story_dict()
         characters = self._characters_dict()
         instruction, params = self.step_generator.prepare_personas_instruction(story_config, characters)
@@ -631,7 +668,17 @@ class AIMasterControlPanel(QWidget):
         if not text:
             QMessageBox.warning(self, "提示", "没有可保存的内容。")
             return
-        data = self._manual_result_payload(text, self.step_parameters.get("step1"))
+        params = self.step_parameters.get("step1")
+        parsed = self._try_parse_json_block(text) or self._safe_json_load(text)
+        if isinstance(parsed, dict):
+            data = self._normalize_step_payload(parsed) or parsed
+            data.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if not isinstance(data.get("parameters"), dict):
+                data["parameters"] = params or {}
+            else:
+                data["parameters"].update(params or {})
+        else:
+            data = self._manual_result_payload(text, params)
         self.personas_data = data
         self.project_manager.update_generation_step("step1_personas", data)
         self.step1_group._status.setText("状态：已保存(手动)")
@@ -645,6 +692,7 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
+        self._sync_project_configs()
         if not self.personas_data and not self.project_manager.current_project.generation_history.step1_personas:
             QMessageBox.warning(self, "提示", "请先完成步骤1：角色人设。")
             return
@@ -687,7 +735,17 @@ class AIMasterControlPanel(QWidget):
         if not text:
             QMessageBox.warning(self, "提示", "没有可保存的内容。")
             return
-        data = self._manual_result_payload(text, self.step_parameters.get("step2"))
+        params = self.step_parameters.get("step2")
+        parsed = self._try_parse_json_block(text) or self._safe_json_load(text)
+        if isinstance(parsed, dict):
+            data = self._normalize_step_payload(parsed) or parsed
+            data.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if not isinstance(data.get("parameters"), dict):
+                data["parameters"] = params or {}
+            else:
+                data["parameters"].update(params or {})
+        else:
+            data = self._manual_result_payload(text, params)
         self.outline_data = data
         self.project_manager.update_generation_step("step2_outline", data)
         self.step2_group._status.setText("状态：已保存(手动)")
@@ -701,6 +759,7 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
+        self._sync_project_configs()
         if not self.outline_data and not self.project_manager.current_project.generation_history.step2_outline:
             QMessageBox.warning(self, "提示", "请先完成步骤2：故事大纲。")
             return
@@ -744,7 +803,17 @@ class AIMasterControlPanel(QWidget):
         if not text:
             QMessageBox.warning(self, "提示", "没有可保存的内容。")
             return
-        data = self._manual_result_payload(text, self.step_parameters.get("step3"))
+        params = self.step_parameters.get("step3")
+        parsed = self._try_parse_json_block(text) or self._safe_json_load(text)
+        if isinstance(parsed, dict):
+            data = self._normalize_step_payload(parsed) or parsed
+            data.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if not isinstance(data.get("parameters"), dict):
+                data["parameters"] = params or {}
+            else:
+                data["parameters"].update(params or {})
+        else:
+            data = self._manual_result_payload(text, params)
         self.chapters_data = data
         self.project_manager.update_generation_step("step3_chapters", data)
         self.step3_group._status.setText("状态：已保存(手动)")
@@ -759,6 +828,7 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
+        self._sync_project_configs()
         chapters_struct = self._chapter_list()
         if not chapters_struct:
             QMessageBox.warning(self, "提示", "请先完成步骤3并确保章节列表为结构化JSON。")
@@ -772,7 +842,13 @@ class AIMasterControlPanel(QWidget):
         if idx > 0:
             prev = chapters_struct[idx - 1]
             prev_context = prev.get("summary") or prev.get("chapter_summary")
-        instruction, params = self.step_generator.prepare_chapter_detail_instruction(idx, chapter_info, prev_context)
+        instruction, params = self.step_generator.prepare_chapter_detail_instruction(
+            idx,
+            chapter_info,
+            prev_context,
+            self._story_dict(),
+            self._characters_dict(),
+        )
         self.step4_instruction.setPlainText(instruction)
         self.step4_status.setText(f"状态：第{idx+1}章指令已生成，待发送")
         self.step_parameters["step4"] = params
@@ -784,6 +860,7 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
+        self._sync_project_configs()
         chapters_struct = self._chapter_list()
         if not chapters_struct:
             QMessageBox.warning(self, "提示", "请先完成步骤3并确保章节列表为结构化JSON。")
@@ -802,6 +879,11 @@ class AIMasterControlPanel(QWidget):
             return self.step_generator.generate_chapter_detail(instruction, params)
 
         def _on_success(detail):
+            # 兼容 LLM 输出带噪导致 structured=None：尽量做一次规范化
+            try:
+                detail = self.step_generator._normalize_chapter_detail(detail)
+            except Exception:
+                pass
             while len(self.chapter_details) <= idx:
                 self.chapter_details.append({})
             self.chapter_details[idx] = detail
@@ -830,7 +912,19 @@ class AIMasterControlPanel(QWidget):
             return
         params = self.step_parameters.get("step4") or {"chapter_index": idx}
         params["chapter_index"] = idx
-        detail = self._manual_result_payload(text, params, {"chapter_index": idx})
+        # 如果用户保存的是“已生成结果的JSON”，则尽量按原结构保存，避免覆盖/丢失 raw_response。
+        parsed = self._try_parse_json_block(text) or self._safe_json_load(text)
+        if isinstance(parsed, dict):
+            detail = self._normalize_step_payload(parsed) or parsed
+            detail.setdefault("chapter_index", idx)
+            detail.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            # 确保 parameters 不丢
+            if not isinstance(detail.get("parameters"), dict):
+                detail["parameters"] = params
+            else:
+                detail["parameters"].update(params)
+        else:
+            detail = self._manual_result_payload(text, params, {"chapter_index": idx})
         while len(self.chapter_details) <= idx:
             self.chapter_details.append({})
         self.chapter_details[idx] = detail
@@ -886,7 +980,10 @@ class AIMasterControlPanel(QWidget):
 
         story = self._story_dict()
         chars = self._characters_dict()
-        result = self.step_generator.build_pending_and_flow(story, chars, self.chapter_details)
+        personas = self.personas_data
+        if not personas and self.project_manager.current_project:
+            personas = self.project_manager.current_project.generation_history.step1_personas
+        result = self.step_generator.build_pending_and_flow(story, chars, self.chapter_details, personas)
 
         self.pending_lists = result.get("pending_lists")
         self.flow_nodes = result.get("flow_nodes") or []

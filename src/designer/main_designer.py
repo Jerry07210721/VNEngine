@@ -20,8 +20,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from pathlib import Path
-from PyQt6.QtGui import QAction, QTextCursor, QIcon
-from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal
+from PyQt6.QtGui import QAction, QTextCursor, QIcon, QDesktopServices
+from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QUrl
 from src.core.project_manager import VNProjectManager
 from src.game.game_runtime import VNGameRuntime
 from src.designer.graph_canvas import GraphView
@@ -49,12 +49,31 @@ from src.packager.packager_manager import PackagerManager
 from src.packager.packager_dialog import PackagerDialog
 
 
+def _resolve_app_icon_path() -> Path | None:
+    """Locate icon.ico in frozen or dev mode."""
+    # 1) frozen temp dir (_MEIPASS)
+    project_root = Path(__file__).resolve().parents[2]
+    base = Path(getattr(sys, "_MEIPASS", project_root))
+    candidates = [base / "icon.ico", project_root / "icon.ico"]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
 class StartDialog(QDialog):
     """启动选择对话框：新建 / 加载 / 退出。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("选择操作")
+
+        icon_path = _resolve_app_icon_path()
+        if icon_path:
+            app = QApplication.instance()
+            if app:
+                app.setWindowIcon(QIcon(str(icon_path)))
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.mode: str | None = None
         self.project_path: Path | None = None
         self.project_name: str | None = None
@@ -172,7 +191,7 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V0.1")
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.1")
         self.setGeometry(100, 100, 1200, 800)
         icon_path = self._resolve_icon()
         if icon_path:
@@ -182,14 +201,7 @@ class VNDesignerMainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
 
     def _resolve_icon(self) -> Path | None:
-        """Locate icon.ico in frozen or dev mode."""
-        # 1) frozen temp dir (_MEIPASS)
-        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent.parent))
-        candidates = [base / "icon.ico", Path(__file__).resolve().parent.parent.parent / "icon.ico"]
-        for p in candidates:
-            if p.exists():
-                return p
-        return None
+        return _resolve_app_icon_path()
 
     def init_menu_bar(self):
         file_menu = QMenu("文件(&F)", self)
@@ -246,24 +258,8 @@ class VNDesignerMainWindow(QMainWindow):
         ai_project_action = QAction("AI辅助生成", self)
         ai_project_action.triggered.connect(self.open_ai_project_window)
         ai_menu.addAction(ai_project_action)
-        
+
         ai_menu.addSeparator()
-        
-        # 保留旧的入口（兼容）
-        ai_new_project = QAction("新建 AI 工程（旧版）", self)
-        ai_new_project.triggered.connect(self.open_ai_assist)
-        ai_menu.addAction(ai_new_project)
-
-        ai_run = QAction("启动 AI 生成（旧版）", self)
-        ai_run.triggered.connect(self.start_ai_generation)
-        ai_menu.addAction(ai_run)
-        
-        ai_menu.addSeparator()
-
-        ai_api = QAction("API 配置", self)
-        ai_api.triggered.connect(self.open_api_config)
-        ai_menu.addAction(ai_api)
-
         ai_help = QAction("使用帮助", self)
         ai_help.triggered.connect(self.open_ai_help)
         ai_menu.addAction(ai_help)
@@ -321,10 +317,16 @@ class VNDesignerMainWindow(QMainWindow):
         dlg.exec()
 
     def open_ai_help(self):
+        help_path = Path(__file__).resolve().parents[2] / "docs" / "AI_ASSIST_HELP.md"
+        if help_path.exists():
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(help_path)))
+            if opened:
+                return
+
         QMessageBox.information(
             self,
             "AI 辅助使用帮助",
-            "在“AI 辅助”菜单中配置 API、工程和角色信息，然后通过进度对话框观察任务状态。更多细节见 docs/STAGE1_COMPLETED.md。",
+            f"未能自动打开帮助文档。请手动查看：{help_path}",
         )
 
     def start_ai_generation(self):
@@ -866,6 +868,9 @@ class VNDesignerMainWindow(QMainWindow):
 
 def run_designer():
     app = QApplication(sys.argv)
+    icon_path = _resolve_app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(str(icon_path)))
     start = StartDialog()
     if start.exec() != QDialog.DialogCode.Accepted or not start.mode:
         sys.exit(0)

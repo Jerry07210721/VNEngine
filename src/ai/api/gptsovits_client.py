@@ -82,7 +82,7 @@ class GPTSoVITSClient(BaseAPIClient):
         # 添加语气参数
         if ext:
             payload["ext"] = ext
-        elif self.genre == 1:
+        elif (genre if genre is not None else self.genre) == 1:
             # 如果是语气参考模式，提供默认值
             payload["ext"] = {
                 "happy": 0.0,
@@ -108,11 +108,30 @@ class GPTSoVITSClient(BaseAPIClient):
             raise APIError(f"语音合成失败: {response.get('msg')}")
 
     def list_reference_models(self, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """查询克隆模型列表，用于选择 audioId。"""
+        """查询克隆模型列表，用于选择 audioId。
+
+        API 要求：page/pageSize 分页；pageSize <= 20。
+        """
+
+        try:
+            page_i = int(page)
+        except Exception:
+            page_i = 1
+        if page_i < 1:
+            page_i = 1
+
+        try:
+            page_size_i = int(page_size)
+        except Exception:
+            page_size_i = 20
+        if page_size_i < 1:
+            page_size_i = 20
+        if page_size_i > 20:
+            page_size_i = 20
 
         params = {
-            "page": str(page),
-            "pageSize": str(page_size),
+            "page": str(page_i),
+            "pageSize": str(page_size_i),
         }
 
         response = self.get("/api/third/reference/list", params=params)
@@ -269,6 +288,8 @@ class GPTSoVITSClient(BaseAPIClient):
         audio_id: str,
         save_path: str,
         ext: Optional[Dict[str, float]] = None,
+        style: Optional[str] = None,
+        genre: Optional[int] = None,
         timeout: Optional[float] = None
     ) -> tuple[bool, Optional[str]]:
         """
@@ -286,7 +307,7 @@ class GPTSoVITSClient(BaseAPIClient):
         """
         try:
             # 1. 创建任务
-            task_info = self.create_tts(content, audio_id, ext)
+            task_info = self.create_tts(content, audio_id, ext, style=style, genre=genre)
             task_id = task_info["taskId"]
             
             # 2. 等待完成

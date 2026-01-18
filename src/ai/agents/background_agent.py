@@ -9,6 +9,8 @@ from pathlib import Path
 import time
 from datetime import datetime
 
+from ..utils.flux_reference_images import prepare_flux_reference_images
+
 from ..api.api_manager import APIManager
 from ..core.config_manager import ConfigManager
 from ..core.models import TaskAssignment, AgentResponse
@@ -71,8 +73,10 @@ class BackgroundAgent:
         atmos = atmosphere or ""
         tw = time_weather or ""
         return (
-            f"visual novel background, {description}, {atmos}, {tw}, high quality anime environment, "
-            "no characters, detailed lighting and depth"
+            f"visual novel background (establishing shot), {description}, {atmos}, {tw}, "
+            "anime style environment concept art, wide shot, strong depth, detailed lighting, "
+            "high quality background art, clean composition, "
+            "no characters, no subtitles, no text, no watermark, no logo"
         )
 
     def _generate_single_background(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -83,15 +87,35 @@ class BackgroundAgent:
         prompt = parameters.get("prompt") or self.build_prompt(description, atmosphere, time_weather)
         aspect = parameters.get("aspect", "16:9")
         model_choice = parameters.get("model") or "flux"
+        flux_model = parameters.get("flux_model")
+        flux_mode = parameters.get("flux_mode")
+        flux_num = parameters.get("flux_num")
+        ref_image_paths = parameters.get("reference_images") or []
         project_root = self._project_root(parameters)
 
-        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/backgrounds/{bg_id}.png")
+        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/images/{bg_id}.png")
         self._ensure_image_client(model_choice)
+
+        ref_images: List[Dict[str, Any]] = []
+        if isinstance(ref_image_paths, list) and ref_image_paths:
+            paths = [Path(p) for p in ref_image_paths if p]
+            ref_images = prepare_flux_reference_images(paths, limit=3)
+
+        flux_params: Dict[str, Any] = {"aspect": aspect}
+        if flux_num is not None:
+            try:
+                flux_params["num"] = int(flux_num)
+            except Exception:
+                pass
+        if flux_mode:
+            flux_params["mode"] = str(flux_mode)
 
         file_path = self._generate_and_download(
             prompt=prompt,
             output_path=output_path,
-            params={"aspect": aspect},
+            params=flux_params,
+            images=ref_images if ref_images else None,
+            flux_model=flux_model,
         )
         if not file_path:
             raise RuntimeError("背景生成失败")
@@ -127,7 +151,7 @@ class BackgroundAgent:
             ("library", "anime library interior, bookshelves, study desks, quiet atmosphere"),
         ]
 
-        output_dir = project_root / "resources" / "backgrounds"
+        output_dir = project_root / "resources" / "images"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_files = []
@@ -167,6 +191,8 @@ class BackgroundAgent:
         prompt: str,
         output_path: Path,
         params: Optional[Dict[str, Any]] = None,
+        images: Optional[list] = None,
+        flux_model: Optional[str] = None,
     ) -> Optional[Path]:
         client_type = type(self.image_client).__name__
 
@@ -178,11 +204,20 @@ class BackgroundAgent:
             )
             return Path(local_path) if success and local_path else None
 
-        success, local_paths, _urls = self.image_client.generate_and_download(
-            prompt=prompt,
-            save_dir=str(output_path.parent),
-            params=params,
-        )
+        if "FluxClient" in client_type:
+            success, local_paths, _urls = self.image_client.generate_and_download(
+                prompt=prompt,
+                save_dir=str(output_path.parent),
+                params=params,
+                images=images,
+                model=flux_model,
+            )
+        else:
+            success, local_paths, _urls = self.image_client.generate_and_download(
+                prompt=prompt,
+                save_dir=str(output_path.parent),
+                params=params,
+            )
         if success and local_paths:
             downloaded = Path(local_paths[0])
             if downloaded != output_path:

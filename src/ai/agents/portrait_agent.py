@@ -12,6 +12,9 @@ from datetime import datetime
 import base64
 import io
 from typing import Tuple
+import re
+
+from ..utils.flux_reference_images import prepare_flux_reference_images, prepare_flux_reference_image
 
 from ..api.api_manager import APIManager
 from ..core.config_manager import ConfigManager
@@ -133,7 +136,7 @@ class PortraitAgent:
         if base_file:
             output_files.append(base_file.relative_to(project_root).as_posix())
             if support_reference:
-                ref = self._prepare_reference_image(base_file)
+                ref = prepare_flux_reference_image(base_file)
                 if ref:
                     reference_images = [ref]
                 else:
@@ -180,10 +183,27 @@ class PortraitAgent:
         save_path = Path(parameters.get("save_path", "design.png"))
         aspect = parameters.get("aspect", "3:2")
         model_choice = parameters.get("model") or "midjourney"
+        flux_model = parameters.get("flux_model")
+        flux_mode = parameters.get("flux_mode")
+        flux_num = parameters.get("flux_num")
+        ref_image_paths = parameters.get("reference_images") or []
         self._ensure_image_client(None, model_choice)
 
+        ref_images: List[Dict[str, Any]] = []
+        if isinstance(ref_image_paths, list) and ref_image_paths:
+            paths = [Path(p) for p in ref_image_paths if p]
+            ref_images = prepare_flux_reference_images(paths, limit=3)
+
+        flux_params = self._build_flux_params(aspect=aspect, flux_num=flux_num, flux_mode=flux_mode)
+
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path = self._generate_and_download(prompt=prompt, output_path=save_path, params={"aspect": aspect}, images=None)
+        file_path = self._generate_and_download(
+            prompt=prompt,
+            output_path=save_path,
+            params=flux_params,
+            images=ref_images if ref_images else None,
+            flux_model=flux_model,
+        )
         if not file_path:
             raise RuntimeError("设定图生成失败")
 
@@ -200,10 +220,34 @@ class PortraitAgent:
         output_path = Path(parameters.get("output_path", "base.png"))
         aspect = parameters.get("aspect", "2:3")
         model_choice = parameters.get("model") or "flux"
+        flux_model = parameters.get("flux_model")
+        flux_mode = parameters.get("flux_mode")
+        flux_num = parameters.get("flux_num")
+        ref_image_paths = parameters.get("reference_images") or []
         self._ensure_image_client(None, model_choice)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path = self._generate_and_download(prompt=prompt, output_path=output_path, params={"aspect": aspect}, images=None)
+        flux_params: Dict[str, Any] = {"aspect": aspect}
+        if flux_num is not None:
+            try:
+                flux_params["num"] = int(flux_num)
+            except Exception:
+                pass
+        if flux_mode:
+            flux_params["mode"] = str(flux_mode)
+
+        ref_images: List[Dict[str, Any]] = []
+        if isinstance(ref_image_paths, list) and ref_image_paths:
+            paths = [Path(p) for p in ref_image_paths if p]
+            ref_images = prepare_flux_reference_images(paths, limit=3)
+
+        file_path = self._generate_and_download(
+            prompt=prompt,
+            output_path=output_path,
+            params=flux_params,
+            images=ref_images if ref_images else None,
+            flux_model=flux_model,
+        )
         if not file_path:
             raise RuntimeError("基准立绘生成失败")
 
@@ -220,7 +264,12 @@ class PortraitAgent:
         expressions: List[str] = parameters.get("expressions", [])
         aspect = parameters.get("aspect", "2:3")
         model_choice = parameters.get("model") or "flux"
+        flux_model = parameters.get("flux_model")
+        flux_mode = parameters.get("flux_mode")
+        flux_num = parameters.get("flux_num")
         base_image = parameters.get("base_image_path")
+        ref_image_paths = parameters.get("reference_images") or []
+        prompt_template = parameters.get("prompt_template")
         output_dir = Path(parameters.get("output_dir", "output/portraits"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -231,21 +280,38 @@ class PortraitAgent:
         support_reference = "FluxClient" in type(self.image_client).__name__
         if not support_reference:
             raise RuntimeError("表情差分仅支持Flux客户端，请选择Flux")
-        ref_images = []
-        if base_image and support_reference:
-            ref = self._prepare_reference_image(Path(base_image))
+        ref_images: List[Dict[str, Any]] = []
+        # 用户上传的参考图优先（最多3张）；否则退回使用基准图作为参考
+        if isinstance(ref_image_paths, list) and ref_image_paths:
+            paths = [Path(p) for p in ref_image_paths if p]
+            ref_images = prepare_flux_reference_images(paths, limit=3)
+        elif base_image and support_reference:
+            ref = prepare_flux_reference_image(Path(base_image))
             if ref:
                 ref_images = [ref]
 
         output_files: List[str] = []
-        for exp in expressions:
-            prompt = self._build_portrait_prompt(char_name, description, exp, use_reference=support_reference)
-            out_path = output_dir / f"{char_id}_{exp}.png"
+        for idx_exp, exp in enumerate(expressions):
+            if isinstance(prompt_template, str) and prompt_template.strip():
+                # 允许在模板中使用 {expression} 占位符
+                try:
+                    prompt = prompt_template.format(expression=exp)
+                except Exception:
+                    prompt = f"{prompt_template}\nexpression: {exp}"
+            else:
+                prompt = self._build_portrait_prompt(char_name, description, exp, use_reference=support_reference)
+            safe_exp = re.sub(r"[<>:\\/:\"|?*]", "_", str(exp)).strip().replace(" ", "_")
+            safe_exp = safe_exp.strip("._ ")
+            if not safe_exp:
+                safe_exp = f"expr{idx_exp+1}"
+            safe_exp = safe_exp[:32]
+            out_path = output_dir / f"{char_id}_{safe_exp}.png"
             file_path = self._generate_and_download(
                 prompt=prompt,
                 output_path=out_path,
-                params={"aspect": aspect},
+                params=self._build_flux_params(aspect=aspect, flux_num=flux_num, flux_mode=flux_mode),
                 images=ref_images if support_reference else None,
+                flux_model=flux_model,
             )
             if file_path:
                 output_files.append(file_path.as_posix())
@@ -254,6 +320,17 @@ class PortraitAgent:
             "files": output_files,
             "metadata": {"mode": "expression_batch", "model": type(self.image_client).__name__, "count": len(output_files)},
         }
+
+    def _build_flux_params(self, aspect: str, flux_num: Any = None, flux_mode: Any = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"aspect": aspect}
+        if flux_num is not None:
+            try:
+                params["num"] = int(flux_num)
+            except Exception:
+                pass
+        if flux_mode:
+            params["mode"] = str(flux_mode)
+        return params
     
     def _build_portrait_prompt(
         self,
@@ -279,56 +356,38 @@ class PortraitAgent:
         expr_text = expression_desc.get(expression, f"{expression} expression")
         
         transparent_hint = "transparent background, no background elements, alpha channel"
-        consistency_hint = "keep proportions and outfit consistent with reference" if use_reference else ""
+        consistency_hint = (
+            "STRICT consistency with reference image: same face, same hairstyle, same outfit, same proportions, same color palette"
+            if use_reference
+            else ""
+        )
+        desc = (description or "").strip()
         prompt = (
-            f"anime character portrait, {char_name}, {description}, {expr_text}, full body standing pose,"
-            f" {transparent_hint}, {consistency_hint} high quality anime art style, visual novel character design,"
-            " detailed shading, professional illustration"
+            "masterpiece, best quality, ultra-detailed, clean lineart, anime visual novel character illustration, "
+            f"character name: {char_name}. "
+            f"character description (must follow): {desc}. "
+            f"expression: {expr_text}. "
+            "full body, standing pose, centered composition, single character, "
+            f"{transparent_hint}. "
+            f"{consistency_hint}. "
+            "sharp focus, correct anatomy, detailed shading"
         )
         
         return prompt
 
     def build_design_prompt(self, char_name: str, description: str) -> str:
         """生成设定图提示词模板。"""
-        desc = description or ""
+        desc = (description or "").strip()
         return (
-            f"anime character design sheet, {char_name}, full body front and side, outfit variants, clear partition layout, "
-            f"5 expression close-ups, {desc}, ultra high detail, clean white background, professional reference sheet"
+            "character design reference sheet, anime visual novel style, masterpiece, best quality. "
+            f"character name: {char_name}. "
+            f"character description (must follow): {desc}. "
+            "layout: clean white background, clear partitions. "
+            "include: full body front view, full body side view, full body back view, outfit details close-up, "
+            "accessories close-up, shoes close-up, color palette swatches, 6 facial expressions close-ups. "
+            "high resolution, sharp lines, consistent proportions"
         )
     
-    def _prepare_reference_image(self, image_path: Path) -> Optional[Dict[str, Any]]:
-        """准备参考图，迭代压缩到安全体积，返回FLUX可接受的b64结构。"""
-        try:
-            try:
-                from PIL import Image
-            except Exception:
-                Image = None
-
-            raw = image_path.read_bytes()
-
-            if not Image:
-                data = raw
-            else:
-                img = Image.open(io.BytesIO(raw)).convert("RGBA")
-                # 多级缩放+压缩，目标 < 420KB
-                for max_side in [1024, 900, 768, 640, 512]:
-                    scaled = self._resize_with_max_side(img, max_side)
-                    data = self._encode_png(scaled, optimize=True)
-                    if len(data) <= 420_000:
-                        break
-                else:
-                    self.logger.warning(f"参考图仍过大({len(data)} bytes)，跳过以避免413")
-                    return None
-
-            b64 = base64.b64encode(data).decode("ascii")
-            return {
-                "type": "image/png",
-                "b64": f"data:image/png;base64,{b64}",
-            }
-        except Exception as exc:
-            self.logger.warning(f"参考图处理失败: {exc}")
-            return None
-
     def _generate_and_download(
         self,
         prompt: str,
@@ -336,6 +395,7 @@ class PortraitAgent:
         params: Optional[Dict[str, Any]] = None,
         images: Optional[List[Dict[str, Any]]] = None,
         postprocess_transparent: bool = False,
+        flux_model: Optional[str] = None,
     ) -> Optional[Path]:
         """生成并下载图像，必要时做透明背景后处理。"""
 
@@ -350,12 +410,21 @@ class PortraitAgent:
             )
             final_path = Path(local_path) if success and local_path else None
         else:
-            success, local_paths, _urls = self.image_client.generate_and_download(
-                prompt=prompt,
-                save_dir=str(output_path.parent),
-                params=params,
-                images=images,
-            )
+            if "FluxClient" in client_type:
+                success, local_paths, _urls = self.image_client.generate_and_download(
+                    prompt=prompt,
+                    save_dir=str(output_path.parent),
+                    params=params,
+                    images=images,
+                    model=flux_model,
+                )
+            else:
+                success, local_paths, _urls = self.image_client.generate_and_download(
+                    prompt=prompt,
+                    save_dir=str(output_path.parent),
+                    params=params,
+                    images=images,
+                )
             final_path = None
             if success and local_paths:
                 downloaded = Path(local_paths[0])

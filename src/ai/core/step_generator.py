@@ -6,6 +6,7 @@
 
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
+from pathlib import Path
 import json
 import re
 
@@ -73,7 +74,23 @@ class StepGenerator:
                 candidate = candidate.split("```", 1)[1].split("```", 1)[0].strip()
             return json.loads(candidate)
         except Exception:
-            return None
+            pass
+
+        # 兼容 LLM 在 JSON 前后加解释/提示等噪声：尽量截取最外层 {...} 或 [...] 再解析。
+        def _try_span(open_ch: str, close_ch: str):
+            if open_ch not in candidate or close_ch not in candidate:
+                return None
+            start = candidate.find(open_ch)
+            end = candidate.rfind(close_ch)
+            if start < 0 or end <= start:
+                return None
+            snippet = candidate[start : end + 1].strip()
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
+
+        return _try_span("{", "}") or _try_span("[", "]")
 
     def _call_llm(self, instruction: str, system: str, *, max_tokens: int, temperature: float) -> Tuple[str, Optional[Any]]:
         """统一的LLM调用，返回文本与解析后的结构化数据。"""
@@ -216,7 +233,7 @@ class StepGenerator:
 章节数量：约{story_config.get('chapter_count', 5)}章
 
 角色人设：
-{personas.get('raw_response', '（已生成）')[:500]}...
+{personas.get('raw_response', '（已生成）')}
 
 请生成：
 1. 完整的故事大纲（包括开端、发展、高潮、结局）
@@ -366,7 +383,9 @@ class StepGenerator:
         self,
         chapter_index: int,
         chapter_info: Dict[str, Any],
-        previous_context: Optional[str] = None
+        previous_context: Optional[str] = None,
+        story_config: Optional[Dict[str, Any]] = None,
+        character_config: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         准备生成单个章节详细内容的指令
@@ -380,24 +399,136 @@ class StepGenerator:
             (指令文本, 参数字典)
         """
         self.logger.info(f"准备第{chapter_index+1}章详细内容生成指令")
-        
-        instruction = f"""请生成第{chapter_index+1}章的详细内容：
+
+        story_cfg = story_config or {}
+        chars = character_config or []
+        pov = (story_cfg.get("narrative_pov") or "third").strip().lower()
+        fp_name = story_cfg.get("first_person_name") or "我"
+        fp_has_portrait = bool(story_cfg.get("first_person_has_portrait", False))
+        fp_has_voice = bool(story_cfg.get("first_person_has_voice", False))
+        fp_cg_presence = bool(story_cfg.get("first_person_cg_presence", True))
+        fp_cg_notes = story_cfg.get("first_person_cg_notes") or ""
+        cg_count = int(story_cfg.get("cg_count") or 0)
+
+        char_lines = []
+        for c in chars:
+            name = c.get("char_name") or c.get("name") or ""
+            cid = c.get("char_id") or c.get("id") or ""
+            role = c.get("role") or ""
+            is_player = bool(c.get("is_player", False))
+            is_fp = bool(c.get("is_first_person", False))
+            tags = []
+            if is_player:
+                tags.append("玩家")
+            if is_fp:
+                tags.append("第一人称")
+            tag_text = f" [{', '.join(tags)}]" if tags else ""
+            if name or cid:
+                char_lines.append(f"- {name} ({cid}) {role}{tag_text}".strip())
+        char_block = "\n".join(char_lines) if char_lines else "(未提供角色列表)"
+
+        # Step5 需要可稳定解析的结构化输出，以便按媒体状态变化切分/聚合文本节点。
+        # 因此这里强制输出 JSON（建议包在 ```json 代码块中），并约定 scenes + directives。
+        prev = f"上一章结尾：{previous_context}\n" if previous_context else ""
+        pov_text = "第一人称" if pov == "first" else "第三人称"
+        fp_rules = ""
+        if pov == "first":
+            fp_rules = f"""
+POV 规则（必须遵守）：
+- 叙述视角：{pov_text}
+- 第一人称代称：{fp_name}
+- 第一人称立绘：{'有' if fp_has_portrait else '无'}（无则该角色对白不要提供 portrait，且不要暗示需要生成立绘）
+- 第一人称配音：{'有' if fp_has_voice else '无'}（无则该角色对白不要提供 voice，且不要暗示需要生成语音）
+- 第一人称 CG 出镜：{'会' if fp_cg_presence else '不会'}；说明：{fp_cg_notes}
+"""
+
+        cg_rules = ""
+        if cg_count > 0:
+            cg_rules = f"""
+CG 规则（必须遵守）：
+- 本章目标 CG 数量：{cg_count}（请尽量使用恰好 {cg_count} 张不同的 CG）
+- CG 标注方式：在 scene.directives.cg 填写 CG 的 id（例如 cg_{chapter_index+1:02d}_01、cg_{chapter_index+1:02d}_02 ...），不要写完整路径。
+- 当进入/退出 CG 时必须新开一个 scene，并在 directives 中体现 cg/background 的切换：
+    - 进入 CG：写 directives.cg
+    - 退出 CG：写 directives.background（恢复到某个背景）
+"""
+
+        instruction = f"""你正在为 VNEngine 生成“逐章详稿”（将用于后续自动生成 flow_nodes 与 pending_lists）。
+
+请严格输出 **仅一个 JSON 对象**（不要输出解释文字），建议放在 ```json 代码块中。
 
 章节信息：
 {json.dumps(chapter_info, ensure_ascii=False, indent=2)}
 
-{"上一章结尾：" + previous_context if previous_context else ""}
+故事配置摘要：
+- 故事风格：{story_cfg.get('style', '')}
+- 启用选择节点：{bool(story_cfg.get('enable_choice_node', True))}
+- 启用条件节点：{bool(story_cfg.get('enable_condition_node', True))}
 
-要求：
-1. 生成完整的对白和场景描述
-2. 保持角色人设一致
-3. 符合章节摘要
-4. 标注所需的立绘、背景、BGM等资源
+角色列表：
+{char_block}
+
+{prev}
+输出 JSON Schema（必须遵守字段名，未用字段可为空/省略）：
+{{
+    "chapter_title": "string",
+    "summary": "string",
+    "scenes": [
+        {{
+            "type": "text|choice|condition",
+            "title": "string (可选)",
+
+            "directives": {{
+                "background": "bg_id_or_path (可选，例 bg_001 或 resources/images/bg_001.png)",
+                "cg": "cg_id_or_path (可选，视为背景切换到 resources/images/cg/...)",
+                "bgm": "bgm_id_or_path (可选，例 bgm_01 或 resources/audios/bgm_01.mp3)",
+                "stop_bgm": false,
+                "video": "video_id_or_path (可选)",
+                "ui_file": "ui_id_or_path (可选)",
+                "hide_textbox": false
+            }},
+
+            "dialogues": [
+                {{
+                    "speaker": "角色名",
+                    "text": "对白内容",
+                    "emotion": "情绪(可选)",
+                    "portrait": "可选：若省略，将由引擎按角色+情绪映射到 resources/portraits/...",
+                    "voice": "可选：若省略，将由系统生成虚拟路径 resources/voices/...",
+                    "hide_textbox": false,
+                    "portrait_fade": false,
+                    "portrait_fade_out": false
+                }}
+            ],
+
+            "options": ["选项1", "选项2"],
+            "condition": {{"var": "favorability_char_001", "op": ">=", "value": 10, "const": true}}
+        }}
+    ]
+}}
+
+关键约束（用于保证 Step5 节点聚合/切分效果）：
+1) **同一个 scene(type=text)** 内的对白将被尽量聚合进同一个文本节点的 sub_dialogues。
+2) 当需要强制切分为新文本节点时，请在新的 scene 的 directives 中体现变化：
+     - background 改变 / bgm 改变 / stop_bgm=true / cg 出现 / video 改变 / ui_file 改变 / hide_textbox 段落变化。
+3) choice/condition scene：不要提供 sub_dialogues 的多行对白；
+     - choice 必须提供 options 数组（>=2）。
+     - condition 必须提供 condition 对象（并隐含 True/False 两条分支）。
+
+{fp_rules}
+{cg_rules}
+
+内容要求：
+- 对白自然、推进剧情，符合章节摘要与人设。
+- 每个 scene 的 directives 只在需要变化时写；不写表示沿用上一 scene 的状态。
 """
         
         parameters = {
             "chapter_index": chapter_index,
-            "chapter_title": chapter_info.get('title', f'第{chapter_index+1}章')
+            "chapter_title": chapter_info.get('title', f'第{chapter_index+1}章'),
+            "narrative_pov": pov,
+            "first_person_name": fp_name,
+            "cg_count": cg_count,
         }
         
         return instruction, parameters
@@ -479,6 +610,12 @@ class StepGenerator:
             if parsed_struct is not None:
                 normalized["structured"] = parsed_struct
 
+            # 如果 structured 缺失，尝试从 raw_response（可能是 ```json 代码块或带噪 JSON）提取
+            if not normalized.get("structured") and isinstance(raw_text, str):
+                extracted = self._try_parse_json(raw_text)
+                if extracted is not None:
+                    normalized["structured"] = extracted
+
             # 如果structured缺失，尝试从raw_response里提取简单对话，避免语音统计为0
             if not normalized.get("structured") and isinstance(raw_text, str):
                 dialogues = []
@@ -517,6 +654,7 @@ class StepGenerator:
         story_config: Dict[str, Any],
         characters: List[Dict[str, Any]],
         chapter_details: List[Dict[str, Any]],
+        personas_data: Any | None = None,
     ) -> Dict[str, Any]:
         """
         根据章节详情生成待生成列表（立绘/背景/CG/语音/BGM）与基础流程节点骨架。
@@ -534,158 +672,363 @@ class StepGenerator:
 
         normalized_chapters = [self._normalize_chapter_detail(ch) for ch in (chapter_details or [])]
 
-        # ---------- 立绘 ----------
+        pov = (story_config.get("narrative_pov") or "third").strip().lower()
+        first_person_name = (story_config.get("first_person_name") or "我").strip() or "我"
+        first_person_has_portrait = bool(story_config.get("first_person_has_portrait", False))
+        first_person_has_voice = bool(story_config.get("first_person_has_voice", False))
+
+        def _is_first_person_char(char_dict: Dict[str, Any]) -> bool:
+            # 只要用户在角色配置中明确标记 is_player/is_first_person，就视为第一人称角色。
+            if char_dict.get("is_player") or char_dict.get("is_first_person"):
+                return True
+            # 叙事 POV 为第一人称时，允许用名称匹配第一人称代称。
+            if pov == "first":
+                name = (char_dict.get("char_name") or char_dict.get("name") or "").strip()
+                return bool(name) and name == first_person_name
+            return False
+
+        # ---------- 立绘（虚拟路径：resources/portraits/...） ----------
+        from ..utils.persona_extract import extract_persona_map
+
+        persona_by_char_id = extract_persona_map(personas_data)
+
         portrait_items: List[PortraitPendingItem] = []
         default_expressions = ["neutral", "happy", "sad", "angry", "surprised"]
         for char in characters:
             char_id = char.get("char_id") or char.get("id") or "char"
             char_name = char.get("char_name") or char.get("name") or char_id
+            if _is_first_person_char(char) and (not first_person_has_portrait):
+                continue
+            persona_text = (persona_by_char_id.get(str(char_id)) or "").strip()
+            if not persona_text:
+                persona_text = (char.get("persona_keywords", "") or "").strip()
             portrait_items.append(
                 PortraitPendingItem(
                     item_id=f"portrait_{char_id}",
                     char_id=char_id,
                     char_name=char_name,
-                    description=char.get("persona_keywords", ""),
+                    description=persona_text,
                     expressions=default_expressions,
                     poses=["stand"],
                     status="pending",
-                    file_paths=[f"resources/portraits/{char_id}_{exp}.png" for exp in default_expressions],
+                    file_paths=[f"resources/portraits/{char_id}_stand_{exp}.png" for exp in default_expressions],
                 )
             )
 
-        # ---------- 背景 ----------
-        background_items: List[BackgroundPendingItem] = []
-        for idx, chapter in enumerate(normalized_chapters):
-            desc = ""
-            structured = chapter.get("structured") if isinstance(chapter, dict) else None
-            if structured and isinstance(structured, dict):
-                desc = structured.get("summary") or structured.get("chapter_summary") or ""
-            if not desc and isinstance(chapter, dict):
-                desc = chapter.get("raw_response", "")[:120]
-            bg_id = f"bg_{idx+1:03d}"
-            background_items.append(
-                BackgroundPendingItem(
-                    item_id=f"background_{idx+1:03d}",
-                    bg_id=bg_id,
-                    description=desc or f"第{idx+1}章背景",
-                    atmosphere=story_config.get("style", ""),
-                    time_weather="",
-                    status="pending",
-                    file_path=f"resources/backgrounds/{bg_id}.png",
-                )
-            )
+        # ---------- 工具：从结构化章节里提取“事件流” ----------
+        def _emotion_to_expr(emotion_text: str) -> str:
+            t = (emotion_text or "").strip().lower()
+            if not t:
+                return "neutral"
+            mapping = [
+                ("angry", ["angry", "生气", "愤怒", "恼", "怒"]),
+                ("sad", ["sad", "难过", "悲伤", "委屈", "哭"]),
+                ("happy", ["happy", "开心", "高兴", "喜悦", "笑"]),
+                ("surprised", ["surprised", "惊讶", "震惊", "诧异"]),
+            ]
+            for expr, keys in mapping:
+                if any(k in t for k in keys):
+                    return expr
+            return "neutral"
 
-        # ---------- BGM ----------
-        bgm_items: List[BGMPendingItem] = []
-        for idx, chapter in enumerate(normalized_chapters):
-            desc = ""
-            structured = chapter.get("structured") if isinstance(chapter, dict) else None
-            if structured and isinstance(structured, dict):
-                desc = structured.get("emotional_tone") or structured.get("summary") or ""
-            if not desc and isinstance(chapter, dict):
-                desc = chapter.get("raw_response", "")[:80]
-            bgm_id = f"bgm_{idx+1:02d}"
-            bgm_items.append(
-                BGMPendingItem(
-                    item_id=f"bgm_item_{idx+1:02d}",
-                    bgm_id=bgm_id,
-                    description=desc or f"第{idx+1}章BGM",
-                    mood=desc,
-                    style=story_config.get("style", ""),
-                    duration=120,
-                    loop=True,
-                    status="pending",
-                    file_path=f"resources/bgm/{bgm_id}.mp3",
-                )
-            )
+        def _as_path(val: Any, *, kind: str) -> str:
+            """把 id 或路径规范为虚拟路径。
 
-        # ---------- CG（此阶段仅占位，待用户后续补充） ----------
-        cg_items: List[CGPendingItem] = []
+            kind: background|cg|bgm|video|ui
+            """
+            if not val:
+                return ""
+            if isinstance(val, dict):
+                val = val.get("file") or val.get("path") or val.get("id") or ""
+            token = str(val).strip()
+            if not token:
+                return ""
+            if token.startswith("resources/"):
+                return token
 
-        # ---------- 语音 ----------
-        voice_items: List[VoicePendingItem] = []
-        char_map = {c.get("char_name") or c.get("name"): c for c in characters}
-        for chap_idx, chapter in enumerate(normalized_chapters):
-            structured = chapter.get("structured") if isinstance(chapter, dict) else None
-            dialogues = []
-            if structured:
-                # 兼容多种字段名
-                if isinstance(structured, dict):
-                    dialogues = structured.get("dialogues") or structured.get("dialogue") or []
-                elif isinstance(structured, list):
-                    dialogues = structured
-            for dlg_idx, dlg in enumerate(dialogues):
-                if not isinstance(dlg, dict):
-                    continue
-                speaker = dlg.get("speaker") or dlg.get("role") or ""
-                content = dlg.get("text") or dlg.get("content") or ""
-                emotion = dlg.get("emotion") or dlg.get("tone") or "平静"
-                char_id = "unknown"
-                for name, cfg in char_map.items():
-                    if name and name == speaker:
-                        char_id = cfg.get("char_id") or cfg.get("id") or "unknown"
-                        break
-                voice_id = f"voice_{chap_idx+1:02d}_{dlg_idx+1:03d}"
-                voice_items.append(
-                    VoicePendingItem(
-                        item_id=f"voice_item_{chap_idx+1:02d}_{dlg_idx+1:03d}",
-                        voice_id=voice_id,
-                        node_id=str(chap_idx + 1),
-                        sub_id=dlg_idx,
-                        speaker=speaker,
-                        char_id=char_id,
-                        text=content,
-                        emotion=emotion,
-                        voice_model_id=None,
-                        status="pending",
-                        file_path=f"resources/voices/{char_id}/{voice_id}.mp3",
-                    )
-                )
+            def _norm_id(s: str) -> str:
+                # 仅对“id”做温和归一化：把空白压成下划线，避免生成带空格的资源路径。
+                # 若用户传入的是路径（包含分隔符），则保持原样。
+                if "/" in s or "\\" in s:
+                    return s
+                s2 = re.sub(r"\s+", "_", s)
+                s2 = re.sub(r"_+", "_", s2).strip("_")
+                return s2 or s
 
-        pending_lists = PendingLists(
-            portraits=portrait_items,
-            backgrounds=background_items,
-            cgs=cg_items,
-            voices=voice_items,
-            bgms=bgm_items,
-        )
+            token = _norm_id(token)
 
-        # ---------- 流程骨架 ----------
+            low = token.lower()
+            if kind == "bgm":
+                # 支持 stop/none 表示停止BGM
+                if low in {"stop", "stop_bgm", "none", "null", "off"}:
+                    return ""
+                # 容许传入不带扩展名的 id
+                if not low.endswith(".mp3"):
+                    token = f"{token}.mp3"
+                return f"resources/audios/{token}".replace("\\", "/")
+            if kind == "background":
+                if not (low.endswith(".png") or low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".webp")):
+                    token = f"{token}.png"
+                return f"resources/images/{token}".replace("\\", "/")
+            if kind == "cg":
+                if not (low.endswith(".png") or low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".webp")):
+                    token = f"{token}.png"
+                return f"resources/images/cg/{token}".replace("\\", "/")
+            if kind == "video":
+                # 不强制扩展名，用户可能给 mp4/webm
+                return f"resources/videos/{token}".replace("\\", "/")
+            if kind == "ui":
+                # UI 资源统一归入 images 子目录，避免额外顶层 resources/ui
+                return f"resources/images/ui/{token}".replace("\\", "/")
+            return token
+
+        def _iter_items(structured: Any) -> List[Dict[str, Any]]:
+            """把章节 structured 统一成 item 列表。
+
+            支持：
+            - {scenes:[{type, dialogues/options/condition,...}]}
+            - {dialogues:[...]}
+            - 直接是 list
+            """
+            if structured is None or not isinstance(structured, (list, dict)):
+                return []
+            if isinstance(structured, list):
+                return [x for x in structured if isinstance(x, dict)]
+            if not isinstance(structured, dict):
+                return []
+            if isinstance(structured.get("scenes"), list):
+                out: List[Dict[str, Any]] = []
+                for scene in structured.get("scenes"):
+                    if not isinstance(scene, dict):
+                        continue
+                    st = (scene.get("type") or scene.get("node_type") or "text").strip().lower()
+                    directives = scene.get("directives") if isinstance(scene.get("directives"), dict) else {}
+                    scene_title = (scene.get("title") or scene.get("scene_title") or "").strip()
+                    if st in {"choice", "condition"}:
+                        # choice/condition 本身也可能携带媒体指令（用于切换背景/BGM后再进入节点）
+                        out.append({"_kind": st, "_directives": directives, "_scene_title": scene_title, **scene})
+                        continue
+                    dialogues = scene.get("dialogues") or scene.get("dialogue") or []
+                    if isinstance(dialogues, list):
+                        for d in dialogues:
+                            if not isinstance(d, dict):
+                                continue
+                            # 将 scene 的 directives 合并到每条对白上（对白字段优先）
+                            merged = dict(directives)
+                            merged.update(d)
+                            merged["_directives"] = directives
+                            merged["_scene_title"] = scene_title
+                            out.append(merged)
+                return out
+            dialogues = structured.get("dialogues") or structured.get("dialogue") or structured.get("lines") or []
+            if isinstance(dialogues, list):
+                return [x for x in dialogues if isinstance(x, dict)]
+            return []
+
+        # ---------- 流程骨架（文本节点按“媒体状态”聚合；choice/condition 不建 sub_dialogues） ----------
         flow_nodes: List[FlowNodeData] = []
         connections: List[ConnectionData] = []
+        global_variables: List[GlobalVariable] = []
+
+        # ---------- 待生成清单（从实际引用推导，支持虚拟路径） ----------
+        background_by_path: Dict[str, BackgroundPendingItem] = {}
+        bgm_by_path: Dict[str, BGMPendingItem] = {}
+        cg_by_path: Dict[str, CGPendingItem] = {}
+        voice_items: List[VoicePendingItem] = []
+
+        char_map = {str(c.get("char_name") or c.get("name") or "").strip(): c for c in characters}
+
+        def _ensure_background_item(path: str, *, hint: str) -> str:
+            if not path or path.startswith("resources/images/cg/"):
+                return path
+            if path in background_by_path:
+                # 允许用更具体的信息补齐（仅填空字段，避免覆盖用户自定义 prompt）
+                try:
+                    it = background_by_path[path]
+                    if hint and (not it.description):
+                        it.description = hint
+                except Exception:
+                    pass
+                return path
+            stem = Path(path).stem
+            bg_id = stem or f"bg_{len(background_by_path)+1:03d}"
+            background_by_path[path] = BackgroundPendingItem(
+                item_id=f"background_{len(background_by_path)+1:03d}",
+                bg_id=bg_id,
+                description=hint or bg_id,
+                atmosphere=str(story_config.get("style", "") or ""),
+                time_weather="",
+                status="pending",
+                file_path=path,
+            )
+            return path
+
+        def _make_bg_hint(chapter_title: str, raw_item: Dict[str, Any]) -> str:
+            parts: List[str] = [chapter_title]
+            st = (raw_item.get("_scene_title") or "").strip()
+            if st:
+                parts.append(st)
+
+            # 尝试拼一些更“可用”的结构化字段（若 Step4 输出里带了）
+            loc = (raw_item.get("location") or raw_item.get("place") or raw_item.get("scene") or "").strip()
+            tw = (raw_item.get("time_weather") or raw_item.get("time") or raw_item.get("weather") or "").strip()
+            atmos = (raw_item.get("atmosphere") or raw_item.get("mood") or raw_item.get("tone") or "").strip()
+            if loc:
+                parts.append(f"地点:{loc}")
+            if tw:
+                parts.append(f"时间/天气:{tw}")
+            if atmos and atmos not in {"平静", "neutral"}:
+                parts.append(f"氛围:{atmos}")
+
+            speaker = (raw_item.get("speaker") or raw_item.get("role") or "").strip()
+            text = (raw_item.get("text") or raw_item.get("content") or "").strip()
+            if speaker and text:
+                snippet = text.replace("\n", " ").strip()
+                if len(snippet) > 24:
+                    snippet = snippet[:24] + "..."
+                parts.append(f"{speaker}:{snippet}")
+            return " | ".join(parts)
+
+        def _make_bgm_hint(chapter_title: str, raw_item: Dict[str, Any]) -> str:
+            parts: List[str] = [chapter_title]
+            st = (raw_item.get("_scene_title") or "").strip()
+            if st:
+                parts.append(st)
+            emo = str(raw_item.get("emotion") or raw_item.get("tone") or "").strip()
+            if emo and emo not in {"平静", "neutral"}:
+                parts.append(f"情绪:{emo}")
+            speaker = (raw_item.get("speaker") or raw_item.get("role") or "").strip()
+            text = (raw_item.get("text") or raw_item.get("content") or "").strip()
+            if speaker and text:
+                snippet = text.replace("\n", " ").strip()
+                if len(snippet) > 24:
+                    snippet = snippet[:24] + "..."
+                parts.append(f"{speaker}:{snippet}")
+            return " | ".join(parts)
+
+        def _make_cg_hint(chapter_title: str, raw_item: Dict[str, Any], recent_chars: List[str]) -> str:
+            parts: List[str] = [chapter_title]
+            st = (raw_item.get("_scene_title") or "").strip()
+            if st:
+                parts.append(st)
+            if recent_chars:
+                parts.append("人物:" + ",".join(recent_chars[:4]))
+            speaker = (raw_item.get("speaker") or raw_item.get("role") or "").strip()
+            text = (raw_item.get("text") or raw_item.get("content") or "").strip()
+            if speaker and text:
+                snippet = text.replace("\n", " ").strip()
+                if len(snippet) > 24:
+                    snippet = snippet[:24] + "..."
+                parts.append(f"{speaker}:{snippet}")
+            return " | ".join(parts)
+
+        def _ensure_bgm_item(path: str, *, hint: str, mood: str = "") -> str:
+            if not path:
+                return path
+            if path in bgm_by_path:
+                try:
+                    it = bgm_by_path[path]
+                    if hint and (not it.description):
+                        it.description = hint
+                    if mood and (not it.mood):
+                        it.mood = mood
+                except Exception:
+                    pass
+                return path
+            stem = Path(path).stem
+            bgm_id = stem or f"bgm_{len(bgm_by_path)+1:02d}"
+            bgm_by_path[path] = BGMPendingItem(
+                item_id=f"bgm_item_{len(bgm_by_path)+1:02d}",
+                bgm_id=bgm_id,
+                description=hint or bgm_id,
+                mood=(mood or ""),
+                style=story_config.get("style", ""),
+                duration=120,
+                loop=True,
+                status="pending",
+                file_path=path,
+            )
+            return path
+
+        def _ensure_cg_item(
+            path: str,
+            *,
+            hint: str,
+            node_id_hint: str = "0",
+            characters: List[str] | None = None,
+        ) -> str:
+            if not path:
+                return path
+            if path in cg_by_path:
+                # 若之前没有 node_id（占位 0），后续拿到真实 node_id 则补齐
+                try:
+                    if cg_by_path[path].node_id in ("", "0") and node_id_hint not in ("", "0"):
+                        cg_by_path[path].node_id = str(node_id_hint)
+                    if characters and (not cg_by_path[path].characters):
+                        cg_by_path[path].characters = [c for c in characters if c]
+                except Exception:
+                    pass
+                return path
+            stem = Path(path).stem
+            cg_id = stem or f"cg_{len(cg_by_path)+1:03d}"
+            cg_by_path[path] = CGPendingItem(
+                item_id=f"cg_item_{len(cg_by_path)+1:03d}",
+                cg_id=cg_id,
+                node_id=str(node_id_hint),
+                description=hint or cg_id,
+                characters=[c for c in (characters or []) if c],
+                atmosphere=story_config.get("style", ""),
+                status="pending",
+                file_path=path,
+            )
+            return path
+
+        def _states_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+            keys = ("background", "bgm", "stop_bgm", "video", "ui_file", "hide_textbox")
+            return all((a.get(k) or "") == (b.get(k) or "") for k in keys)
+
         node_id = 1
-        for idx, chapter in enumerate(normalized_chapters):
-            title = f"第{idx+1}章"
-            structured = chapter.get("structured") if isinstance(chapter, dict) else None
-            if structured and isinstance(structured, dict):
-                title = structured.get("chapter_title") or structured.get("title") or title
-            content = ""
-            if structured and isinstance(structured, dict):
-                content = structured.get("summary") or structured.get("chapter_summary") or ""
-            if not content and isinstance(chapter, dict):
-                content = chapter.get("raw_response", "")[:400]
+        last_linear_sources: List[int] = []  # 需要连接到“下一个节点”的源（用于分支汇合）
 
-            bg_path = background_items[idx].file_path if idx < len(background_items) else ""
-            bgm_path = bgm_items[idx].file_path if idx < len(bgm_items) else ""
+        def _append_node_with_linear_links(node: FlowNodeData):
+            """把 node 加入 flow，并从线性来源连到该 node。
 
+            - 若存在 last_linear_sources（分支汇合点），则全部连向 node
+            - 否则若已有前一个节点，则从前一个节点连向 node
+            - 第一个节点不自动生成连线
+            """
+            nonlocal last_linear_sources
+            sources: List[int] = []
+            if last_linear_sources:
+                sources = list(last_linear_sources)
+            elif flow_nodes:
+                sources = [flow_nodes[-1].id]
+            for src in sources:
+                if src != node.id:
+                    connections.append(ConnectionData(source=src, target=node.id))
+            flow_nodes.append(node)
+            last_linear_sources = [node.id]
+
+        def _new_text_node(title: str, state: Dict[str, Any], *, content_hint: str) -> FlowNodeData:
+            nonlocal node_id
             node = FlowNodeData(
                 id=node_id,
                 node_type="text",
                 title=title,
-                content=content,
+                content=content_hint,
                 speaker="",
                 portrait="",
-                background=bg_path,
+                background=state.get("background") or "",
                 voice="",
-                bgm=bgm_path,
+                bgm=state.get("bgm") or "",
                 bgm_loop=True,
-                stop_bgm=False,
+                stop_bgm=bool(state.get("stop_bgm", False)),
                 bg_fade_in=False,
                 portrait_fade=False,
                 portrait_fade_out=False,
-                hide_textbox=False,
-                ui_file="",
-                video="",
+                hide_textbox=bool(state.get("hide_textbox", False)),
+                ui_file=state.get("ui_file") or "",
+                video=state.get("video") or "",
                 video_loop=False,
                 options=[],
                 condition_var="",
@@ -694,20 +1037,430 @@ class StepGenerator:
                 condition_const=False,
                 sub_dialogues=[],
                 var_ops=[],
-                x=120 * (idx % 5),
-                y=140 * (idx // 5),
+                x=220 * ((node_id - 1) % 5),
+                y=180 * ((node_id - 1) // 5),
             )
-            flow_nodes.append(node)
-            if node_id > 1:
-                connections.append(ConnectionData(source=node_id - 1, target=node_id))
+
+            # 只有在“节点实际引用”时，才登记默认背景/BGM，避免出现未引用的 bg_001/bgm_01 等兜底项。
+            try:
+                bg_path = state.get("background") or ""
+                if bg_path:
+                    if str(bg_path).startswith("resources/images/cg/"):
+                        _ensure_cg_item(str(bg_path), hint=f"{title} CG", node_id_hint=str(node_id))
+                    else:
+                        _ensure_background_item(str(bg_path), hint=f"{title} | 节点背景")
+                bgm_path = state.get("bgm") or ""
+                if bgm_path:
+                    _ensure_bgm_item(str(bgm_path), hint=f"{title} | 节点BGM")
+            except Exception:
+                pass
+
             node_id += 1
+            return node
+
+        def _is_first_person_line(speaker_name: str, char_cfg: Dict[str, Any]) -> bool:
+            # 角色配置标记优先（不依赖 narrative_pov 是否正确保存）。
+            if char_cfg and (char_cfg.get("is_player") or char_cfg.get("is_first_person")):
+                return True
+            if pov == "first" and speaker_name and speaker_name.strip() == first_person_name:
+                return True
+            return False
+
+        def _add_voice(node_id_for_voice: int, sub_id: int, speaker: str, char_id: str, text: str, emotion: str) -> str:
+            cfg = char_map.get(speaker) or {}
+            voice_model_id = cfg.get("voice_model_id")
+            voice_id = f"voice_{len(voice_items)+1:05d}"
+            voice_items.append(
+                VoicePendingItem(
+                    item_id=f"voice_item_{len(voice_items)+1:05d}",
+                    voice_id=voice_id,
+                    node_id=str(node_id_for_voice),
+                    sub_id=sub_id,
+                    speaker=speaker,
+                    char_id=char_id,
+                    text=text,
+                    emotion=emotion,
+                    voice_model_id=voice_model_id,
+                    status="pending",
+                    file_path=f"resources/voices/{char_id}/{voice_id}.mp3",
+                )
+            )
+            return voice_items[-1].file_path
+        for chap_idx, chapter in enumerate(normalized_chapters):
+            structured = chapter.get("structured") if isinstance(chapter, dict) else None
+            chap_title = f"第{chap_idx+1}章"
+            chap_summary = ""
+            if isinstance(structured, dict):
+                chap_title = structured.get("chapter_title") or structured.get("title") or chap_title
+                chap_summary = structured.get("summary") or structured.get("chapter_summary") or ""
+            if not chap_summary and isinstance(chapter, dict):
+                chap_summary = (chapter.get("raw_response", "") or "")[:400]
+
+            # 章节默认背景/BGM（作为兜底）。
+            # 注意：不要提前写入 pending 列表，只有当节点真正使用它们时才登记，避免出现“未引用的默认项”。
+            default_bg = _as_path(f"bg_{chap_idx+1:03d}", kind="background")
+            default_bgm = _as_path(f"bgm_{chap_idx+1:02d}", kind="bgm")
+
+            items = _iter_items(structured)
+
+            # 用于 CG 角色推断：记录最近出现的角色（char_id）
+            recent_char_ids: List[str] = []
+
+            pending_state = {
+                "background": default_bg,
+                "bgm": default_bgm,
+                "stop_bgm": False,
+                "video": "",
+                "ui_file": "",
+                "hide_textbox": False,
+            }
+            current_node: FlowNodeData | None = None
+            node_state: Dict[str, Any] | None = None
+            current_subs: List[Dict[str, Any]] = []
+
+            def _flush_text_node():
+                nonlocal current_node, current_subs, node_state
+                if current_node is None:
+                    return
+                current_node.sub_dialogues = current_subs
+                _append_node_with_linear_links(current_node)
+                current_node = None
+                node_state = None
+                current_subs = []
+
+            for raw in items:
+                kind = (raw.get("_kind") or raw.get("type") or raw.get("node_type") or "").strip().lower()
+                directives = raw.get("_directives") if isinstance(raw.get("_directives"), dict) else {}
+                if isinstance(raw.get("directives"), dict):
+                    directives = {**directives, **raw.get("directives")}
+                if kind in {"choice", "condition"}:
+                    # choice/condition 前先应用 scene directives（会触发节点切分）
+                    desired_state = dict(pending_state)
+                    bg_val = directives.get("background")
+                    if bg_val:
+                        desired_state["background"] = _as_path(bg_val, kind="background")
+                    cg_val = directives.get("cg")
+                    if cg_val:
+                        desired_state["background"] = _as_path(cg_val, kind="cg")
+                    video_val = directives.get("video")
+                    if video_val:
+                        desired_state["video"] = _as_path(video_val, kind="video")
+                    ui_val = directives.get("ui") or directives.get("ui_file")
+                    if ui_val:
+                        desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+                    if directives.get("hide_textbox") is not None:
+                        desired_state["hide_textbox"] = bool(directives.get("hide_textbox"))
+
+                    stop_bgm_val = directives.get("stop_bgm")
+                    bgm_val = directives.get("bgm")
+                    if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                        desired_state["stop_bgm"] = True
+                        desired_state["bgm"] = ""
+                    elif bgm_val:
+                        desired_state["stop_bgm"] = False
+                        desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+
+                    # 登记媒体引用
+                    if desired_state.get("background"):
+                        if str(desired_state["background"]).startswith("resources/images/cg/"):
+                            _ensure_cg_item(
+                                desired_state["background"],
+                                hint=_make_cg_hint(chap_title, raw, recent_char_ids),
+                                node_id_hint="0",
+                                characters=recent_char_ids,
+                            )
+                        else:
+                            _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
+                    if desired_state.get("bgm"):
+                        bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
+                        _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+
+                    pending_state = desired_state
+                    _flush_text_node()
+
+                    if kind == "choice":
+                        options = raw.get("options") or []
+                        if isinstance(options, str):
+                            options = [options]
+                        if not isinstance(options, list):
+                            options = []
+                        options = [str(o.get("text") if isinstance(o, dict) else o) for o in options]
+                        options = [o.strip() for o in options if o and str(o).strip()]
+                        if not options:
+                            options = ["选项 1", "选项 2"]
+
+                        choice_node = FlowNodeData(
+                            id=node_id,
+                            node_type="choice",
+                            title=raw.get("title") or "选择",
+                            content=raw.get("prompt") or raw.get("content") or "请选择：",
+                            speaker="",
+                            portrait="",
+                            background=pending_state.get("background") or "",
+                            voice="",
+                            bgm=pending_state.get("bgm") or "",
+                            bgm_loop=True,
+                            stop_bgm=bool(pending_state.get("stop_bgm", False)),
+                            bg_fade_in=False,
+                            portrait_fade=False,
+                            portrait_fade_out=False,
+                            hide_textbox=bool(pending_state.get("hide_textbox", False)),
+                            ui_file=pending_state.get("ui_file") or "",
+                            video=pending_state.get("video") or "",
+                            video_loop=False,
+                            options=options,
+                            condition_var="",
+                            condition_op="==",
+                            condition_value="",
+                            condition_const=False,
+                            sub_dialogues=[],
+                            var_ops=[],
+                            x=220 * ((node_id - 1) % 5),
+                            y=180 * ((node_id - 1) // 5),
+                        )
+                        node_id += 1
+                        _append_node_with_linear_links(choice_node)
+
+                        branch_sources: List[int] = []
+                        for opt_idx, opt in enumerate(options):
+                            stub = _new_text_node(
+                                title=f"{choice_node.title}-{opt_idx+1}",
+                                state=dict(pending_state),
+                                content_hint=f"分支占位：{opt}",
+                            )
+                            # choice 节点连到每个分支桩
+                            connections.append(ConnectionData(source=choice_node.id, target=stub.id))
+                            stub.sub_dialogues = []
+                            flow_nodes.append(stub)
+                            branch_sources.append(stub.id)
+                        last_linear_sources = branch_sources
+                        continue
+
+                    # condition
+                    cond = raw.get("condition") or raw
+                    var_name = (cond.get("var") or cond.get("condition_var") or "").strip() or "favorability"
+                    op = (cond.get("op") or cond.get("condition_op") or ">=").strip() or ">="
+                    value = str(cond.get("value") or cond.get("condition_value") or "0")
+                    is_const = bool(cond.get("const") if "const" in cond else cond.get("condition_const", True))
+
+                    cond_node = FlowNodeData(
+                        id=node_id,
+                        node_type="condition",
+                        title=raw.get("title") or "条件判断",
+                        content=raw.get("prompt") or raw.get("content") or f"判断：{var_name} {op} {value}",
+                        speaker="",
+                        portrait="",
+                        background=pending_state.get("background") or "",
+                        voice="",
+                        bgm=pending_state.get("bgm") or "",
+                        bgm_loop=True,
+                        stop_bgm=bool(pending_state.get("stop_bgm", False)),
+                        bg_fade_in=False,
+                        portrait_fade=False,
+                        portrait_fade_out=False,
+                        hide_textbox=bool(pending_state.get("hide_textbox", False)),
+                        ui_file=pending_state.get("ui_file") or "",
+                        video=pending_state.get("video") or "",
+                        video_loop=False,
+                        options=[],
+                        condition_var=var_name,
+                        condition_op=op,
+                        condition_value=value,
+                        condition_const=is_const,
+                        sub_dialogues=[],
+                        var_ops=[],
+                        x=220 * ((node_id - 1) % 5),
+                        y=180 * ((node_id - 1) // 5),
+                    )
+                    node_id += 1
+                    _append_node_with_linear_links(cond_node)
+
+                    true_stub = _new_text_node(
+                        title=f"{cond_node.title}-True",
+                        state=dict(pending_state),
+                        content_hint="条件为真分支占位",
+                    )
+                    false_stub = _new_text_node(
+                        title=f"{cond_node.title}-False",
+                        state=dict(pending_state),
+                        content_hint="条件为假分支占位",
+                    )
+                    connections.append(ConnectionData(source=cond_node.id, target=true_stub.id))
+                    connections.append(ConnectionData(source=cond_node.id, target=false_stub.id))
+                    true_stub.sub_dialogues = []
+                    false_stub.sub_dialogues = []
+                    flow_nodes.extend([true_stub, false_stub])
+                    last_linear_sources = [true_stub.id, false_stub.id]
+                    continue
+
+                # 普通“对白/指令”项
+                desired_state = dict(pending_state)
+
+                # 媒体/显示指令（这些变化会触发新节点）
+                bg_val = raw.get("background") or raw.get("bg") or raw.get("bg_id") or directives.get("background")
+                if bg_val:
+                    desired_state["background"] = _as_path(bg_val, kind="background")
+                cg_val = raw.get("cg") or raw.get("cg_id") or raw.get("cg_path") or directives.get("cg")
+                if cg_val:
+                    # CG 视为背景切换到 resources/images/cg/...
+                    desired_state["background"] = _as_path(cg_val, kind="cg")
+                video_val = raw.get("video") or raw.get("video_path") or directives.get("video")
+                if video_val:
+                    desired_state["video"] = _as_path(video_val, kind="video")
+                ui_val = raw.get("ui") or raw.get("ui_file") or directives.get("ui") or directives.get("ui_file")
+                if ui_val:
+                    desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+
+                hide_val = raw.get("hide_textbox")
+                if hide_val is None and ("hide_textbox" in directives):
+                    hide_val = directives.get("hide_textbox")
+                if hide_val is not None:
+                    desired_state["hide_textbox"] = bool(hide_val)
+
+                stop_bgm_val = raw.get("stop_bgm")
+                if stop_bgm_val is None and ("stop_bgm" in directives):
+                    stop_bgm_val = directives.get("stop_bgm")
+                bgm_val = raw.get("bgm") or raw.get("bgm_id")
+                if not bgm_val and directives.get("bgm"):
+                    bgm_val = directives.get("bgm")
+                if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                    desired_state["stop_bgm"] = True
+                    desired_state["bgm"] = ""
+                elif bgm_val:
+                    desired_state["stop_bgm"] = False
+                    desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+
+                # 这里把“媒体引用”登记到待生成清单（即使文件不存在）
+                if desired_state.get("background"):
+                    if str(desired_state["background"]).startswith("resources/images/cg/"):
+                        _ensure_cg_item(
+                            desired_state["background"],
+                            hint=_make_cg_hint(chap_title, raw, recent_char_ids),
+                            node_id_hint="0",
+                            characters=recent_char_ids,
+                        )
+                    else:
+                        _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
+                if desired_state.get("bgm"):
+                    bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
+                    _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+
+                speaker = (raw.get("speaker") or raw.get("role") or "").strip()
+                text = (raw.get("text") or raw.get("content") or "").strip()
+                emotion = str(raw.get("emotion") or raw.get("tone") or "平静")
+
+                narrator_aliases = {"旁白", "叙述", "narrator", "narration", "Narrator", "Narration"}
+                is_narration = (not speaker) or (speaker.strip() in narrator_aliases)
+
+                # 纯指令行（无对白），只更新状态，不创建节点
+                if not speaker and not text:
+                    pending_state = desired_state
+                    continue
+
+                # 节点聚合规则：只要媒体状态不变，就尽量塞进同一 text node
+                if current_node is None:
+                    pending_state = desired_state
+                    node_state = dict(desired_state)
+                    current_node = _new_text_node(chap_title, node_state, content_hint=chap_summary)
+                else:
+                    if node_state is None:
+                        node_state = dict(pending_state)
+                    if not _states_equal(node_state, desired_state):
+                        _flush_text_node()
+                        pending_state = desired_state
+                        node_state = dict(desired_state)
+                        current_node = _new_text_node(chap_title, node_state, content_hint=chap_summary)
+                    else:
+                        # 同节点内对白：保持 pending_state 跟随最新（便于后续指令继承），但 node_state 不变
+                        pending_state = desired_state
+
+                # 若当前媒体状态使用 CG 背景，补齐 CG 的 node_id
+                if current_node and desired_state.get("background") and str(desired_state["background"]).startswith("resources/images/cg/"):
+                    _ensure_cg_item(
+                        desired_state["background"],
+                        hint=_make_cg_hint(chap_title, raw, recent_char_ids),
+                        node_id_hint=str(current_node.id),
+                        characters=recent_char_ids,
+                    )
+
+                char_cfg = char_map.get(speaker) or {}
+                if _is_first_person_line(speaker, char_cfg) and not char_cfg:
+                    char_cfg = {"char_id": "player", "char_name": speaker, "is_player": True}
+                char_id = (char_cfg.get("char_id") or char_cfg.get("id") or "unknown")
+                expr = _emotion_to_expr(emotion)
+                is_fp_line = _is_first_person_line(speaker, char_cfg)
+                if is_narration:
+                    portrait_path = ""
+                elif is_fp_line and (not first_person_has_portrait):
+                    portrait_path = ""
+                else:
+                    portrait_path = f"resources/portraits/{char_id}_stand_{expr}.png" if char_id != "unknown" else ""
+
+                if is_narration:
+                    voice_path = ""
+                elif is_fp_line and (not first_person_has_voice):
+                    voice_path = ""
+                else:
+                    voice_path = _add_voice(current_node.id, len(current_subs), speaker, char_id, text, emotion)
+
+                # 更新“最近角色”缓存，用于后续 CG 角色推断
+                if (not is_narration) and char_id and char_id != "unknown":
+                    try:
+                        cid = str(char_id)
+                        if cid in recent_char_ids:
+                            recent_char_ids.remove(cid)
+                        recent_char_ids.append(cid)
+                        if len(recent_char_ids) > 4:
+                            recent_char_ids = recent_char_ids[-4:]
+                    except Exception:
+                        pass
+
+                # 若当前行更新了 recent_char_ids，且当前背景为 CG，则补齐 CG 的人物信息
+                if current_node and desired_state.get("background") and str(desired_state["background"]).startswith("resources/images/cg/"):
+                    _ensure_cg_item(
+                        desired_state["background"],
+                        hint=_make_cg_hint(chap_title, raw, recent_char_ids),
+                        node_id_hint=str(current_node.id),
+                        characters=recent_char_ids,
+                    )
+
+                # 注意：运行时 hide_textbox 从 sub_dialogues 覆盖 node 本体
+                current_subs.append(
+                    {
+                        "speaker": speaker,
+                        "text": text,
+                        "portrait": portrait_path,
+                        "voice": voice_path,
+                        "hide_textbox": bool((node_state or desired_state).get("hide_textbox", False)),
+                        "portrait_fade": bool(raw.get("portrait_fade", False)),
+                        "portrait_fade_out": bool(raw.get("portrait_fade_out", False)),
+                    }
+                )
+
+            _flush_text_node()
+
+        # ---------- 全局变量（启用条件节点时，预置好感度变量，后续可扩展） ----------
+        if story_config.get("enable_condition_node"):
+            for char in characters:
+                char_id = char.get("char_id") or char.get("id")
+                if not char_id:
+                    continue
+                global_variables.append(GlobalVariable(name=f"favorability_{char_id}", initial=0.0, type="float"))
+
+        pending_lists = PendingLists(
+            portraits=portrait_items,
+            backgrounds=list(background_by_path.values()),
+            cgs=list(cg_by_path.values()),
+            voices=voice_items,
+            bgms=list(bgm_by_path.values()),
+        )
 
         summary = {
             "portraits": len(portrait_items),
-            "backgrounds": len(background_items),
-            "cgs": len(cg_items),
-            "voices": len(voice_items),
-            "bgms": len(bgm_items),
+            "backgrounds": len(pending_lists.backgrounds),
+            "cgs": len(pending_lists.cgs),
+            "voices": len(pending_lists.voices),
+            "bgms": len(pending_lists.bgms),
             "nodes": len(flow_nodes),
         }
 
@@ -715,6 +1468,6 @@ class StepGenerator:
             "pending_lists": pending_lists,
             "flow_nodes": flow_nodes,
             "connections": connections,
-            "global_variables": [],
+            "global_variables": global_variables,
             "summary": summary,
         }

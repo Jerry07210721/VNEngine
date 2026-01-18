@@ -229,6 +229,7 @@ class SunoClient(BaseAPIClient):
         tags: str = "",
         title: str = "",
         make_instrumental: bool = False,
+        mv_version: Optional[str] = None,
         timeout: Optional[float] = None
     ) -> tuple[bool, List[Dict[str, str]]]:
         """
@@ -253,7 +254,8 @@ class SunoClient(BaseAPIClient):
                 prompt=prompt,
                 tags=tags,
                 title=title,
-                make_instrumental=make_instrumental
+                make_instrumental=make_instrumental,
+                mv_version=mv_version,
             )
             task_batch_id = task_info["taskBatchId"]
             

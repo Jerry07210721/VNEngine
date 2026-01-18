@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QFormLayout,
     QFileDialog,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -29,6 +30,7 @@ from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
 from src.ai.core.models import PendingLists, BGMPendingItem, TaskAssignment
 from src.ai.agents.bgm_agent import BGMAgent
+from src.designer.async_elapsed_runner import AsyncElapsedRunner
 
 
 class AIBGMPanel(QWidget):
@@ -44,6 +46,7 @@ class AIBGMPanel(QWidget):
         self.current_item: Optional[BGMPendingItem] = None
         self.bgm_agent: Optional[BGMAgent] = None
         self._is_busy = False
+        self._runner = AsyncElapsedRunner(self)
         self.init_ui()
 
     def init_ui(self):
@@ -83,6 +86,34 @@ class AIBGMPanel(QWidget):
         form.addRow("模型", self.model_combo)
         info_group.setLayout(form)
         right.addWidget(info_group)
+
+        param_group = QGroupBox("条目参数（可编辑并持久化）")
+        param_form = QFormLayout()
+
+        self.input_type_combo = QComboBox()
+        self.input_type_combo.addItem("20 自定义/歌词模式", "20")
+        self.input_type_combo.addItem("10 灵感模式", "10")
+        param_form.addRow("inputType", self.input_type_combo)
+
+        self.make_instrumental_check = QCheckBox("纯音乐（makeInstrumental=true）")
+        self.make_instrumental_check.setChecked(True)
+        self.make_instrumental_check.stateChanged.connect(self._sync_prompt_enabled)
+        param_form.addRow("makeInstrumental", self.make_instrumental_check)
+
+        self.mv_version_edit = QLineEdit()
+        self.mv_version_edit.setPlaceholderText("可选：如 chirp-v4/chirp-v5；留空则使用 API 配置默认")
+        param_form.addRow("mvVersion", self.mv_version_edit)
+
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("可选：风格 tags（如 piano, orchestral, cinematic）")
+        param_form.addRow("tags", self.tags_edit)
+
+        self.save_item_params_btn = QPushButton("保存条目参数")
+        self.save_item_params_btn.clicked.connect(self._save_item_params)
+        param_form.addRow("", self.save_item_params_btn)
+
+        param_group.setLayout(param_form)
+        right.addWidget(param_group)
 
         prompt_group = QGroupBox("提示词")
         prompt_layout = QVBoxLayout()
@@ -185,9 +216,18 @@ class AIBGMPanel(QWidget):
         self.mood_label.setText(item.mood or "-")
         self.style_label.setText(item.style or "-")
         self.duration_label.setText(str(item.duration))
+
+        # 条目参数显示
+        idx = self.input_type_combo.findData(str(getattr(item, "input_type", "20") or "20"))
+        self.input_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.make_instrumental_check.setChecked(bool(getattr(item, "make_instrumental", True)))
+        self.mv_version_edit.setText(str(getattr(item, "mv_version", "") or ""))
+        self.tags_edit.setText(str(getattr(item, "tags", "") or ""))
+        self._sync_prompt_enabled()
+
         prompt_text = item.prompt or self._default_prompt(item)
         self.prompt_edit.setPlainText(prompt_text)
-        self.path_edit.setText(self._resource_path(item.file_path or f"resources/bgm/{item.bgm_id}.mp3").as_posix())
+        self.path_edit.setText(self._resource_path(item.file_path or f"resources/audios/{item.bgm_id}.mp3").as_posix())
         self.file_label.setText(f"文件：{item.file_path or '待生成'}")
         self.progress_label.setText("状态：就绪")
 
@@ -202,6 +242,32 @@ class AIBGMPanel(QWidget):
         self.path_edit.clear()
         self.file_label.setText("文件：")
         self.progress_label.setText("状态：等待选择")
+
+        self.input_type_combo.setCurrentIndex(0)
+        self.make_instrumental_check.setChecked(True)
+        self.mv_version_edit.clear()
+        self.tags_edit.clear()
+
+    def _sync_prompt_enabled(self):
+        # 纯音乐时 prompt 允许为空；UI 上不强制禁用编辑，但给出更清晰的交互：纯音乐时允许留空。
+        # 这里不 disable，避免用户仍想填描述；真正发送时会按接口要求置空。
+        return
+
+    def _save_item_params(self):
+        if not self.current_item:
+            return
+        try:
+            self.current_item.input_type = str(self.input_type_combo.currentData() or "20")
+            self.current_item.make_instrumental = bool(self.make_instrumental_check.isChecked())
+            mv = self.mv_version_edit.text().strip()
+            self.current_item.mv_version = mv or None
+            self.current_item.tags = self.tags_edit.text().strip()
+
+            self._persist_pending_lists()
+            self._refresh_list_texts()
+            self.progress_label.setText("状态：条目参数已保存")
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"保存条目参数失败: {exc}")
 
     # ==================== 工具 ====================
     def _default_prompt(self, item: BGMPendingItem) -> str:
@@ -284,18 +350,25 @@ class AIBGMPanel(QWidget):
     def _save_prompt_only(self):
         if not self.current_item:
             return
-        text = self.prompt_edit.toPlainText().strip()
-        if not text:
+        text = self.prompt_edit.toPlainText()
+        # 纯音乐允许保存空字符串
+        if (not text.strip()) and (not bool(getattr(self.current_item, "make_instrumental", True))):
             QMessageBox.warning(self, "提示", "提示词为空，无法保存。")
             return
-        self.current_item.prompt = text
+        self.current_item.prompt = text.strip() if text is not None else ""
         self._persist_pending_lists()
         self.progress_label.setText("状态：指令已保存")
 
     def _generate_bgm(self):
         if self._is_busy or not self._ensure_project() or not self.current_item or not self._ensure_agent():
             return
-        prompt = self.prompt_edit.toPlainText().strip() or self._default_prompt(self.current_item)
+
+        make_instrumental = bool(getattr(self.current_item, "make_instrumental", True))
+        if make_instrumental:
+            prompt = ""
+        else:
+            prompt = self.prompt_edit.toPlainText().strip() or self._default_prompt(self.current_item)
+
         save_path = self.path_edit.text().strip()
         if not save_path:
             self._choose_path()
@@ -312,6 +385,10 @@ class AIBGMPanel(QWidget):
             "duration": self.current_item.duration,
             "loop": self.current_item.loop,
             "prompt": prompt,
+            "tags": getattr(self.current_item, "tags", "") or "",
+            "input_type": getattr(self.current_item, "input_type", "20") or "20",
+            "make_instrumental": bool(getattr(self.current_item, "make_instrumental", True)),
+            "mv_version": getattr(self.current_item, "mv_version", None),
             "output_path": save_path,
             "project_root": str(self._project_root()),
         }
@@ -322,28 +399,47 @@ class AIBGMPanel(QWidget):
             task_content=f"生成BGM {self.current_item.bgm_id}",
             parameters=params,
         )
-        self._is_busy = True
-        self.progress_label.setText("状态：生成中...")
-        try:
-            resp = self.bgm_agent.execute(task)
-        finally:
-            self._is_busy = False
-        if resp.status != "success":
-            QMessageBox.critical(self, "生成失败", resp.error_message or "生成失败")
-            self.progress_label.setText("状态：生成失败")
-            return
 
-        outputs = self._normalize_paths(resp.output_files or [])
-        if outputs:
-            self.current_item.file_path = outputs[0]
-        self.current_item.prompt = prompt
-        self.current_item.model = self.model_combo.currentData()
-        self.current_item.status = "generated"
-        self.file_label.setText("文件：" + (self.current_item.file_path or ""))
-        self._persist_pending_lists()
-        self._refresh_list_texts()
-        self.status_label.setText(self.current_item.status)
-        self.progress_label.setText("状态：生成完成")
+        self._is_busy = True
+        self.generate_btn.setEnabled(False)
+
+        def _do_work():
+            return self.bgm_agent.execute(task)
+
+        def _on_success(resp):
+            if resp.status != "success":
+                QMessageBox.critical(self, "生成失败", resp.error_message or "生成失败")
+                self.progress_label.setText("状态：生成失败")
+                return
+
+            outputs = self._normalize_paths(resp.output_files or [])
+            if outputs:
+                self.current_item.file_path = outputs[0]
+            # 纯音乐时 prompt 允许为空字符串
+            self.current_item.prompt = prompt
+            self.current_item.model = self.model_combo.currentData()
+            self.current_item.status = "generated"
+            self.file_label.setText("文件：" + (self.current_item.file_path or ""))
+            self._persist_pending_lists()
+            self._refresh_list_texts()
+            self.status_label.setText(self.current_item.status)
+            self.progress_label.setText("状态：生成完成")
+
+        def _on_finally():
+            self._is_busy = False
+            self.generate_btn.setEnabled(True)
+
+        started = self._runner.run(
+            label=self.progress_label,
+            base_text="状态：生成中...",
+            fn=_do_work,
+            on_success=_on_success,
+            on_finally=_on_finally,
+        )
+        if not started:
+            self._is_busy = False
+            self.generate_btn.setEnabled(True)
+            QMessageBox.information(self, "提示", "已有任务在运行，请稍候。")
 
     def mark_generated(self):
         if not self.current_item:

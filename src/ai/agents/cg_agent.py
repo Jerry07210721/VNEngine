@@ -11,6 +11,8 @@ from datetime import datetime
 import base64
 import io
 
+from ..utils.flux_reference_images import prepare_flux_reference_images
+
 from ..api.api_manager import APIManager
 from ..core.config_manager import ConfigManager
 from ..core.models import TaskAssignment, AgentResponse
@@ -70,11 +72,15 @@ class CGAgent:
             )
 
     def build_prompt(self, description: str, characters: List[str], atmosphere: str) -> str:
-        chars = ", ".join(filter(None, characters)) if characters else "characters"
+        chars = ", ".join([c for c in (characters or []) if c])
         atmos = atmosphere or ""
+        role_part = f"characters: {chars}" if chars else "characters: (not specified)"
         return (
-            f"visual novel event cg, {description}, characters: {chars}, {atmos}, cinematic lighting, "
-            "dramatic composition, detailed anime illustration, high quality game art"
+            "visual novel event CG, "
+            f"{description}, {role_part}, {atmos}, "
+            "anime style, cinematic lighting, dramatic composition, depth of field, "
+            "highly detailed illustration, high quality game art, clean background, "
+            "no subtitles, no text, no watermark, no logo"
         )
 
     def _generate_single_cg(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -85,17 +91,38 @@ class CGAgent:
         prompt = parameters.get("prompt") or self.build_prompt(description, characters, atmosphere)
         aspect = parameters.get("aspect", "16:9")
         model_choice = parameters.get("model") or "flux"
+        flux_model = parameters.get("flux_model")
+        flux_mode = parameters.get("flux_mode")
+        flux_num = parameters.get("flux_num")
+        ref_image_paths = parameters.get("reference_images") or []
         project_root = self._project_root(parameters)
 
-        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/cg/{cg_id}.png")
+        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/images/cg/{cg_id}.png")
         self._ensure_image_client(model_choice)
 
-        ref_images = self._load_reference_portraits(project_root, characters)
+        # 用户显式上传参考图优先，否则回退到自动搜立绘参考
+        ref_images: List[Dict[str, Any]] = []
+        if isinstance(ref_image_paths, list) and ref_image_paths:
+            paths = [Path(p) for p in ref_image_paths if p]
+            ref_images = prepare_flux_reference_images(paths, limit=3)
+        else:
+            ref_images = self._load_reference_portraits(project_root, characters)
+
+        flux_params: Dict[str, Any] = {"aspect": aspect}
+        if flux_num is not None:
+            try:
+                flux_params["num"] = int(flux_num)
+            except Exception:
+                pass
+        if flux_mode:
+            flux_params["mode"] = str(flux_mode)
+
         file_path = self._generate_and_download(
             prompt=prompt,
             output_path=output_path,
-            params={"aspect": aspect},
+            params=flux_params,
             images=ref_images if ref_images else None,
+            flux_model=flux_model,
         )
         if not file_path:
             raise RuntimeError("CG生成失败")
@@ -127,7 +154,7 @@ class CGAgent:
             ("peaceful_moment", "peaceful moment, characters relaxing together, gentle atmosphere"),
         ]
 
-        output_dir = project_root / "resources" / "cg"
+        output_dir = project_root / "resources" / "images" / "cg"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_files = []
@@ -171,11 +198,6 @@ class CGAgent:
         if not portraits_dir.exists():
             return refs
 
-        try:
-            from PIL import Image
-        except Exception:
-            Image = None
-
         def iter_candidates():
             ordered = []
             if preferred_chars:
@@ -186,38 +208,16 @@ class CGAgent:
                 if path.exists() and path.is_dir():
                     yield path
 
+        candidate_paths: List[Path] = []
         for char_dir in iter_candidates():
             candidates = list(char_dir.glob("*_neutral.png")) or list(char_dir.glob("*.png"))
-            if not candidates:
-                continue
-            img_path = candidates[0]
-            try:
-                raw = img_path.read_bytes()
-                if Image:
-                    img = Image.open(io.BytesIO(raw)).convert("RGBA")
-                    max_side = max(img.size)
-                    if max_side > 1024:
-                        scale = 1024 / max_side
-                        new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
-                        img = img.resize(new_size)
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG", optimize=True)
-                    data = buf.getvalue()
-                else:
-                    data = raw
-
-                if len(data) > 500_000:
-                    self.logger.warning(f"参考立绘过大，跳过: {img_path.name}")
-                    continue
-                refs.append({
-                    "type": "image/png",
-                    "b64": base64.b64encode(data).decode("ascii"),
-                })
-            except Exception as exc:
-                self.logger.warning(f"读取参考立绘失败 {img_path}: {exc}")
-
-            if len(refs) >= 3:
+            if candidates:
+                candidate_paths.append(candidates[0])
+            if len(candidate_paths) >= 3:
                 break
+
+        if candidate_paths:
+            refs = prepare_flux_reference_images(candidate_paths, limit=3)
 
         return refs
 
@@ -227,6 +227,7 @@ class CGAgent:
         output_path: Path,
         params: Optional[Dict[str, Any]] = None,
         images: Optional[list] = None,
+        flux_model: Optional[str] = None,
     ) -> Optional[Path]:
         client_type = type(self.image_client).__name__
 
@@ -239,12 +240,22 @@ class CGAgent:
             )
             return Path(local_path) if success and local_path else None
 
-        success, local_paths, _urls = self.image_client.generate_and_download(
-            prompt=prompt,
-            save_dir=str(output_path.parent),
-            params=params,
-            images=images,
-        )
+        # FluxClient 支持 per-call model 覆盖
+        if "FluxClient" in client_type:
+            success, local_paths, _urls = self.image_client.generate_and_download(
+                prompt=prompt,
+                save_dir=str(output_path.parent),
+                params=params,
+                images=images,
+                model=flux_model,
+            )
+        else:
+            success, local_paths, _urls = self.image_client.generate_and_download(
+                prompt=prompt,
+                save_dir=str(output_path.parent),
+                params=params,
+                images=images,
+            )
         if success and local_paths:
             downloaded = Path(local_paths[0])
             if downloaded != output_path:

@@ -311,7 +311,11 @@ class GraphView(QGraphicsView):
         self.scene = GraphScene(parent=self)
         self.setScene(self.scene)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._min_zoom = 0.05
+        self._max_zoom = 6.0
         self._is_panning = False
         self._last_mouse_pos = None
         self._node_counter = 1
@@ -328,7 +332,50 @@ class GraphView(QGraphicsView):
             zoom_factor = zoom_in_factor
         else:
             zoom_factor = zoom_out_factor
-        self.scale(zoom_factor, zoom_factor)
+        current = float(self.transform().m11())
+        if current <= 0:
+            current = 1.0
+        target = current * zoom_factor
+        target = max(self._min_zoom, min(self._max_zoom, target))
+        applied = target / current
+        if abs(applied - 1.0) < 1e-6:
+            event.accept()
+            return
+        self.scale(applied, applied)
+        event.accept()
+
+    def _ensure_scene_contains_rect(self, rect: QRectF, margin: float = 200.0):
+        if rect.isNull() or rect.isEmpty():
+            return
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        scene_rect = self.scene.sceneRect()
+        if scene_rect.contains(rect):
+            return
+        self.scene.setSceneRect(scene_rect.united(rect))
+
+    def fit_canvas_to_content(self, margin: float = 300.0):
+        items = [i for i in self.scene.items() if isinstance(i, (FlowTextNode, ConnectionPath))]
+        if not items:
+            return
+        rect = items[0].sceneBoundingRect()
+        for it in items[1:]:
+            rect = rect.united(it.sceneBoundingRect())
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        if rect.width() < 200:
+            rect.setWidth(200)
+        if rect.height() < 200:
+            rect.setHeight(200)
+        self.scene.setSceneRect(rect)
+
+    def set_canvas_size(self, width: float, height: float):
+        try:
+            w = float(width)
+            h = float(height)
+        except Exception:
+            return
+        w = max(200.0, w)
+        h = max(200.0, h)
+        self.scene.setSceneRect(QRectF(-w / 2.0, -h / 2.0, w, h))
 
     def mousePressEvent(self, event):  # noqa: N802
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -399,7 +446,27 @@ class GraphView(QGraphicsView):
         clear_action.triggered.connect(self.clear_scene)
         menu.addAction(clear_action)
 
+        menu.addSeparator()
+        canvas_size_action = QAction("调整画布大小...", self)
+        canvas_size_action.triggered.connect(self._prompt_canvas_size)
+        menu.addAction(canvas_size_action)
+        fit_canvas_action = QAction("画布适配内容", self)
+        fit_canvas_action.triggered.connect(self.fit_canvas_to_content)
+        menu.addAction(fit_canvas_action)
+
         menu.exec(event.globalPos())
+
+    def _prompt_canvas_size(self):
+        rect = self.scene.sceneRect()
+        w0 = int(max(200.0, rect.width()))
+        h0 = int(max(200.0, rect.height()))
+        w, ok = QInputDialog.getInt(self, "画布宽度", "请输入画布宽度：", w0, 200, 200000, 100)
+        if not ok:
+            return
+        h, ok = QInputDialog.getInt(self, "画布高度", "请输入画布高度：", h0, 200, 200000, 100)
+        if not ok:
+            return
+        self.set_canvas_size(w, h)
 
     def add_text_node(self, pos: QPointF):
         node_id = self._node_counter
@@ -408,6 +475,7 @@ class GraphView(QGraphicsView):
         node = FlowTextNode(title=title, node_id=node_id, on_position_changed=self.on_node_moved)
         node.setPos(pos)
         self.scene.addItem(node)
+        self._ensure_scene_contains_rect(node.sceneBoundingRect())
         return node
 
     def delete_selected_nodes(self):
@@ -660,6 +728,7 @@ class GraphView(QGraphicsView):
     def on_node_moved(self, node: FlowTextNode):
         for edge in self._edges_for_node(node):
             edge.update_path()
+        self._ensure_scene_contains_rect(node.sceneBoundingRect())
 
     def update_start_marks(self):
         nodes = [i for i in self.scene.items() if isinstance(i, FlowTextNode)]

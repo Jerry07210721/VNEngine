@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import json
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,9 +30,11 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QApplication,
 )
 
 from src.ai.core.config_manager import ConfigManager
+from src.ai.core.secret_store import get_secret_key_storage_display, get_secret_key_storage_path
 from src.ai.api.gptsovits_client import GPTSoVITSClient
 
 
@@ -212,6 +215,21 @@ class AIAssistDialog(QDialog):
         scroll.setWidgetResizable(True)
         content = QWidget()
         form = QFormLayout(content)
+
+        # Show where the encryption key is stored (for backup/migration).
+        self.secret_key_path_edit = QLineEdit()
+        self.secret_key_path_edit.setReadOnly(True)
+        self.secret_key_path_edit.setText(get_secret_key_storage_display())
+        copy_btn = QPushButton("复制")
+        open_btn = QPushButton("打开文件夹")
+        copy_btn.clicked.connect(self._copy_secret_key_path)
+        open_btn.clicked.connect(self._open_secret_key_folder)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.secret_key_path_edit, 1)
+        key_row.addWidget(copy_btn)
+        key_row.addWidget(open_btn)
+        form.addRow("加密密钥位置", key_row)
+
         self.api_fields: Dict[str, Dict[str, QLineEdit]] = {}
         api_defs = {
             "claude": {},
@@ -261,6 +279,26 @@ class AIAssistDialog(QDialog):
         scroll.setWidget(content)
         layout.addWidget(scroll)
         self.tabs.addTab(w, "API 配置")
+
+    def _copy_secret_key_path(self):
+        text = self.secret_key_path_edit.text().strip() if hasattr(self, "secret_key_path_edit") else ""
+        if not text:
+            return
+        try:
+            QApplication.clipboard().setText(text)
+        except Exception:
+            pass
+
+    def _open_secret_key_folder(self):
+        path = get_secret_key_storage_path()
+        if path is None:
+            QMessageBox.information(self, "提示", "当前使用环境变量 VNENGINE_SECRET_KEY 提供密钥，不存在密钥文件。")
+            return
+        try:
+            folder = path.parent
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception:
+            pass
 
     # --- 事件 ---
     def _fmt_combo(self, default: str = "png", choices: Optional[List[str]] = None) -> QComboBox:
@@ -687,5 +725,15 @@ class APIConfigDialog(AIAssistDialog):
     def __init__(self, config_manager: Optional[ConfigManager] = None, parent=None):
         super().__init__(config_manager=config_manager, parent=parent)
         self.setWindowTitle("API 配置")
-        self.tabs.setCurrentIndex(self.tabs.indexOf(self.tabs.findChild(QWidget, None)))
-        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+
+        # 只保留“API 配置”页签，其余页签不展示（旧版入口的多页签对用户是干扰）。
+        api_idx = -1
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).strip() == "API 配置":
+                api_idx = i
+                break
+        if api_idx >= 0:
+            for i in reversed(range(self.tabs.count())):
+                if i != api_idx:
+                    self.tabs.removeTab(i)
+            self.tabs.setCurrentIndex(0)

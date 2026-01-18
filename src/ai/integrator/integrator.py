@@ -9,6 +9,8 @@ from pathlib import Path
 import json
 import shutil
 from datetime import datetime
+import os
+import yaml
 
 from ..core.config_manager import ConfigManager
 from ..core.models import (
@@ -19,6 +21,7 @@ from ..core.models import (
     MaterialRequirement,
 )
 from ..log.logger import get_logger
+from ...core.project_manager import VNProjectManager
 
 
 class Integrator:
@@ -98,15 +101,22 @@ class Integrator:
         self.resources_dir = self.project_path / "resources"
         self.resources_dir.mkdir(exist_ok=True)
         
-        # 创建资源子目录
+        # 创建资源子目录（必须对齐 VNEngine 运行时/设计器）
         self.portraits_dir = self.resources_dir / "portraits"
-        self.backgrounds_dir = self.resources_dir / "backgrounds"
-        self.cg_dir = self.resources_dir / "cg"
+        self.backgrounds_dir = self.resources_dir / "images"
+        self.cg_dir = self.backgrounds_dir / "cg"
         self.voice_dir = self.resources_dir / "voices"
-        self.bgm_dir = self.resources_dir / "bgm"
+        self.bgm_dir = self.resources_dir / "audios"
+        self.videos_dir = self.resources_dir / "videos"
         
-        for dir_path in [self.portraits_dir, self.backgrounds_dir, 
-                         self.cg_dir, self.voice_dir, self.bgm_dir]:
+        for dir_path in [
+            self.portraits_dir,
+            self.backgrounds_dir,
+            self.cg_dir,
+            self.voice_dir,
+            self.bgm_dir,
+            self.videos_dir,
+        ]:
             dir_path.mkdir(exist_ok=True)
         
         self.logger.info(f"工程目录已创建: {self.project_path}")
@@ -366,7 +376,7 @@ class Integrator:
             if not node.background:
                 # 每10个节点切换一次背景
                 if bg_index < len(bg_files):
-                    current_bg = f"resources/backgrounds/{bg_files[bg_index].name}"
+                    current_bg = f"resources/images/{bg_files[bg_index].name}"
                     bg_index = (bg_index + 1) % len(bg_files)
                 
                 node.background = current_bg or ""
@@ -441,7 +451,7 @@ class Integrator:
         
         # 简单策略：使用第一首BGM作为主题曲
         if bgm_files:
-            main_bgm = f"resources/bgm/{bgm_files[0].name}"
+            main_bgm = f"resources/audios/{bgm_files[0].name}"
             
             # 第一个节点播放BGM
             if self.flow_nodes:
@@ -485,115 +495,100 @@ class Integrator:
         if not self.project_path:
             raise RuntimeError("工程路径未设置")
 
+        # 资源列表：允许虚拟路径（文件尚未生成）
+        resources_payload = self._collect_resources_from_nodes()
+
         flow_nodes_payload = {
-            "nodes": [node.model_dump() for node in self.flow_nodes],
-            "connections": [conn.model_dump() for conn in self.connections],
-            "material_requirements": [mr.model_dump() for mr in self.material_reqs],
+            "nodes": [node.model_dump(mode="python") for node in self.flow_nodes],
+            "connections": [conn.model_dump(mode="python") for conn in self.connections],
         }
 
-        resources_payload = self._collect_resources()
-        
-        # 构建工程数据
-        project_data = {
-            "project_info": {
-                "name": self.project_name,
-                "version": "0.1",
-                "engine_version": user_config.project_info.engine_version,
-                "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "last_modify_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "story_title": user_config.story_config.title,
-                "story_style": user_config.story_config.style,
-            },
-            "game_config": {
-                "window_width": user_config.project_info.window_width,
-                "window_height": user_config.project_info.window_height,
-                "game_title": user_config.story_config.title,
-                "branch_strategy": "first",
-                "menu_title": user_config.story_config.title,
-                "menu_background": "",
-                "menu_bgm": resources_payload.get("audios", [""])[0] if resources_payload.get("audios") else "",
-                "menu_bgm_loop": True,
-                "menu_video": "",
-                "menu_video_loop": False,
-                "menu_overlay_alpha": 0,
-                "menu_title_pos": [60, 60],
-                "menu_title_color": [240, 240, 255],
-                "menu_option_pos": [80, 140],
-                "menu_option_color": [255, 255, 255],
-                "menu_title_image": "",
-                "menu_title_image_pos": [400, 80],
-                "menu_title_scale": 1.0,
-                "menu_title_image_scale": 1.0,
-                "menu_option_scale": 1.0,
-            },
-            "resources": resources_payload,
-            "global_variables": [var.model_dump() for var in self.global_vars],
-            "flow_nodes": flow_nodes_payload,
-            # 向后兼容旧字段
-            "flow_data": flow_nodes_payload,
-            "characters": [
-                {
-                    "char_id": char.char_id,
-                    "char_name": char.char_name,
-                    "persona_keywords": char.persona_keywords,
-                }
-                for char in user_config.character_config
-            ],
-        }
-        
-        # 保存工程文件
+        # 使用 VNProjectManager 生成 YAML，保证与 Designer/Runtime 完全兼容
+        pm = VNProjectManager()
+        pm.new_project(
+            project_name=self.project_name,
+            window_width=user_config.project_info.window_width,
+            window_height=user_config.project_info.window_height,
+        )
+        pm.project_data["project_info"]["engine_version"] = user_config.project_info.engine_version
+        pm.project_data["project_info"]["name"] = self.project_name
+        pm.project_data["project_info"]["last_modify_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        game_cfg = pm.project_data.get("game_config", {})
+        game_cfg["window_width"] = user_config.project_info.window_width
+        game_cfg["window_height"] = user_config.project_info.window_height
+        game_cfg["game_title"] = user_config.story_config.title
+        game_cfg["branch_strategy"] = game_cfg.get("branch_strategy") or "first"
+
+        # 默认把第一首音频作为菜单BGM（若有）
+        audios = resources_payload.get("audios") or []
+        if audios:
+            game_cfg["menu_bgm"] = audios[0]
+            game_cfg["menu_bgm_loop"] = True
+
+        pm.project_data["game_config"] = game_cfg
+        pm.project_data["resources"] = resources_payload
+        pm.project_data["global_variables"] = [var.model_dump(mode="python") for var in (self.global_vars or [])]
+        pm.project_data["flow_nodes"] = flow_nodes_payload
+
+        # 保存工程文件（YAML）
         project_file = self.project_path / f"{self.project_name}.vngproj"
-        
-        with open(project_file, 'w', encoding='utf-8') as f:
-            json.dump(project_data, f, ensure_ascii=False, indent=2)
-        
+        pm.save_project(str(project_file))
+
         self.logger.info(f"工程文件已生成: {project_file}")
-        
         return str(project_file)
 
-    def _collect_resources(self) -> Dict[str, List[str]]:
-        """扫描资源目录，生成资源列表供 Designer/Runtime 读取。"""
+    def _collect_resources_from_nodes(self) -> Dict[str, List[str]]:
+        """从节点引用中收集资源路径（允许虚拟路径，不要求文件存在）。"""
 
-        if not self.project_path:
-            return {"images": [], "audios": [], "portraits": [], "voices": [], "videos": []}
-
-        def _rel(path: Path) -> str:
-            try:
-                return path.relative_to(self.project_path).as_posix()
-            except Exception:
-                return path.as_posix()
+        def _norm(p: str) -> str:
+            if not p:
+                return ""
+            # 统一为 forward slash，runtime 用 Path 拼接可跨平台
+            return p.replace("\\\\", "/").replace("\\", "/")
 
         images: List[str] = []
-        for folder in [self.backgrounds_dir, self.cg_dir]:
-            if not folder:
+        audios: List[str] = []
+        portraits: List[str] = []
+        voices: List[str] = []
+        videos: List[str] = []
+
+        def _add(lst: List[str], val: str):
+            v = _norm(val)
+            if v and v not in lst:
+                lst.append(v)
+
+        for node in self.flow_nodes or []:
+            if not node:
                 continue
-            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"]:
-                images.extend([_rel(p) for p in folder.glob(pattern)])
+            _add(images, getattr(node, "background", "") or "")
+            _add(audios, getattr(node, "bgm", "") or "")
+            _add(portraits, getattr(node, "portrait", "") or "")
+            _add(voices, getattr(node, "voice", "") or "")
+            _add(videos, getattr(node, "video", "") or "")
 
-        portraits = []
-        if self.portraits_dir:
-            portraits = [_rel(p) for p in self.portraits_dir.glob("*.png")]
-
-        voices = []
-        if self.voice_dir:
-            voices = [_rel(p) for p in self.voice_dir.glob("**/*.mp3")]
-
-        audios = []
-        if self.bgm_dir:
-            audios = [_rel(p) for p in self.bgm_dir.glob("*.mp3")]
+            if getattr(node, "node_type", "") == "text":
+                for sub in (getattr(node, "sub_dialogues", None) or []):
+                    if not isinstance(sub, dict):
+                        continue
+                    _add(portraits, sub.get("portrait") or "")
+                    _add(voices, sub.get("voice") or "")
 
         return {
             "images": images,
             "audios": audios,
             "portraits": portraits,
             "voices": voices,
-            "videos": [],
+            "videos": videos,
         }
 
     def _assign_voice_from_files(self):
         """为节点按角色顺序分配语音文件，避免路径不匹配。"""
 
         if not self.voice_dir or not self.flow_nodes:
+            return
+
+        if not self.voice_dir.exists():
             return
 
         # 为每个角色预取文件列表
@@ -734,10 +729,11 @@ class Integrator:
         self.resources_dir = Path(resources_dir) if resources_dir else self.project_path / "resources"
         self.resources_dir.mkdir(parents=True, exist_ok=True)
         self.portraits_dir = self.resources_dir / "portraits"
-        self.backgrounds_dir = self.resources_dir / "backgrounds"
-        self.cg_dir = self.resources_dir / "cg"
+        self.backgrounds_dir = self.resources_dir / "images"
+        self.cg_dir = self.backgrounds_dir / "cg"
         self.voice_dir = self.resources_dir / "voices"
-        self.bgm_dir = self.resources_dir / "bgm"
+        self.bgm_dir = self.resources_dir / "audios"
+        self.videos_dir = self.resources_dir / "videos"
 
         # 记录数据
         self.flow_nodes = flow_nodes
@@ -745,11 +741,13 @@ class Integrator:
         self.global_vars = global_variables or []
         self.material_reqs = material_requirements or []
 
-        # 若存在语音文件，尝试根据文件填充节点引用
-        self._assign_voice_from_files()
+        # 预置常见资源子目录（对齐 VNEngine）。
+        # 顶层仅保留 5 类资源目录：images/portraits/audios/voices/videos。
+        # 允许在 images 下扩展子目录（如 cg、ui）。
+        for sub in ["portraits", "images", "images/cg", "images/ui", "voices", "audios", "videos"]:
+            (self.resources_dir / Path(sub)).mkdir(parents=True, exist_ok=True)
 
-        # 预置常见资源子目录
-        for sub in ["portraits", "backgrounds", "cg", "voices", "bgm", "plot"]:
-            (self.resources_dir / sub).mkdir(parents=True, exist_ok=True)
+        # 若存在语音文件，尝试根据文件填充节点引用（虚拟路径阶段通常为空，需容错）
+        self._assign_voice_from_files()
 
         return self.generate_project_file(user_config)

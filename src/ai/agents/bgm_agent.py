@@ -69,25 +69,49 @@ class BGMAgent:
         desc = description or "visual novel background music"
         mood_text = mood or ""
         style_text = style or ""
-        return f"{desc}, {mood_text}, {style_text}, instrumental score, clean mix, loop friendly"
+        return (
+            f"{desc}, mood: {mood_text}, style/tags: {style_text}, "
+            "instrumental only (no vocals), loop friendly, seamless loop, "
+            "clean mix, consistent loudness, gentle intro/outro"
+        )
 
     def _generate_bgm_item(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         bgm_id = parameters.get("bgm_id") or "bgm"
         description = parameters.get("description", "")
         mood = parameters.get("mood", "")
         style = parameters.get("style", "")
-        prompt = parameters.get("prompt") or self.build_prompt(description, mood, style)
-        tags = parameters.get("tags") or style or mood
+        make_instrumental = parameters.get("make_instrumental")
+        if make_instrumental is None:
+            make_instrumental = True
+        make_instrumental = bool(make_instrumental)
+
+        prompt = parameters.get("prompt")
+        if prompt is None:
+            prompt = self.build_prompt(description, mood, style)
+        prompt = str(prompt)
+        # 纯音乐时 prompt 允许为空字符串（接口要求/客户端也会强制置空）
+        if make_instrumental:
+            prompt = ""
+
+        tags = parameters.get("tags")
+        if tags is None:
+            tags = style or mood
+        tags = str(tags or "")
+
+        mv_version = parameters.get("mv_version")
+        mv_version = str(mv_version).strip() if mv_version else None
+
         project_root = self._project_root(parameters)
-        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/bgm/{bgm_id}.mp3")
+        output_path = self._resolve_output_path(parameters, project_root, default_rel=f"resources/audios/{bgm_id}.mp3")
 
         success, music_list = self.music_client.generate_and_download(
             save_dir=str(output_path.parent),
-            input_type=parameters.get("input_type", "20"),
+            input_type=str(parameters.get("input_type", "20") or "20"),
             prompt=prompt,
             tags=tags,
             title=parameters.get("title", bgm_id),
-            make_instrumental=parameters.get("make_instrumental", True),
+            make_instrumental=make_instrumental,
+            mv_version=mv_version,
             timeout=parameters.get("timeout"),
         )
 
@@ -134,7 +158,7 @@ class BGMAgent:
             ("cheerful", "upbeat cheerful melody, happy scene music, lighthearted tune"),
         ]
 
-        output_dir = project_root / "resources" / "bgm"
+        output_dir = project_root / "resources" / "audios"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         output_files: List[str] = []

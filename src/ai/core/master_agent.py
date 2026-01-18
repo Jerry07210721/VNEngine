@@ -218,6 +218,9 @@ class MasterAgent:
         
         # 4. CG任务
         if config.enable_agents.cg_agent:
+            cg_count = int(getattr(config.story_config, "cg_count", 0) or 0)
+            if cg_count <= 0:
+                cg_count = 3
             tasks.append(TaskAssignment(
                 task_id=f"task_{task_id_counter:03d}",
                 agent_type="cg",
@@ -225,7 +228,7 @@ class MasterAgent:
                 agent_name="cg_agent",
                 task_content="生成事件CG图",
                 parameters={
-                    "cg_count": 3,
+                    "cg_count": cg_count,
                     "style": config.story_config.style,
                     "project_root": str(self.project_root)
                 },

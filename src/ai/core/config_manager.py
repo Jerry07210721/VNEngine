@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from .models import UserConfig
+from .secret_store import decrypt_str, encrypt_str
 
 
 class ConfigManager:
@@ -75,6 +76,7 @@ class ConfigManager:
                     "poll_interval": 5
                 },
                 "gptsovits": {
+                    "api_key": "",
                     "sign": "YOUR_GPTSOVITS_SIGN",
                     "base_url": "https://openapi.lipvoice.cn",
                     "style": "2",
@@ -167,8 +169,8 @@ class ConfigManager:
         with open(self.config_path, 'w', encoding='utf-8') as f:
             yaml.dump(default_config, f, allow_unicode=True, default_flow_style=False, indent=2)
         
-        print(f"✅ 已创建默认配置文件: {self.config_path}")
-        print("⚠️  请在配置文件中填写您的API密钥")
+        print(f"[OK] 已创建默认配置文件: {self.config_path}")
+        print("[WARN] 请在配置文件中填写您的API密钥")
     
     def load_config(self) -> Dict[str, Any]:
         """
@@ -179,12 +181,58 @@ class ConfigManager:
         """
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                self.config_data = yaml.safe_load(f)
+                self.config_data = yaml.safe_load(f) or {}
             self._ensure_defaults()
+            self._decrypt_api_secrets_inplace()
             return self.config_data
         except Exception as e:
-            print(f"❌ 配置文件加载失败: {e}")
+            print(f"[ERROR] 配置文件加载失败: {e}")
             return {}
+
+    def _decrypt_api_secrets_inplace(self) -> None:
+        """Decrypt sensitive fields in-memory after loading.
+
+        On disk, secrets are stored as ENC::... strings. In memory we keep them
+        decrypted so the rest of the system (UI + API clients) continues to use
+        plain values.
+        """
+        api_keys = self.config_data.get("api_keys")
+        if not isinstance(api_keys, dict):
+            return
+
+        secret_fields = {"api_key", "token", "sign"}
+        for _, cfg in api_keys.items():
+            if not isinstance(cfg, dict):
+                continue
+            for field in secret_fields:
+                val = cfg.get(field)
+                if isinstance(val, str) and val:
+                    cfg[field] = decrypt_str(val)
+
+    def _encrypted_dump_copy(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a deep-ish copy of config with secrets encrypted for disk."""
+        # Manual copy to avoid importing copy.deepcopy for large configs.
+        out: Dict[str, Any] = {}
+        for k, v in (data or {}).items():
+            if isinstance(v, dict):
+                out[k] = self._encrypted_dump_copy(v)
+            elif isinstance(v, list):
+                out[k] = [self._encrypted_dump_copy(i) if isinstance(i, dict) else i for i in v]
+            else:
+                out[k] = v
+
+        # Encrypt only under api_keys.* for known sensitive fields.
+        api_keys = out.get("api_keys")
+        if isinstance(api_keys, dict):
+            secret_fields = {"api_key", "token", "sign"}
+            for _, cfg in api_keys.items():
+                if not isinstance(cfg, dict):
+                    continue
+                for field in secret_fields:
+                    val = cfg.get(field)
+                    if isinstance(val, str) and val:
+                        cfg[field] = encrypt_str(val)
+        return out
 
     def _ensure_defaults(self):
         """在缺省字段时填充默认值，避免KeyError。"""
@@ -228,14 +276,16 @@ class ConfigManager:
         try:
             if config_data is not None:
                 self.config_data = config_data
-            
+
+            # Persist secrets encrypted at rest.
+            dump_data = self._encrypted_dump_copy(self.config_data)
             with open(self.config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(self.config_data, f, allow_unicode=True, default_flow_style=False, indent=2)
+                yaml.dump(dump_data, f, allow_unicode=True, default_flow_style=False, indent=2)
             
-            print(f"✅ 配置文件保存成功: {self.config_path}")
+            print(f"[OK] 配置文件保存成功: {self.config_path}")
             return True
         except Exception as e:
-            print(f"❌ 配置文件保存失败: {e}")
+            print(f"[ERROR] 配置文件保存失败: {e}")
             return False
     
     def get_api_config(self, api_name: str) -> Dict[str, Any]:

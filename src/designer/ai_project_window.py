@@ -28,6 +28,7 @@ from PyQt6.QtGui import QAction, QIcon
 
 from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
+from src.designer.ai_assist_dialog import APIConfigDialog
 
 # 导入子界面（占位）
 from src.designer.ai_story_config_panel import AIStoryConfigPanel
@@ -38,6 +39,7 @@ from src.designer.ai_cg_panel import AICGPanel
 from src.designer.ai_background_panel import AIBackgroundPanel
 from src.designer.ai_voice_panel import AIVoicePanel
 from src.designer.ai_bgm_panel import AIBGMPanel
+from src.designer.voice_model_dialog import VoiceModelPickerDialog, get_gptsovits_client
 
 
 class AIProjectWindow(QMainWindow):
@@ -123,6 +125,10 @@ class AIProjectWindow(QMainWindow):
         api_config_action = QAction("API配置", self)
         api_config_action.triggered.connect(self.open_api_config)
         tools_menu.addAction(api_config_action)
+
+        voice_model_action = QAction("语音模型配置", self)
+        voice_model_action.triggered.connect(self.open_voice_model_manager)
+        tools_menu.addAction(voice_model_action)
         
         project_summary_action = QAction("工程摘要", self)
         project_summary_action.triggered.connect(self.show_project_summary)
@@ -162,6 +168,15 @@ class AIProjectWindow(QMainWindow):
         # 工程信息显示
         self.project_info_label = QLabel("未打开工程")
         tool_bar.addWidget(self.project_info_label)
+
+    def open_voice_model_manager(self):
+        """打开 GPT-SoVITS 语音模型配置（分页查询/上传/删除）。"""
+
+        client = get_gptsovits_client(self.config_manager, self)
+        if not client:
+            return
+        dlg = VoiceModelPickerDialog(client, self, allow_manage=True)
+        dlg.exec()
         
     def init_central_widget(self):
         """初始化中心部件 - 多标签页"""
@@ -406,8 +421,8 @@ class AIProjectWindow(QMainWindow):
     
     def open_api_config(self):
         """打开API配置对话框"""
-        # TODO: 复用主设计器的API配置对话框
-        QMessageBox.information(self, "提示", "API配置功能将在后续实现")
+        dlg = APIConfigDialog(config_manager=self.config_manager, parent=self)
+        dlg.exec()
     
     def show_project_summary(self):
         """显示工程摘要"""

@@ -121,6 +121,37 @@ class MidjourneyClient(BaseAPIClient):
             return task_data
         else:
             raise APIError(f"图像拆分失败: {response.get('message')}")
+
+    def upscale(self, task_id: str, upscale_type: str = "subtle") -> Dict[str, Any]:
+        """图像高清（第三步，针对拆分后的单张图像）。
+
+        Args:
+            task_id: 拆分任务ID（由 separate API 返回的任务ID）
+            upscale_type: subtle（默认）或 creative
+
+        Returns:
+            新任务信息 {"id": 任务ID}
+        """
+
+        if upscale_type not in ("subtle", "creative"):
+            raise ValueError(f"upscale_type 取值必须为 subtle/creative，当前为: {upscale_type}")
+
+        payload: Dict[str, Any] = {
+            "id": task_id,
+            "type": upscale_type,
+        }
+
+        self.logger.info(f"发起图像高清: task_id={task_id}, type={upscale_type}")
+
+        response = self.post("/open/v1/midjourney/upscale", data=payload)
+
+        if response.get("status") == "Success":
+            task_data = response.get("data", {})
+            new_task_id = task_data.get("id")
+            self.logger.info(f"图像高清任务创建成功: new_task_id={new_task_id}")
+            return task_data
+        else:
+            raise APIError(f"图像高清失败: {response.get('message')}")
     
     def query_result(self, task_id: str) -> Dict[str, Any]:
         """

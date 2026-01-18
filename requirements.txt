@@ -13,6 +13,7 @@ importlib-metadata>=6.8.0
 zipp>=3.17.0
 moviepy>=1.0.3
 imageio-ffmpeg>=0.4.10
+pytest>=7.4.0
 
 # Multi-Agent System Dependencies
 pydantic>=2.5.0

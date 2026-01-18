@@ -43,6 +43,8 @@ class VNGameRuntime:
         self.text_margin = 24
         self.text_area = None
         self.name_area = None
+        self.portrait_pos = None
+        self.portrait_size = None
         self._portrait_cache = {}
         self._portrait_scaled_cache = {}
         self._bg_cache = {}
@@ -309,10 +311,8 @@ class VNGameRuntime:
         if abs_path in self._portrait_cache:
             return
         try:
+            # Cache raw portrait to avoid quality loss from double-scaling.
             img = pygame.image.load(str(abs_path)).convert_alpha()
-            max_w = int(self.render_size[0] * 0.35)
-            max_h = int(self.render_size[1] * 0.7)
-            img = self._scale_to_fit(img, max_w, max_h)
             self._portrait_cache[abs_path] = img
         except Exception:
             return
@@ -1343,27 +1343,44 @@ class VNGameRuntime:
         if abs_path not in self._portrait_cache:
             try:
                 img = pygame.image.load(str(abs_path)).convert_alpha()
-                max_w = int(self.render_size[0] * 0.35)
-                max_h = int(self.render_size[1] * 0.7)
-                img = self._scale_to_fit(img, max_w, max_h)
                 self._portrait_cache[abs_path] = img
-                self._portrait_scaled_cache.pop(abs_path, None)
             except Exception:
                 return
 
-        base_img = self._portrait_cache[abs_path]
+        raw_img = self._portrait_cache[abs_path]
+
+        # Determine base size (independent from portrait_scale).
+        base_w = None
+        base_h = None
+        psz = getattr(self, "portrait_size", None)
+        if isinstance(psz, (list, tuple)) and len(psz) == 2:
+            try:
+                w0 = int(psz[0])
+                h0 = int(psz[1])
+                if w0 > 0 and h0 > 0:
+                    base_w, base_h = w0, h0
+            except Exception:
+                base_w, base_h = None, None
+
+        if base_w is None or base_h is None:
+            max_w = int(self.render_size[0] * 0.35)
+            max_h = int(self.render_size[1] * 0.7)
+            rw, rh = raw_img.get_size()
+            fit_scale = min(max_w / max(1, rw), max_h / max(1, rh), 1.0)
+            base_w = max(1, int(rw * fit_scale))
+            base_h = max(1, int(rh * fit_scale))
+
         scale = getattr(self, "portrait_scale", 1.0) or 1.0
         scale = max(0.1, min(5.0, float(scale)))
-        if scale != 1.0:
-            key = (abs_path, scale)
-            target_img = self._portrait_scaled_cache.get(key)
-            if target_img is None:
-                w = max(1, int(base_img.get_width() * scale))
-                h = max(1, int(base_img.get_height() * scale))
-                target_img = pygame.transform.smoothscale(base_img, (w, h))
-                self._portrait_scaled_cache[key] = target_img
-        else:
-            target_img = base_img
+        final_w = max(1, int(base_w * scale))
+        final_h = max(1, int(base_h * scale))
+
+        # Always scale from the original to avoid quality loss from double-scaling.
+        key = (abs_path, final_w, final_h)
+        target_img = self._portrait_scaled_cache.get(key)
+        if target_img is None:
+            target_img = pygame.transform.smoothscale(raw_img, (final_w, final_h))
+            self._portrait_scaled_cache[key] = target_img
 
         # manage fade state
         if self._portrait_current_path != abs_path:
@@ -1801,6 +1818,18 @@ class VNGameRuntime:
             except Exception:
                 ps = 1.0
         self.portrait_scale = max(0.1, min(5.0, ps))
+
+        self.portrait_size = None
+        if isinstance(layout, dict):
+            psz = layout.get("portrait_size")
+            if isinstance(psz, (list, tuple)) and len(psz) == 2:
+                try:
+                    pw = int(psz[0])
+                    ph = int(psz[1])
+                    if pw > 0 and ph > 0:
+                        self.portrait_size = (pw, ph)
+                except Exception:
+                    self.portrait_size = None
         self._bg_cache.clear()
         self._portrait_scaled_cache.clear()
 

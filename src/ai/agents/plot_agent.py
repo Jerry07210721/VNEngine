@@ -518,8 +518,8 @@ class PlotAgent:
             for scene_idx, scene in enumerate(scenes, start=1):
                 location = scene.get("location", f"scene_{chapter_idx}_{scene_idx}")
                 bg_slug = image_utils.slugify_name(str(location) or f"scene_{scene_idx}")
-                background_path = f"resources/backgrounds/bg_{bg_slug}.png"
-                bgm_path = f"resources/bgm/main_theme.mp3"
+                background_path = f"resources/images/bg_{bg_slug}.png"
+                bgm_path = f"resources/audios/main_theme.mp3"
 
                 dialogues = scene.get("dialogues", []) or []
                 for dlg_idx, dialogue in enumerate(dialogues, start=1):
@@ -657,9 +657,9 @@ class PlotAgent:
         material_reqs: List[MaterialRequirement],
         project_root: Path,
     ) -> List[str]:
-        """保存剧情与节点数据到工程内 resources/plot"""
+        """保存剧情与节点数据到工程输出目录（避免污染 resources 素材目录）"""
 
-        output_dir = project_root / "resources" / "plot"
+        output_dir = project_root / "output" / "plot"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

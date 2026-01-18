@@ -29,17 +29,21 @@ class LayoutPreview(QWidget):
         self._text_rect = [40, 380, 720, 160]
         self._name_rect = [40, 340, 200, 32]
         self._portrait = [0, 0]
+        self._portrait_size = [0, 0]
         self._portrait_scale = 1.0
 
     def update_layout(self, data: dict):
         ta = data.get("text_area") or self._text_rect
         na = data.get("name_area") or self._name_rect
         pp = data.get("portrait_pos") or self._portrait
+        psz = data.get("portrait_size") or self._portrait_size
         ps = data.get("portrait_scale", 1.0)
         try:
             self._text_rect = [int(ta[0]), int(ta[1]), int(ta[2]), int(ta[3])]
             self._name_rect = [int(na[0]), int(na[1]), int(na[2]), int(na[3])]
             self._portrait = [int(pp[0]), int(pp[1])]
+            if isinstance(psz, (list, tuple)) and len(psz) == 2:
+                self._portrait_size = [max(0, int(psz[0])), max(0, int(psz[1]))]
             self._portrait_scale = float(ps)
         except Exception:
             pass
@@ -75,7 +79,9 @@ class LayoutPreview(QWidget):
         painter.setBrush(QBrush(QColor(120, 200, 255, 50)))
         px, py = self._portrait
         scale = max(0.2, min(3.0, self._portrait_scale))
-        base_w, base_h = 120, 200
+        base_w, base_h = self._portrait_size
+        if base_w <= 0 or base_h <= 0:
+            base_w, base_h = 120, 200
         pw = int(base_w * scale * sx)
         ph = int(base_h * scale * sy)
         cx = int(px * sx)
@@ -121,9 +127,13 @@ class UILayoutDesigner(QDialog):
         # portrait position
         self.portrait_x = self._spin(-2000, 4000, 0)
         self.portrait_y = self._spin(-2000, 4000, 0)
+        self.portrait_w = self._spin(0, 8000, 0)
+        self.portrait_h = self._spin(0, 8000, 0)
         self.portrait_scale = self._dspin(0.1, 5.0, 1.0, 0.1)
         form.addRow("立绘位置 x", self.portrait_x)
         form.addRow("立绘位置 y", self.portrait_y)
+        form.addRow("立绘宽（0=自动）", self.portrait_w)
+        form.addRow("立绘高（0=自动）", self.portrait_h)
         form.addRow("立绘缩放", self.portrait_scale)
 
         preview_wrap = QVBoxLayout()
@@ -159,6 +169,8 @@ class UILayoutDesigner(QDialog):
             self.name_h,
             self.portrait_x,
             self.portrait_y,
+            self.portrait_w,
+            self.portrait_h,
             self.portrait_scale,
         ]:
             sp.valueChanged.connect(self._update_preview)
@@ -218,6 +230,7 @@ class UILayoutDesigner(QDialog):
             "text_area": [self.text_x.value(), self.text_y.value(), self.text_w.value(), self.text_h.value()],
             "name_area": [self.name_x.value(), self.name_y.value(), self.name_w.value(), self.name_h.value()],
             "portrait_pos": [self.portrait_x.value(), self.portrait_y.value()],
+            "portrait_size": [self.portrait_w.value(), self.portrait_h.value()],
             "portrait_scale": float(self.portrait_scale.value()),
         }
 
@@ -225,6 +238,7 @@ class UILayoutDesigner(QDialog):
         ta = data.get("text_area") or [40, 400, 720, 180]
         na = data.get("name_area") or [40, 360, 200, 32]
         pp = data.get("portrait_pos") or [0, 0]
+        psz = data.get("portrait_size") or [0, 0]
         ps = data.get("portrait_scale", 1.0)
         try:
             self.text_x.setValue(int(ta[0]))
@@ -237,6 +251,9 @@ class UILayoutDesigner(QDialog):
             self.name_h.setValue(int(na[3]))
             self.portrait_x.setValue(int(pp[0]))
             self.portrait_y.setValue(int(pp[1]))
+            if isinstance(psz, (list, tuple)) and len(psz) == 2:
+                self.portrait_w.setValue(max(0, int(psz[0])))
+                self.portrait_h.setValue(max(0, int(psz[1])))
             self.portrait_scale.setValue(float(ps))
         except Exception:
             pass
