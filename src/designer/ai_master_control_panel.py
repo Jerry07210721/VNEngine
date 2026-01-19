@@ -586,15 +586,47 @@ class AIMasterControlPanel(QWidget):
     def _try_parse_json_block(self, text: str):
         if not text:
             return None
+
         candidate = text.strip()
+
+        def _strip_fence_payload(payload: str) -> str:
+            payload = (payload or "").strip("\n\r \t")
+            # 兼容 ```JSON / ```Json / ```json5 等：若第一行像语言标识，则去掉
+            first_line, _, rest = payload.partition("\n")
+            lang = first_line.strip().lower()
+            if lang in {"json", "json5", "javascript", "js"}:
+                return rest.strip("\n\r \t")
+            return payload
+
+        def _try_span(open_ch: str, close_ch: str):
+            if open_ch not in candidate or close_ch not in candidate:
+                return None
+            start = candidate.find(open_ch)
+            end = candidate.rfind(close_ch)
+            if start < 0 or end <= start:
+                return None
+            snippet = candidate[start : end + 1].strip()
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
+
         try:
-            if "```json" in candidate:
-                candidate = candidate.split("```json", 1)[1].split("```", 1)[0].strip()
-            elif candidate.startswith("```"):
-                candidate = candidate.split("```", 1)[1].split("```", 1)[0].strip()
+            if "```json" in candidate.lower():
+                # 使用 lower() 探测，但保持原文本切片：找到第一个 ```json（大小写不敏感）
+                lower = candidate.lower()
+                pos = lower.find("```json")
+                payload = candidate[pos + len("```json") :]
+                payload = payload.split("```", 1)[0]
+                payload = _strip_fence_payload(payload)
+                return json.loads(payload)
+            if candidate.startswith("```"):
+                payload = candidate.split("```", 1)[1].split("```", 1)[0]
+                payload = _strip_fence_payload(payload)
+                return json.loads(payload)
             return json.loads(candidate)
         except Exception:
-            return None
+            return _try_span("{", "}") or _try_span("[", "]")
 
     def _load_chapter_detail(self, idx: int):
         if idx < 0:
