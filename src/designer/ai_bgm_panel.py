@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QFileDialog,
     QCheckBox,
+    QScrollArea,
+    QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -61,12 +63,15 @@ class AIBGMPanel(QWidget):
         header.addStretch(1)
         layout.addLayout(header)
 
-        main = QHBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
         self.list_widget = QListWidget()
         self.list_widget.itemSelectionChanged.connect(self.on_item_selected)
-        main.addWidget(self.list_widget, 2)
+        splitter.addWidget(self.list_widget)
 
-        right = QVBoxLayout()
+        right_container = QWidget()
+        right = QVBoxLayout(right_container)
 
         info_group = QGroupBox("BGM详情")
         form = QFormLayout()
@@ -161,8 +166,16 @@ class AIBGMPanel(QWidget):
         right.addWidget(self.progress_label)
         right.addStretch(1)
 
-        main.addLayout(right, 3)
-        layout.addLayout(main)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setWidget(right_container)
+        splitter.addWidget(right_scroll)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
 
     # ==================== 列表刷新 ====================
     def refresh(self):

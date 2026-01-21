@@ -89,7 +89,7 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         scale_layout = QFormLayout()
         
         self.text_volume_spin = QSpinBox()
-        self.text_volume_spin.setRange(1000, 100000)
+        self.text_volume_spin.setRange(1000, 500000)
         self.text_volume_spin.setValue(5000)
         self.text_volume_spin.setSingleStep(1000)
         self.text_volume_spin.setSuffix(" 字")
@@ -155,15 +155,29 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         node_layout = QVBoxLayout()
         
         self.enable_choice_check = QCheckBox("启用选择节点（玩家可以做出选择）")
-        self.enable_choice_check.setChecked(True)
+        # 仅在开启多分支时可用；默认关闭
+        self.enable_choice_check.setChecked(False)
         self.enable_choice_check.stateChanged.connect(self.mark_modified)
         node_layout.addWidget(self.enable_choice_check)
         
         self.enable_condition_check = QCheckBox("启用条件节点（基于变量判断分支）")
-        self.enable_condition_check.setChecked(True)
+        # 仅在开启多分支时可用；默认关闭
+        self.enable_condition_check.setChecked(False)
         self.enable_condition_check.stateChanged.connect(self.mark_modified)
         self.enable_condition_check.stateChanged.connect(self.on_condition_check_changed)
         node_layout.addWidget(self.enable_condition_check)
+
+        self.enable_single_route_check = QCheckBox("启用单线叙事（强制章节线性推进；不生成章节级分支）")
+        self.enable_single_route_check.setChecked(False)
+        self.enable_single_route_check.stateChanged.connect(self._on_single_route_changed)
+        self.enable_single_route_check.stateChanged.connect(self.mark_modified)
+        node_layout.addWidget(self.enable_single_route_check)
+
+        self.enable_multi_branch_check = QCheckBox("开启多分支（允许并行路线/多结局；章节数按主线计）")
+        self.enable_multi_branch_check.setChecked(False)
+        self.enable_multi_branch_check.stateChanged.connect(self._on_multi_branch_changed)
+        self.enable_multi_branch_check.stateChanged.connect(self.mark_modified)
+        node_layout.addWidget(self.enable_multi_branch_check)
         
         # 条件类型子选项
         condition_type_layout = QHBoxLayout()
@@ -241,6 +255,9 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         # 初始化POV可用性
         self._on_pov_changed()
 
+        # 初始化“单线/多分支/节点开关”约束
+        self._apply_story_mode_constraints()
+
     def _set_form_signals_blocked(self, blocked: bool):
         widgets = [
             self.title_edit,
@@ -251,6 +268,8 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             self.cg_count_spin,
             self.enable_choice_check,
             self.enable_condition_check,
+            self.enable_single_route_check,
+            self.enable_multi_branch_check,
             self.condition_type_edit,
             self.char_hint_weight_spin,
             self.pov_combo,
@@ -302,6 +321,8 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             
             self.enable_choice_check.setChecked(story_config.enable_choice_node)
             self.enable_condition_check.setChecked(story_config.enable_condition_node)
+            self.enable_single_route_check.setChecked(bool(getattr(story_config, 'enable_single_route', False)))
+            self.enable_multi_branch_check.setChecked(bool(getattr(story_config, 'enable_multi_branch', False)))
             self.condition_type_edit.setText(story_config.condition_type)
             self.char_hint_weight_spin.setValue(story_config.character_hint_weight)
 
@@ -316,6 +337,9 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             self.fp_cg_notes_edit.setText(getattr(story_config, 'first_person_cg_notes', '') or '')
 
             self._on_pov_changed()
+
+            # 刷新后同步“单线/多分支/节点开关”约束
+            self._apply_story_mode_constraints()
             
             self._set_form_signals_blocked(False)
     
@@ -340,6 +364,8 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             cg_count=self.cg_count_spin.value(),
             enable_choice_node=self.enable_choice_check.isChecked(),
             enable_condition_node=self.enable_condition_check.isChecked(),
+            enable_multi_branch=self.enable_multi_branch_check.isChecked(),
+            enable_single_route=self.enable_single_route_check.isChecked(),
             condition_type=self.condition_type_edit.text().strip(),
             character_hint_weight=self.char_hint_weight_spin.value(),
             narrative_pov=self.pov_combo.currentData() or getattr(current, 'narrative_pov', 'third'),
@@ -360,3 +386,74 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         
         # 触发修改信号（通知主窗口）
         self.mark_modified()
+
+    def _on_single_route_changed(self, *_):
+        enabled = bool(self.enable_single_route_check.isChecked())
+        # 单线叙事与多分支互斥：启用时关闭并禁用多分支
+        if enabled:
+            try:
+                self.enable_multi_branch_check.blockSignals(True)
+                self.enable_multi_branch_check.setChecked(False)
+            finally:
+                self.enable_multi_branch_check.blockSignals(False)
+        self.enable_multi_branch_check.setEnabled(not enabled)
+
+        # 单线叙事开启时，多分支为 False => 选择/条件节点必须不可用
+        self._apply_story_mode_constraints()
+
+    def _on_multi_branch_changed(self, *_):
+        enabled = bool(self.enable_multi_branch_check.isChecked())
+        # 多分支与单线叙事互斥：启用多分支时关闭并禁用单线叙事
+        if enabled:
+            try:
+                self.enable_single_route_check.blockSignals(True)
+                self.enable_single_route_check.setChecked(False)
+            finally:
+                self.enable_single_route_check.blockSignals(False)
+        self.enable_single_route_check.setEnabled(not enabled)
+
+        # 多分支开启/关闭会影响选择/条件节点开关
+        self._apply_story_mode_constraints()
+
+    def _apply_story_mode_constraints(self):
+        """根据当前勾选状态，强制互斥/依赖规则，并同步控件可用性。"""
+        multi = bool(self.enable_multi_branch_check.isChecked())
+        single = bool(self.enable_single_route_check.isChecked())
+
+        # 互斥纠偏（尽量保持“用户刚勾选的”为真）：
+        # - 如果单线为 True，则强制关闭多分支
+        # - 如果多分支为 True，则强制关闭单线
+        if single and multi:
+            try:
+                self.enable_multi_branch_check.blockSignals(True)
+                self.enable_multi_branch_check.setChecked(False)
+            finally:
+                self.enable_multi_branch_check.blockSignals(False)
+            multi = False
+
+        # 只有多分支允许选择/条件节点
+        self.enable_choice_check.setEnabled(multi)
+        self.enable_condition_check.setEnabled(multi)
+        if not multi:
+            try:
+                self.enable_choice_check.blockSignals(True)
+                self.enable_condition_check.blockSignals(True)
+                self.enable_choice_check.setChecked(False)
+                self.enable_condition_check.setChecked(False)
+            finally:
+                self.enable_choice_check.blockSignals(False)
+                self.enable_condition_check.blockSignals(False)
+        else:
+            # 开启多分支时，默认勾选两类节点（用户可再手动取消）
+            if not self.enable_choice_check.isChecked() and not self.enable_condition_check.isChecked():
+                try:
+                    self.enable_choice_check.blockSignals(True)
+                    self.enable_condition_check.blockSignals(True)
+                    self.enable_choice_check.setChecked(True)
+                    self.enable_condition_check.setChecked(True)
+                finally:
+                    self.enable_choice_check.blockSignals(False)
+                    self.enable_condition_check.blockSignals(False)
+
+        # 条件类型输入框仅在“条件节点启用”时可编辑
+        self.condition_type_edit.setEnabled(multi and bool(self.enable_condition_check.isChecked()))

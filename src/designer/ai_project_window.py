@@ -5,6 +5,7 @@ AI辅助工程主窗口
 """
 
 import sys
+import os
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QScrollArea,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
@@ -40,6 +42,7 @@ from src.designer.ai_background_panel import AIBackgroundPanel
 from src.designer.ai_voice_panel import AIVoicePanel
 from src.designer.ai_bgm_panel import AIBGMPanel
 from src.designer.voice_model_dialog import VoiceModelPickerDialog, get_gptsovits_client
+from src.designer.floating_llm_chat import FloatingBall, FloatingChatWidget
 
 
 class AIProjectWindow(QMainWindow):
@@ -56,6 +59,10 @@ class AIProjectWindow(QMainWindow):
         
         # 当前工程状态
         self.is_modified = False
+
+        # 悬浮球/悬浮窗（在 init_central_widget 中创建）
+        self._floating_ball: FloatingBall | None = None
+        self._floating_chat: FloatingChatWidget | None = None
         
         self.init_ui()
         self.update_window_title()
@@ -63,13 +70,31 @@ class AIProjectWindow(QMainWindow):
     def init_ui(self):
         """初始化UI"""
         self.setWindowTitle("VNEngine - AI辅助工程")
-        self.resize(1400, 900)
+        # AI辅助界面默认窗口大小：1280x720
+        self.resize(1280, 720)
         
         # 初始化各部分
         self.init_menu_bar()
         self.init_tool_bar()
         self.init_central_widget()
         self.init_status_bar()
+
+        # debug: floating widgets
+        self._floating_debug = os.getenv("VNENGINE_FLOATING_DEBUG", "0").strip() in {"1", "true", "True", "YES", "yes"}
+
+    def _fdebug(self, msg: str):
+        if not getattr(self, "_floating_debug", False):
+            return
+        try:
+            print(f"[FLOATING] {msg}")
+        except Exception:
+            pass
+        try:
+            sb = self.statusBar()
+            if sb:
+                sb.showMessage(msg, 5000)
+        except Exception:
+            pass
         
     def init_menu_bar(self):
         """初始化菜单栏"""
@@ -212,24 +237,124 @@ class AIProjectWindow(QMainWindow):
         self.tab_widget.addTab(wrap_with_scroll(self.story_panel), "剧情配置")
         self.tab_widget.addTab(wrap_with_scroll(self.character_panel), "角色配置")
         self.tab_widget.addTab(wrap_with_scroll(self.master_panel), "主控Agent")
-        self.tab_widget.addTab(wrap_with_scroll(self.portrait_panel), "立绘生成")
-        self.tab_widget.addTab(wrap_with_scroll(self.cg_panel), "CG生成")
-        self.tab_widget.addTab(wrap_with_scroll(self.background_panel), "背景生成")
-        self.tab_widget.addTab(wrap_with_scroll(self.voice_panel), "语音生成")
-        self.tab_widget.addTab(wrap_with_scroll(self.bgm_panel), "BGM生成")
+        # 专项Agent页签：左右区域各自滚动（面板内部已使用 QSplitter + QScrollArea），避免外层滚动条干扰
+        self.tab_widget.addTab(self.portrait_panel, "立绘生成")
+        self.tab_widget.addTab(self.cg_panel, "CG生成")
+        self.tab_widget.addTab(self.background_panel, "背景生成")
+        self.tab_widget.addTab(self.voice_panel, "语音生成")
+        self.tab_widget.addTab(self.bgm_panel, "BGM生成")
         
         layout.addWidget(self.tab_widget)
+
+        # 悬浮球：始终处于最上层（不进入 layout）
+        self._floating_ball = FloatingBall(central_widget)
+        # clicked 信号带 bool 参数，使用 lambda 丢弃，避免槽函数签名不匹配导致无响应
+        self._floating_ball.clicked.connect(lambda _checked=False: self._open_floating_chat())
+        self._floating_ball.show()
+        # 默认右下角
+        self._floating_ball.move(max(6, central_widget.width() - self._floating_ball.width() - 12), max(6, central_widget.height() - self._floating_ball.height() - 12))
+        self._floating_ball.raise_()
+
+        # 悬浮聊天窗
+        self._floating_chat = FloatingChatWidget(central_widget, config_manager=self.config_manager)
+        self._floating_chat.minimized.connect(self._restore_floating_ball)
+        self._floating_chat.hide()
+
+        # tab切换时确保悬浮控件仍在顶层
+        self.tab_widget.currentChanged.connect(lambda _i: self._raise_floating_overlays())
         
         # 监听子界面的修改信号（后续实现）
         self.story_panel.modified.connect(self.on_content_modified)
         self.character_panel.modified.connect(self.on_content_modified)
         self.master_panel.modified.connect(self.on_content_modified)
+
+    def _raise_floating_overlays(self):
+        if self._floating_chat and self._floating_chat.isVisible():
+            self._floating_chat.raise_()
+        if self._floating_ball and self._floating_ball.isVisible():
+            self._floating_ball.raise_()
+
+    def _open_floating_chat(self):
+        self._fdebug("open floating chat requested")
+        if not self._floating_chat or not self._floating_ball:
+            self._fdebug(f"floating widgets not ready: chat={bool(self._floating_chat)} ball={bool(self._floating_ball)}")
+            return
+        self._floating_ball.hide()
+        self._floating_chat.show_default()
+        self._raise_floating_overlays()
+        try:
+            self._fdebug(
+                f"chat shown={self._floating_chat.isVisible()} pos={self._floating_chat.pos().x()},{self._floating_chat.pos().y()} size={self._floating_chat.width()}x{self._floating_chat.height()}"
+            )
+        except Exception:
+            pass
+
+    def _restore_floating_ball(self):
+        self._fdebug("restore floating ball")
+        if not self._floating_ball:
+            return
+        self._floating_ball.show()
+        self._floating_ball.raise_()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        # 约束悬浮控件始终留在界面内
+        cw = self.centralWidget()
+        if not cw:
+            return
+        if self._floating_ball and self._floating_ball.isVisible():
+            # clamp by re-moving to current pos
+            self._floating_ball._move_clamped(self._floating_ball.pos())
+            self._floating_ball.raise_()
+        if self._floating_chat and self._floating_chat.isVisible():
+            self._floating_chat._move_clamped(self._floating_chat.pos())
+            self._floating_chat.raise_()
+        self._raise_floating_overlays()
         
     def init_status_bar(self):
         """初始化状态栏"""
         status_bar = QStatusBar()
         status_bar.showMessage("就绪")
         self.setStatusBar(status_bar)
+
+    def _show_busy_dialog(self, text: str) -> QProgressDialog:
+        """显示不可取消的忙碌提示，用于大文件打开/保存时避免“卡死”错觉。"""
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle("请稍候")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setValue(0)
+        dlg.show()
+        QApplication.processEvents()
+        return dlg
+
+    def load_project_file(self, file_path: str) -> bool:
+        """从指定路径加载 AI 工程文件（用于被设计模式调用自动加载）。"""
+        if not file_path:
+            return False
+        if not self.check_save_current():
+            return False
+
+        busy = None
+        try:
+            busy = self._show_busy_dialog("正在打开AI工程文件，请稍候...")
+            project = self.project_manager.load_project(file_path)
+            if project:
+                self.is_modified = False
+                self.update_window_title()
+                self.refresh_all_panels()
+                self.statusBar().showMessage(f"已加载工程: {project.ai_project_info.name}")
+                return True
+            QMessageBox.critical(self, "错误", "加载工程失败，请检查文件格式")
+            return False
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
         
     # ==================== 工程操作 ====================
     
@@ -252,12 +377,22 @@ class AIProjectWindow(QMainWindow):
         # 获取工程名称
         project_name = Path(file_path).stem
         
-        # 创建工程
-        project = self.project_manager.create_new_project(
-            project_name=project_name,
-            save_path=file_path,
-            story_title=project_name
-        )
+        busy = None
+        try:
+            busy = self._show_busy_dialog("正在创建/保存AI工程文件，请稍候...")
+            # 创建工程
+            project = self.project_manager.create_new_project(
+                project_name=project_name,
+                save_path=file_path,
+                story_title=project_name
+            )
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
         
         if project:
             self.is_modified = False
@@ -283,29 +418,31 @@ class AIProjectWindow(QMainWindow):
         if not file_path:
             return
         
-        project = self.project_manager.load_project(file_path)
-        
-        if project:
-            self.is_modified = False
-            self.update_window_title()
-            self.refresh_all_panels()
-            self.statusBar().showMessage(f"已加载工程: {project.ai_project_info.name}")
-        else:
-            QMessageBox.critical(self, "错误", "加载工程失败，请检查文件格式")
+        self.load_project_file(file_path)
     
     def save_project(self):
         """保存工程"""
         if self.project_manager.current_project is None:
             QMessageBox.warning(self, "提示", "没有打开的工程")
             return
-        
-        if self.project_manager.save_project():
-            self.is_modified = False
-            self.update_window_title()
-            self.statusBar().showMessage("工程已保存")
-            self.project_saved.emit(self.project_manager.current_file_path)
-        else:
-            QMessageBox.critical(self, "错误", "保存失败")
+
+        busy = None
+        try:
+            busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
+            if self.project_manager.save_project():
+                self.is_modified = False
+                self.update_window_title()
+                self.statusBar().showMessage("工程已保存")
+                self.project_saved.emit(self.project_manager.current_file_path)
+            else:
+                QMessageBox.critical(self, "错误", "保存失败")
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
     
     def save_project_as(self):
         """另存为"""
@@ -323,12 +460,22 @@ class AIProjectWindow(QMainWindow):
         if not file_path:
             return
         
-        if self.project_manager.save_project(file_path):
-            self.is_modified = False
-            self.update_window_title()
-            self.statusBar().showMessage(f"工程已另存为: {file_path}")
-        else:
-            QMessageBox.critical(self, "错误", "保存失败")
+        busy = None
+        try:
+            busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
+            if self.project_manager.save_project(file_path):
+                self.is_modified = False
+                self.update_window_title()
+                self.statusBar().showMessage(f"工程已另存为: {file_path}")
+            else:
+                QMessageBox.critical(self, "错误", "保存失败")
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
     
     def close_project(self):
         """关闭当前工程"""
@@ -444,7 +591,7 @@ class AIProjectWindow(QMainWindow):
             self,
             "关于",
             "VNEngine AI辅助工程\n\n"
-            "版本: V2.1\n"
+            "版本: V2.3\n"
             "多智能体协作GalGame制作引擎\n\n"
             "© 2026 VNEngine Team"
         )

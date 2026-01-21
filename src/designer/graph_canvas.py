@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 from PyQt6.QtGui import QColor, QPen, QPainter, QAction, QPainterPath
-from PyQt6.QtCore import Qt, QPointF, QRectF
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 
 
 class GraphScene(QGraphicsScene):
@@ -63,6 +63,7 @@ class FlowTextNode(QGraphicsRectItem):
         self.stop_bgm = stop_bgm
         self.bgm_loop = bgm_loop
         self.bg_fade_in = bg_fade_in
+        self.bg_fade_duration = 0.45
         self.node_type = node_type or "text"
         self.options = options or []
         self.condition_var = condition_var or ""
@@ -131,6 +132,14 @@ class FlowTextNode(QGraphicsRectItem):
     def set_bg_fade_in(self, fade: bool):
         self.bg_fade_in = fade
 
+    def set_bg_fade_duration(self, duration: float):
+        try:
+            d = float(duration)
+        except Exception:
+            d = 0.45
+        # clamp to a sensible range
+        self.bg_fade_duration = max(0.0, min(10.0, d))
+
     def set_node_type(self, node_type: str):
         self.node_type = node_type or "text"
 
@@ -171,15 +180,31 @@ class FlowTextNode(QGraphicsRectItem):
         for item in (items or [])[:50]:
             if not isinstance(item, dict):
                 continue
+            try:
+                fade_in_d = float(item.get("portrait_fade_duration", 0.4))
+            except Exception:
+                fade_in_d = 0.4
+            try:
+                fade_out_d = float(item.get("portrait_fade_out_duration", 0.4))
+            except Exception:
+                fade_out_d = 0.4
+            try:
+                auto_next = float(item.get("auto_next_seconds", 0.0))
+            except Exception:
+                auto_next = 0.0
             normalized.append(
                 {
                     "speaker": item.get("speaker", ""),
                     "text": item.get("text", ""),
                     "voice": item.get("voice", ""),
                     "portrait": item.get("portrait", ""),
+                    "ui_file": item.get("ui_file", ""),
                     "hide_textbox": bool(item.get("hide_textbox", False)),
                     "portrait_fade": bool(item.get("portrait_fade", False)),
                     "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                    "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
+                    "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                    "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                 }
             )
         self.sub_dialogues = normalized
@@ -190,15 +215,31 @@ class FlowTextNode(QGraphicsRectItem):
             for item in items[:50]:
                 if not isinstance(item, dict):
                     continue
+                try:
+                    fade_in_d = float(item.get("portrait_fade_duration", 0.4))
+                except Exception:
+                    fade_in_d = 0.4
+                try:
+                    fade_out_d = float(item.get("portrait_fade_out_duration", 0.4))
+                except Exception:
+                    fade_out_d = 0.4
+                try:
+                    auto_next = float(item.get("auto_next_seconds", 0.0))
+                except Exception:
+                    auto_next = 0.0
                 normalized.append(
                     {
                         "speaker": item.get("speaker", ""),
                         "text": item.get("text", ""),
                         "voice": item.get("voice", ""),
                         "portrait": item.get("portrait", ""),
+                        "ui_file": item.get("ui_file", ""),
                         "hide_textbox": bool(item.get("hide_textbox", False)),
                         "portrait_fade": bool(item.get("portrait_fade", False)),
                         "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                        "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
+                        "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                        "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                     }
                 )
         return normalized
@@ -305,6 +346,8 @@ class ConnectionPath(QGraphicsPathItem):
 
 class GraphView(QGraphicsView):
     """Graphics view with zoom, pan, and context menu."""
+
+    previewFromNodeRequested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -434,6 +477,16 @@ class GraphView(QGraphicsView):
         add_text_action.triggered.connect(lambda: self.add_text_node(scene_pos))
         menu.addAction(add_text_action)
 
+        # 节点级右键菜单：从该节点开始预览
+        clicked = self.scene.itemAt(scene_pos, self.transform())
+        while clicked is not None and not isinstance(clicked, FlowTextNode):
+            clicked = clicked.parentItem()
+        if isinstance(clicked, FlowTextNode) and getattr(clicked, "node_id", None) is not None:
+            menu.addSeparator()
+            preview_from_here = QAction("从该节点开始预览", self)
+            preview_from_here.triggered.connect(lambda _=False, nid=int(clicked.node_id): self.previewFromNodeRequested.emit(nid))
+            menu.addAction(preview_from_here)
+
         if self.scene.selectedItems():
             delete_action = QAction("删除选中节点", self)
             delete_action.triggered.connect(self.delete_selected_nodes)
@@ -553,6 +606,7 @@ class GraphView(QGraphicsView):
                     "stop_bgm": getattr(item, "stop_bgm", False),
                     "bgm_loop": getattr(item, "bgm_loop", True),
                     "bg_fade_in": getattr(item, "bg_fade_in", False),
+                    "bg_fade_duration": getattr(item, "bg_fade_duration", 0.45),
                     "hide_textbox": getattr(item, "hide_textbox", False),
                     "portrait_fade": getattr(item, "portrait_fade", False),
                     "portrait_fade_out": getattr(item, "portrait_fade_out", False),
@@ -612,6 +666,10 @@ class GraphView(QGraphicsView):
             node.hide_textbox = bool(node_data.get("hide_textbox", False))
             node.portrait_fade = bool(node_data.get("portrait_fade", False))
             node.portrait_fade_out = bool(node_data.get("portrait_fade_out", False))
+            try:
+                node.set_bg_fade_duration(float(node_data.get("bg_fade_duration", getattr(node, "bg_fade_duration", 0.45))))
+            except Exception:
+                pass
             node.setPos(QPointF(node_data.get("x", 0), node_data.get("y", 0)))
             self.scene.addItem(node)
             id_to_node[node.node_id] = node
@@ -648,6 +706,7 @@ class GraphView(QGraphicsView):
                 "stop_bgm": getattr(n, "stop_bgm", False),
                 "bgm_loop": getattr(n, "bgm_loop", True),
                 "bg_fade_in": getattr(n, "bg_fade_in", False),
+                "bg_fade_duration": getattr(n, "bg_fade_duration", 0.45),
                 "hide_textbox": getattr(n, "hide_textbox", False),
                 "portrait_fade": getattr(n, "portrait_fade", False),
                 "portrait_fade_out": getattr(n, "portrait_fade_out", False),
@@ -700,6 +759,10 @@ class GraphView(QGraphicsView):
             node.hide_textbox = bool(item.get("hide_textbox", False))
             node.portrait_fade = bool(item.get("portrait_fade", False))
             node.portrait_fade_out = bool(item.get("portrait_fade_out", False))
+            try:
+                node.set_bg_fade_duration(float(item.get("bg_fade_duration", getattr(node, "bg_fade_duration", 0.45))))
+            except Exception:
+                pass
             node.setPos(QPointF(item.get("x", 0), item.get("y", 0)) + offset)
             self.scene.addItem(node)
             new_nodes.append(node)

@@ -12,6 +12,8 @@ from .base_client import BaseAPIClient, APIError
 
 class FluxClient(BaseAPIClient):
     """FLUX API客户端"""
+
+    _ALLOWED_SIZES = {"1MP", "2MP", "4MP"}
     
     def __init__(
         self,
@@ -72,12 +74,24 @@ class FluxClient(BaseAPIClient):
             "model": model or self.model
         }
 
-        # 确保 params 至少包含 mode，避免后端 null 报错
+        # 确保 params 至少包含必要字段，避免后端 null/缺省报错
         params = params or {}
         if "mode" not in params or not params.get("mode"):
             params["mode"] = "pro"
         if "aspect" not in params:
             params["aspect"] = "1:1"
+
+        # 新增：size（默认 1MP，可选 2MP/4MP）
+        size = params.get("size")
+        if size is None or str(size).strip() == "":
+            params["size"] = "1MP"
+        else:
+            size_str = str(size).strip().upper()
+            if size_str not in self._ALLOWED_SIZES:
+                params["size"] = "1MP"
+            else:
+                params["size"] = size_str
+
         payload["params"] = params
         
         if images:

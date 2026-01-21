@@ -251,6 +251,24 @@ class MainMenuDesigner(QDialog):
         self.overlay_alpha.setValue(int(data.get("menu_overlay_alpha", 0)))
         form.addRow("遮罩透明度 (0-255)", self.overlay_alpha)
 
+        self.save_slots_spin = QSpinBox()
+        self.save_slots_spin.setRange(1, 200)
+        self.save_slots_spin.setValue(int(data.get("save_slots", 5) or 5))
+        self.save_slots_spin.setToolTip("游戏存档栏数量；超过10个时将按10个/页分页，数字键0-9选择")
+        form.addRow("存档栏数量", self.save_slots_spin)
+
+        self.enable_autosave_chk = QCheckBox("ESC 返回主菜单时自动存档到【自动存档】")
+        self.enable_autosave_chk.setChecked(bool(data.get("enable_autosave_on_menu", True)))
+        form.addRow("", self.enable_autosave_chk)
+
+        self.help_hotkey_edit = QLineEdit(str(data.get("help_hotkey", "F1") or "F1"))
+        self.help_hotkey_edit.setToolTip("帮助菜单快捷键，如：F1 / F2 / H 等")
+        form.addRow("帮助菜单快捷键", self.help_hotkey_edit)
+
+        self.help_right_click_chk = QCheckBox("右键调出帮助菜单")
+        self.help_right_click_chk.setChecked(bool(data.get("help_right_click", True)))
+        form.addRow("", self.help_right_click_chk)
+
         # 预览
         self.preview = MenuPreview(self.project_dir, self.base_resolution, self)
         preview_wrap = QVBoxLayout()
@@ -396,6 +414,10 @@ class MainMenuDesigner(QDialog):
             "menu_title_image_pos": [int(self.title_img_x.value()), int(self.title_img_y.value())],
             "menu_title_image_scale": float(self.title_img_scale.value()),
             "menu_option_scale": float(self.option_scale.value()),
+            "save_slots": int(self.save_slots_spin.value()),
+            "enable_autosave_on_menu": bool(self.enable_autosave_chk.isChecked()),
+            "help_hotkey": self.help_hotkey_edit.text().strip() or "F1",
+            "help_right_click": bool(self.help_right_click_chk.isChecked()),
         }
 
     def _update_preview(self):

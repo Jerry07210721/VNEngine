@@ -9,6 +9,15 @@ import yaml
 import json
 import numpy as np
 
+from src.game.save_slot_utils import (
+    AUTO_SAVE_SLOT,
+    DEFAULT_PAGE_SIZE,
+    clamp_page,
+    digit_to_slot,
+    page_count,
+    slot_file_path,
+)
+
 
 class VNGameRuntime:
     """视觉小说游戏运行时，负责游戏窗口的初始化和事件循环"""
@@ -35,6 +44,22 @@ class VNGameRuntime:
         self.clock = pygame.time.Clock()
         self.running = False
 
+        # 存档/菜单配置（来自 game_config，可被项目覆盖）
+        try:
+            self._save_slots = int((cfg or {}).get("save_slots", 5))
+        except Exception:
+            self._save_slots = 5
+        self._save_slots = max(1, min(200, self._save_slots))
+        self._save_page_size = DEFAULT_PAGE_SIZE
+        self._save_page = 0
+        self._enable_autosave_on_menu = bool((cfg or {}).get("enable_autosave_on_menu", True))
+        self._help_overlay = False
+        self._help_hotkey_name = str((cfg or {}).get("help_hotkey", "F1") or "F1")
+        self._help_key = None  # pygame keycode
+        self._help_right_click = bool((cfg or {}).get("help_right_click", True))
+        self._exit_confirm_overlay = False
+        self._exit_confirm_choice = 1  # 1=确认, 0=取消
+
         self.font = self._load_font(22)
         self.name_font = self._load_font(24, bold=True)
         self.text_color = (235, 235, 240)
@@ -60,6 +85,7 @@ class VNGameRuntime:
         self.adjacency: dict[int | str, list[int | str]] = {}
         self._connection_order: dict[int | str, list[int | str]] = {}
         self.current_node_id: int | str | None = None
+        self._preview_start_node_id: int | str | None = None
         self.variables: dict[str, str | int | float | bool] = {}
         self.project_data: dict | None = None
         self._global_var_defs: list[dict] = []
@@ -76,11 +102,14 @@ class VNGameRuntime:
         self._menu_overlay_alpha: int = 0
         self._menu_title_pos: tuple[int, int] = (60, 60)
         self._menu_title_color: tuple[int, int, int] = (240, 240, 255)
+        self._menu_title_scale: float = 1.0
         self._menu_option_pos: tuple[int, int] = (80, 140)
         self._menu_option_color: tuple[int, int, int] = (255, 255, 255)
+        self._menu_option_scale: float = 1.0
         self._menu_title_image_path: str = ""
         self._menu_title_image_surface: pygame.Surface | None = None
         self._menu_title_image_pos: tuple[int, int] = (400, 80)
+        self._menu_title_image_scale: float = 1.0
         self.dialogues = self._load_dialogues()
         self.current_index = 0
         self.current_visible_len = 0
@@ -95,10 +124,12 @@ class VNGameRuntime:
         self._portrait_fade_alpha = 255
         self._portrait_target_alpha = 255
         self._portrait_fade_start_alpha = 255
-        self._portrait_fade_duration = 0.4
+        self._portrait_fade_in_duration = 0.4
+        self._portrait_fade_out_duration = 0.4
         self._portrait_fade_time = 0.0
         self._portrait_fadeout_active = False
         self._pending_sub_advance = False
+        self._auto_next_remaining: float | None = None
         self._voice_cache: dict[Path, pygame.mixer.Sound] = {}
         self._voice_channel = None
         self._bgm_current = None
@@ -112,7 +143,6 @@ class VNGameRuntime:
         self._load_overlay = False
         self._settings_overlay = False
         self._overlay_return_mode: str | None = None
-        self._save_slots = 5
         self._settings = self._load_settings()
         self._apply_settings()
         self.fast_skip = False
@@ -166,6 +196,15 @@ class VNGameRuntime:
                     game_cfg = (data.get("game_config", {}) or {})
                     self._global_var_defs = data.get("global_variables", []) or []
                     self.branch_strategy = game_cfg.get("branch_strategy") or "first"
+                    # 覆盖运行时存档/帮助配置
+                    try:
+                        self._save_slots = int(game_cfg.get("save_slots", self._save_slots))
+                    except Exception:
+                        pass
+                    self._save_slots = max(1, min(200, int(self._save_slots)))
+                    self._enable_autosave_on_menu = bool(game_cfg.get("enable_autosave_on_menu", self._enable_autosave_on_menu))
+                    self._help_hotkey_name = str(game_cfg.get("help_hotkey", self._help_hotkey_name) or self._help_hotkey_name)
+                    self._help_right_click = bool(game_cfg.get("help_right_click", self._help_right_click))
                     self._apply_menu_config(game_cfg)
                     self._load_graph_from_flow(data)
                     if self.graph_mode and self.current_node_id is not None:
@@ -358,8 +397,23 @@ class VNGameRuntime:
         self._menu_option_pos = self._pair_from_cfg(cfg.get("menu_option_pos"), (80, 140))
         self._menu_title_color = self._color_from_cfg(cfg.get("menu_title_color"), (240, 240, 255))
         self._menu_option_color = self._color_from_cfg(cfg.get("menu_option_color"), (255, 255, 255))
+        try:
+            self._menu_title_scale = float(cfg.get("menu_title_scale", 1.0) or 1.0)
+        except Exception:
+            self._menu_title_scale = 1.0
+        self._menu_title_scale = max(0.1, min(5.0, float(self._menu_title_scale)))
+        try:
+            self._menu_option_scale = float(cfg.get("menu_option_scale", 1.0) or 1.0)
+        except Exception:
+            self._menu_option_scale = 1.0
+        self._menu_option_scale = max(0.5, min(5.0, float(self._menu_option_scale)))
         self._menu_title_image_path = cfg.get("menu_title_image") or ""
         self._menu_title_image_pos = self._pair_from_cfg(cfg.get("menu_title_image_pos"), (400, 80))
+        try:
+            self._menu_title_image_scale = float(cfg.get("menu_title_image_scale", 1.0) or 1.0)
+        except Exception:
+            self._menu_title_image_scale = 1.0
+        self._menu_title_image_scale = max(0.1, min(5.0, float(self._menu_title_image_scale)))
 
     def _enter_menu(self):
         self.mode = "menu"
@@ -368,6 +422,8 @@ class VNGameRuntime:
         self._settings_overlay = False
         self._choice_overlay = False
         self._history_overlay = False
+        self._help_overlay = False
+        self._exit_confirm_overlay = False
         self._overlay_return_mode = None
         self._menu_selected = 0
         self._stop_voice_playback()
@@ -405,7 +461,7 @@ class VNGameRuntime:
         self._reload_dialogues()
 
     def _continue_latest(self):
-        latest_slot = self._find_latest_slot()
+        latest_slot = self._find_latest_slot(include_autosave=True)
         if latest_slot is None:
             print("没有可继续的存档，自动开始新游戏")
             self._start_new_game()
@@ -419,6 +475,26 @@ class VNGameRuntime:
         self._fast_skip_timer = 0.0
         self.load_game(latest_slot)
 
+    def _continue_autosave(self):
+        """主菜单继续：优先读取自动存档点；无则回退到最新手动存档；仍无则新开游戏。"""
+        autosave_path = slot_file_path(self.save_dir, AUTO_SAVE_SLOT)
+        if autosave_path.exists():
+            slot = AUTO_SAVE_SLOT
+        else:
+            slot = self._find_latest_slot(include_autosave=False)
+        if slot is None:
+            print("没有可继续的存档（含自动存档），自动开始新游戏")
+            self._start_new_game()
+            return
+        self.mode = "game"
+        self._save_overlay = False
+        self._load_overlay = False
+        self._settings_overlay = False
+        self._choice_overlay = False
+        self.fast_skip = False
+        self._fast_skip_timer = 0.0
+        self.load_game(slot)
+
     def _open_load_from_menu(self):
         self._overlay_return_mode = "menu"
         self._load_overlay = True
@@ -426,6 +502,9 @@ class VNGameRuntime:
         self._settings_overlay = False
         self._choice_overlay = False
         self._history_overlay = False
+        self._help_overlay = False
+        self._exit_confirm_overlay = False
+        self._save_page = 0
 
     def _open_settings_from_menu(self):
         self._overlay_return_mode = "menu"
@@ -434,6 +513,8 @@ class VNGameRuntime:
         self._load_overlay = False
         self._choice_overlay = False
         self._history_overlay = False
+        self._help_overlay = False
+        self._exit_confirm_overlay = False
 
     def _move_menu(self, delta: int):
         count = len(self._menu_items)
@@ -446,7 +527,7 @@ class VNGameRuntime:
         if action == "start":
             self._start_new_game()
         elif action == "continue":
-            self._continue_latest()
+            self._continue_autosave()
         elif action == "load":
             self._open_load_from_menu()
         elif action == "settings":
@@ -454,11 +535,12 @@ class VNGameRuntime:
         elif action == "exit":
             self.quit_game()
 
-    def _find_latest_slot(self) -> int | None:
+    def _find_latest_slot(self, include_autosave: bool = True) -> int | None:
         latest = None
         latest_time = None
-        for idx in range(1, self._save_slots + 1):
-            path = self.save_dir / f"slot_{idx}.json"
+        indices = [AUTO_SAVE_SLOT, *range(1, self._save_slots + 1)] if include_autosave else list(range(1, self._save_slots + 1))
+        for idx in indices:
+            path = slot_file_path(self.save_dir, idx)
             if not path.exists():
                 continue
             try:
@@ -545,7 +627,18 @@ class VNGameRuntime:
             img_path = self._resolve_path(self._menu_title_image_path)
         if img_path and img_path.exists():
             try:
-                self._menu_title_image_surface = pygame.image.load(str(img_path)).convert_alpha()
+                img = pygame.image.load(str(img_path)).convert_alpha()
+                scale = getattr(self, "_menu_title_image_scale", 1.0) or 1.0
+                try:
+                    scale = float(scale)
+                except Exception:
+                    scale = 1.0
+                scale = max(0.1, min(5.0, scale))
+                if abs(scale - 1.0) > 1e-6:
+                    w = max(1, int(img.get_width() * scale))
+                    h = max(1, int(img.get_height() * scale))
+                    img = pygame.transform.smoothscale(img, (w, h))
+                self._menu_title_image_surface = img
             except Exception:
                 self._menu_title_image_surface = None
 
@@ -583,7 +676,15 @@ class VNGameRuntime:
         self.render_surface.blit(title_surf, (cx - title_surf.get_width() // 2, cy - title_surf.get_height()))
         self.render_surface.blit(sub_surf, (cx - sub_surf.get_width() // 2, cy + 12))
         if self._splash_elapsed >= self._splash_time:
-            self._enter_menu()
+            # 设计器“从节点开始预览”：跳过主菜单，直接进入游戏
+            if self._preview_start_node_id is not None:
+                self._start_new_game()
+            else:
+                self._enter_menu()
+
+    def set_preview_start_node(self, node_id: int | str | None):
+        """设置预览起始节点（仅影响本次进程）。"""
+        self._preview_start_node_id = node_id
 
     def start_game(self):
         """启动游戏（进入事件循环）"""
@@ -600,62 +701,95 @@ class VNGameRuntime:
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 if event.type == pygame.KEYDOWN:
+                    # lazy init help hotkey mapping after pygame init
+                    if self._help_key is None:
+                        self._help_key = self._parse_hotkey_to_pygame_key(self._help_hotkey_name) or pygame.K_F1
+
                     if self.mode == "splash":
                         if event.key == pygame.K_ESCAPE:
                             self.quit_game()
                             break
                         else:
-                            self._enter_menu()
+                            if self._preview_start_node_id is not None:
+                                self._start_new_game()
+                            else:
+                                self._enter_menu()
                             continue
                     # global overlay handling (works in menu or game)
-                    if event.key == pygame.K_ESCAPE and (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay):
+                    if event.key == pygame.K_ESCAPE and (
+                        self._save_overlay
+                        or self._load_overlay
+                        or self._settings_overlay
+                        or self._choice_overlay
+                        or self._history_overlay
+                        or self._help_overlay
+                        or self._exit_confirm_overlay
+                    ):
                         self._save_overlay = False
                         self._load_overlay = False
                         self._settings_overlay = False
                         self._choice_overlay = False
                         self._history_overlay = False
+                        self._help_overlay = False
+                        self._exit_confirm_overlay = False
                         self._restore_mode_if_needed()
                         continue
-                    if self._settings_overlay:
-                        if self._handle_settings_key(event.key):
+
+                    # exit confirm overlay
+                    if self._exit_confirm_overlay:
+                        if event.key in (pygame.K_LEFT, pygame.K_a, pygame.K_UP, pygame.K_w):
+                            self._exit_confirm_choice = 0
+                            continue
+                        if event.key in (pygame.K_RIGHT, pygame.K_d, pygame.K_DOWN, pygame.K_s):
+                            self._exit_confirm_choice = 1
+                            continue
+                        if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_y):
+                            if self._enable_autosave_on_menu and self.mode == "game":
+                                self.save_game(AUTO_SAVE_SLOT)
+                            self._exit_confirm_overlay = False
+                            self._enter_menu()
+                            continue
+                        if event.key in (pygame.K_ESCAPE, pygame.K_n):
+                            self._exit_confirm_overlay = False
                             self._restore_mode_if_needed()
                             continue
-                    if self._load_overlay and event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_KP1, pygame.K_KP2, pygame.K_KP3, pygame.K_KP4, pygame.K_KP5):
-                        key_map = {
-                            pygame.K_1: 1,
-                            pygame.K_2: 2,
-                            pygame.K_3: 3,
-                            pygame.K_4: 4,
-                            pygame.K_5: 5,
-                            pygame.K_KP1: 1,
-                            pygame.K_KP2: 2,
-                            pygame.K_KP3: 3,
-                            pygame.K_KP4: 4,
-                            pygame.K_KP5: 5,
-                        }
-                        slot = key_map.get(event.key)
-                        if slot:
-                            self.load_game(slot)
-                            self._load_overlay = False
-                            self._overlay_return_mode = None
-                            continue
-                    if self._save_overlay and event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_KP1, pygame.K_KP2, pygame.K_KP3, pygame.K_KP4, pygame.K_KP5):
-                        key_map = {
-                            pygame.K_1: 1,
-                            pygame.K_2: 2,
-                            pygame.K_3: 3,
-                            pygame.K_4: 4,
-                            pygame.K_5: 5,
-                            pygame.K_KP1: 1,
-                            pygame.K_KP2: 2,
-                            pygame.K_KP3: 3,
-                            pygame.K_KP4: 4,
-                            pygame.K_KP5: 5,
-                        }
-                        slot = key_map.get(event.key)
-                        if slot:
-                            self.save_game(slot)
-                            self._save_overlay = False
+
+                    # help overlay toggle
+                    if event.key == self._help_key:
+                        self._toggle_help_overlay()
+                        continue
+
+                    # save/load overlay paging (10 slots per page)
+                    if (self._save_overlay or self._load_overlay) and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                        delta = -1 if event.key in (pygame.K_UP, pygame.K_PAGEUP) else 1
+                        self._save_page = clamp_page(self._save_page + delta, self._save_slots, self._save_page_size)
+                        continue
+
+                    # load autosave (A)
+                    if self._load_overlay and event.key == pygame.K_a:
+                        self.load_game(AUTO_SAVE_SLOT)
+                        self._load_overlay = False
+                        self._overlay_return_mode = None
+                        continue
+
+                    # save/load overlay digit selection (0-9)
+                    if self._save_overlay or self._load_overlay:
+                        digit = self._key_to_digit(event.key)
+                        if digit is not None:
+                            slot = digit_to_slot(self._save_page, digit, page_size=self._save_page_size)
+                            if slot is not None and 1 <= slot <= self._save_slots:
+                                if self._load_overlay:
+                                    self.load_game(slot)
+                                    self._load_overlay = False
+                                    self._overlay_return_mode = None
+                                    continue
+                                if self._save_overlay:
+                                    self.save_game(slot)
+                                    self._save_overlay = False
+                                    self._restore_mode_if_needed()
+                                    continue
+                    if self._settings_overlay:
+                        if self._handle_settings_key(event.key):
                             self._restore_mode_if_needed()
                             continue
 
@@ -676,7 +810,8 @@ class VNGameRuntime:
                         continue
                     # below: game mode
                     if event.key == pygame.K_ESCAPE:
-                        self._enter_menu()
+                        # ESC 返回主菜单：二次确认 + 自动存档
+                        self._open_exit_confirm()
                         continue
                     elif event.key == pygame.K_SPACE or event.key == pygame.K_RETURN:
                         if self._settings_overlay:
@@ -684,7 +819,10 @@ class VNGameRuntime:
                                 self._restore_mode_if_needed()
                                 continue
                         elif not (self._save_overlay or self._load_overlay or self._choice_overlay):
-                            self.advance_dialogue()
+                                if self._auto_next_lock_active():
+                                    self._reveal_current_text()
+                                else:
+                                    self.advance_dialogue()
                     elif event.key == pygame.K_F11:
                         self.toggle_fullscreen()
                     elif event.key == pygame.K_F5:
@@ -693,26 +831,34 @@ class VNGameRuntime:
                         self._load_overlay = False
                         self._settings_overlay = False
                         self._history_overlay = False
+                        self._help_overlay = False
+                        self._exit_confirm_overlay = False
+                        self._save_page = 0
                     elif event.key == pygame.K_F9:
                         self._overlay_return_mode = self.mode
                         self._load_overlay = True
                         self._save_overlay = False
                         self._settings_overlay = False
                         self._history_overlay = False
+                        self._help_overlay = False
+                        self._exit_confirm_overlay = False
+                        self._save_page = 0
                     elif event.key == pygame.K_F10:
                         self._overlay_return_mode = self.mode
                         self._settings_overlay = True
                         self._save_overlay = False
                         self._load_overlay = False
                         self._history_overlay = False
+                        self._help_overlay = False
+                        self._exit_confirm_overlay = False
                     elif event.key == pygame.K_TAB:
-                        if not (self._save_overlay or self._load_overlay or self._settings_overlay):
+                        if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._help_overlay or self._exit_confirm_overlay):
                             self.fast_skip = not self.fast_skip
                             self._fast_skip_timer = 0.0
                             self._reset_typing_state()
                         continue
                     elif event.key == pygame.K_s:
-                        if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay):
+                        if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay):
                             self.fast_skip = True
                             self._fast_skip_timer = 0.0
                             self._reset_typing_state()
@@ -725,6 +871,8 @@ class VNGameRuntime:
                             self._load_overlay = False
                             self._settings_overlay = False
                             self._choice_overlay = False
+                            self._help_overlay = False
+                            self._exit_confirm_overlay = False
                         continue
                     elif event.key == pygame.K_F3:
                         self.debug_hud = not self.debug_hud
@@ -747,12 +895,19 @@ class VNGameRuntime:
                         }
                         self._apply_choice(key_map.get(event.key, -1))
                         continue
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                    if self._help_right_click:
+                        self._toggle_help_overlay()
+                        continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if self.mode == "menu":
                         self._activate_menu_item()
                         continue
-                    if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._history_overlay):
-                        self.advance_dialogue()
+                    if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay):
+                        if self._auto_next_lock_active():
+                            self._reveal_current_text()
+                        else:
+                            self.advance_dialogue()
                 if event.type == pygame.KEYUP:
                     if event.key == pygame.K_s:
                         self.fast_skip = False
@@ -765,19 +920,24 @@ class VNGameRuntime:
                 self._render_splash(dt)
             elif self.mode == "menu":
                 self._render_menu(dt)
-                if self._save_overlay or self._load_overlay or self._settings_overlay:
+                if self._save_overlay or self._load_overlay or self._settings_overlay or self._help_overlay:
                     self._render_overlay()
             else:
                 # overlays pause dialogue progression but still render current frame
-                if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay):
+                if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay):
                     self._update_typing(dt)
+                    self._update_auto_next(dt)
                 self._process_pending_audio(dt)
-                self._render_scene(dt)
-                self._update_fast_skip(dt)
+                advanced_this_tick = False
+                # 如果淡出动画已结束并需要推进到下一子节点：先推进再渲染，避免渲染后重建 surface 导致闪黑。
                 if self._pending_sub_advance:
                     self._pending_sub_advance = False
-                    # advance to next sub-dialogue after fade-out
                     self.advance_dialogue()
+                    advanced_this_tick = True
+                self._render_scene(dt)
+                # 避免同一帧内由于 fast-skip 再次推进
+                if not advanced_this_tick:
+                    self._update_fast_skip(dt)
             self._blit_to_window()
             pygame.display.flip()
 
@@ -789,6 +949,9 @@ class VNGameRuntime:
         if self.current_visible_len < len(full_text):
             self.current_visible_len = len(full_text)
             return
+
+        # leaving current子节点/节点：清理自动下一句倒计时（若有）
+        self._auto_next_remaining = None
 
         # leaving current子节点/节点时先停止当前语音，避免残留播放
         self._stop_voice_playback()
@@ -833,6 +996,8 @@ class VNGameRuntime:
         stop_bgm = bool(entry.get("stop_bgm"))
         hide_textbox = bool(entry.get("hide_textbox", False))
         portrait_fade = bool(entry.get("portrait_fade", False))
+        portrait_fade_duration = entry.get("portrait_fade_duration", None)
+        bg_fade_duration = entry.get("bg_fade_duration", None)
 
         # draw video or background image
         if video_path:
@@ -841,7 +1006,7 @@ class VNGameRuntime:
                 self.render_surface.blit(self._video_surface, (0, 0))
             else:
                 if bg_path:
-                    self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)))
+                    self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)), duration=bg_fade_duration)
                     self._render_background(dt)
                 else:
                     # video加载失败时至少不要复用上一个背景
@@ -849,11 +1014,11 @@ class VNGameRuntime:
         else:
             if self._video_clip:
                 self._stop_video()
-            self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)))
+            self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)), duration=bg_fade_duration)
             self._render_background(dt)
 
         # draw portrait (character sprite) if available
-        self._draw_portrait(portrait_path, portrait_fade, dt)
+        self._draw_portrait(portrait_path, portrait_fade, dt, fade_in_duration=portrait_fade_duration)
 
         # ensure bgm if provided and not explicitly stopped on this node
         if not stop_bgm:
@@ -888,10 +1053,83 @@ class VNGameRuntime:
         if self._history_overlay:
             self._render_history_overlay()
 
-        if self._save_overlay or self._load_overlay or self._settings_overlay:
+        if self._exit_confirm_overlay:
+            self._render_exit_confirm_overlay()
+
+        if self._save_overlay or self._load_overlay or self._settings_overlay or self._help_overlay:
             self._render_overlay()
         if self._choice_overlay:
             self._render_choice_overlay()
+
+    def _key_to_digit(self, key) -> int | None:
+        key_map = {
+            pygame.K_0: 0,
+            pygame.K_1: 1,
+            pygame.K_2: 2,
+            pygame.K_3: 3,
+            pygame.K_4: 4,
+            pygame.K_5: 5,
+            pygame.K_6: 6,
+            pygame.K_7: 7,
+            pygame.K_8: 8,
+            pygame.K_9: 9,
+            pygame.K_KP0: 0,
+            pygame.K_KP1: 1,
+            pygame.K_KP2: 2,
+            pygame.K_KP3: 3,
+            pygame.K_KP4: 4,
+            pygame.K_KP5: 5,
+            pygame.K_KP6: 6,
+            pygame.K_KP7: 7,
+            pygame.K_KP8: 8,
+            pygame.K_KP9: 9,
+        }
+        return key_map.get(key)
+
+    def _parse_hotkey_to_pygame_key(self, text: str) -> int | None:
+        s = (text or "").strip().upper()
+        if not s:
+            return None
+        # Function keys
+        if s.startswith("F") and s[1:].isdigit():
+            try:
+                n = int(s[1:])
+            except Exception:
+                n = 1
+            return getattr(pygame, f"K_F{n}", None)
+        # Single letter
+        if len(s) == 1 and "A" <= s <= "Z":
+            return getattr(pygame, f"K_{s.lower()}", None)
+        # Common names
+        aliases = {
+            "HELP": pygame.K_F1,
+            "H": pygame.K_h,
+        }
+        return aliases.get(s)
+
+    def _toggle_help_overlay(self):
+        self._help_overlay = not self._help_overlay
+        if self._help_overlay:
+            self._overlay_return_mode = self.mode
+            self._save_overlay = False
+            self._load_overlay = False
+            self._settings_overlay = False
+            self._choice_overlay = False
+            self._history_overlay = False
+            self._exit_confirm_overlay = False
+
+    def _open_exit_confirm(self):
+        if self.mode != "game":
+            return
+        self._overlay_return_mode = self.mode
+        self._exit_confirm_overlay = True
+        self._exit_confirm_choice = 1
+        self._save_overlay = False
+        self._load_overlay = False
+        self._settings_overlay = False
+        self._choice_overlay = False
+        self._history_overlay = False
+        self._help_overlay = False
 
     def _render_history_overlay(self):
         overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
@@ -967,7 +1205,7 @@ class VNGameRuntime:
 
         title = self._menu_title or (self.project_path.stem if self.project_path else "VNEngine")
         title_pos = self._menu_title_pos
-        menu_font = self._load_font(26)
+        menu_font = self._load_font(max(8, int(20 * (getattr(self, "_menu_option_scale", 1.0) or 1.0))))
         title_color = self._menu_title_color
         option_color = self._menu_option_color
 
@@ -977,7 +1215,8 @@ class VNGameRuntime:
             y = self._menu_title_image_pos[1]
             self.render_surface.blit(img, (x - img.get_width() // 2, y - img.get_height() // 2))
         else:
-            title_surf = self.name_font.render(title, True, title_color)
+            title_font = self._load_font(max(10, int(36 * (getattr(self, "_menu_title_scale", 1.0) or 1.0))), bold=True)
+            title_surf = title_font.render(title, True, title_color)
             self.render_surface.blit(title_surf, (title_pos[0], title_pos[1]))
 
         start_x, start_y = self._menu_option_pos
@@ -1048,10 +1287,55 @@ class VNGameRuntime:
         content = entry.get("content") or entry.get("title") or ""
         self.current_visible_len = len(content)
         self.typing_progress = len(content)
+
+        # auto-next 倒计时期间：允许快速显示文字，但禁止推进到下一句/下一节点
+        if self._auto_next_lock_active():
+            self._fast_skip_timer = 0.0
+            return
+
         self._fast_skip_timer += dt
         if self._fast_skip_timer >= self._fast_skip_interval:
             self._fast_skip_timer = 0.0
             self.advance_dialogue()
+
+    def _auto_next_lock_active(self) -> bool:
+        try:
+            return self._auto_next_remaining is not None and float(self._auto_next_remaining) > 0.0
+        except Exception:
+            return False
+
+    def _reveal_current_text(self):
+        entry = self._current_entry()
+        if not entry:
+            return
+        content = entry.get("content") or entry.get("title") or ""
+        self.current_visible_len = len(content)
+        self.typing_progress = len(content)
+
+    def _update_auto_next(self, dt: float):
+        if self.mode != "game":
+            return
+        # overlays pause countdown too
+        if self._save_overlay or self._load_overlay or self._settings_overlay or self._choice_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay:
+            return
+        if self._pending_sub_advance:
+            return
+        if self._auto_next_remaining is None:
+            return
+
+        try:
+            self._auto_next_remaining = float(self._auto_next_remaining) - float(dt)
+        except Exception:
+            self._auto_next_remaining = None
+            return
+
+        if self._auto_next_remaining > 0.0:
+            return
+
+        # time's up: reveal then advance immediately
+        self._auto_next_remaining = None
+        self._reveal_current_text()
+        self.advance_dialogue()
 
     def _reset_typing_state(self):
         self.current_visible_len = 0
@@ -1105,6 +1389,15 @@ class VNGameRuntime:
 
     def _on_enter_node(self, skip_media: bool = False):
         entry = self._current_entry()
+        # reset auto-next countdown whenever we enter a node/sub-dialogue
+        self._auto_next_remaining = None
+        if entry and self.graph_mode and entry.get("node_type") == "text":
+            try:
+                secs = float(entry.get("auto_next_seconds") or 0.0)
+                if secs > 0:
+                    self._auto_next_remaining = max(0.0, min(600.0, secs))
+            except Exception:
+                self._auto_next_remaining = None
         self._apply_var_ops(entry)
         stop_bgm = bool(entry.get("stop_bgm")) if entry else False
         bgm = entry.get("bgm") or "" if entry else ""
@@ -1128,8 +1421,9 @@ class VNGameRuntime:
                 self._bgm_current = None
             if bgm:
                 self._ensure_bgm(bgm, loop=bool(entry.get("bgm_loop", True)), fade=True)
-            # apply ui layout if provided
-            self._apply_ui_file(ui_file)
+
+        # per-sub UI：即使 skip_media=True（避免重复刷新 BGM），也需要允许切换 UI 布局。
+        self._apply_ui_file(ui_file)
 
         # avoid replaying voice if already played for this index
         voice_key = (self.current_node_id, self._sub_index) if self.graph_mode else self.current_index
@@ -1175,7 +1469,7 @@ class VNGameRuntime:
         pygame.draw.polygon(tri_surface, (255, 255, 255, alpha), points)
         self.render_surface.blit(tri_surface, (self.text_area.right - 30, self.text_area.bottom - 26))
 
-    def _update_background(self, bg_path: str, fade_in: bool):
+    def _update_background(self, bg_path: str, fade_in: bool, duration: float | None = None):
         # prepare background surfaces and fade state
         if not bg_path:
             # 保留当前背景，避免子节点切换时短暂闪黑；若本就无背景则维持空状态
@@ -1202,6 +1496,13 @@ class VNGameRuntime:
             return
 
         if fade_in and self._bg_surface is not None:
+            # allow per-node override for fade duration
+            if duration is not None:
+                try:
+                    d = float(duration)
+                    self._bg_fade_duration = max(0.0, min(10.0, d))
+                except Exception:
+                    pass
             self._bg_target_surface = new_surface
             self._bg_target_path = abs_path
             self._bg_fade_time = 0.0
@@ -1320,7 +1621,7 @@ class VNGameRuntime:
         self._video_duration = None
         self._video_time = 0.0
 
-    def _draw_portrait(self, portrait_path: str, fade_in: bool, dt: float):
+    def _draw_portrait(self, portrait_path: str, fade_in: bool, dt: float, fade_in_duration: float | None = None):
         # allow fade-out to continue even if next sub has no portrait
         if not portrait_path:
             if not self._portrait_fadeout_active:
@@ -1388,6 +1689,12 @@ class VNGameRuntime:
             self._portrait_fadeout_active = False
             self._portrait_fade_start_alpha = 255
             if fade_in:
+                if fade_in_duration is not None:
+                    try:
+                        d = float(fade_in_duration)
+                        self._portrait_fade_in_duration = max(0.0, min(10.0, d))
+                    except Exception:
+                        pass
                 self._portrait_target_surface = target_img
                 self._portrait_surface = target_img.copy()
                 self._portrait_fade_alpha = 0
@@ -1400,15 +1707,10 @@ class VNGameRuntime:
                 self._portrait_target_alpha = 255
                 self._portrait_fade_time = 0.0
 
-        if fade_in and self._portrait_surface is not None:
+        # IMPORTANT: fade-out has priority (fix: fade-in + fade-out on same entry should still advance)
+        if self._portrait_fadeout_active and self._portrait_surface is not None:
             self._portrait_fade_time += dt
-            progress = min(1.0, self._portrait_fade_time / max(0.001, self._portrait_fade_duration))
-            self._portrait_fade_alpha = int(self._portrait_target_alpha * progress)
-            img = self._portrait_surface.copy()
-            img.set_alpha(self._portrait_fade_alpha)
-        elif self._portrait_fadeout_active and self._portrait_surface is not None:
-            self._portrait_fade_time += dt
-            progress = min(1.0, self._portrait_fade_time / max(0.001, self._portrait_fade_duration))
+            progress = min(1.0, self._portrait_fade_time / max(0.001, self._portrait_fade_out_duration))
             start_alpha = self._portrait_fade_start_alpha if self._portrait_fade_start_alpha is not None else 255
             self._portrait_fade_alpha = int(start_alpha * max(0.0, 1.0 - progress))
             img = self._portrait_surface.copy()
@@ -1419,6 +1721,12 @@ class VNGameRuntime:
                 self._portrait_current_path = None
                 self._portrait_fadeout_active = False
                 self._pending_sub_advance = True
+        elif fade_in and self._portrait_surface is not None:
+            self._portrait_fade_time += dt
+            progress = min(1.0, self._portrait_fade_time / max(0.001, self._portrait_fade_in_duration))
+            self._portrait_fade_alpha = int(self._portrait_target_alpha * progress)
+            img = self._portrait_surface.copy()
+            img.set_alpha(self._portrait_fade_alpha)
         else:
             img = self._portrait_surface if self._portrait_surface is not None else target_img
 
@@ -1437,6 +1745,11 @@ class VNGameRuntime:
             return False
         if self._portrait_surface is None:
             return False
+        try:
+            d = float(sub_entry.get("portrait_fade_out_duration", self._portrait_fade_out_duration))
+            self._portrait_fade_out_duration = max(0.0, min(10.0, d))
+        except Exception:
+            pass
         self._portrait_fadeout_active = True
         current_alpha = self._portrait_surface.get_alpha()
         self._portrait_fade_start_alpha = current_alpha if current_alpha is not None else 255
@@ -1486,8 +1799,14 @@ class VNGameRuntime:
                         "content": sub.get("text", merged.get("content", "")),
                         "portrait": sub.get("portrait", merged.get("portrait", "")),
                         "voice": sub.get("voice", merged.get("voice", "")),
+                        # UI 配置迁移：优先使用子对话的 ui_file；若未配置则回退到节点级（兼容旧数据）
+                        "ui_file": sub.get("ui_file") or merged.get("ui_file", ""),
                         "hide_textbox": bool(sub.get("hide_textbox", False)),
                         "portrait_fade": bool(sub.get("portrait_fade", False)),
+                        "portrait_fade_out": bool(sub.get("portrait_fade_out", False)),
+                        "portrait_fade_duration": sub.get("portrait_fade_duration", None),
+                        "portrait_fade_out_duration": sub.get("portrait_fade_out_duration", None),
+                        "auto_next_seconds": sub.get("auto_next_seconds", None),
                     })
                     return merged
             return node
@@ -1518,6 +1837,26 @@ class VNGameRuntime:
         else:
             self.current_node_id = None
         self.graph_mode = bool(self.nodes_map)
+
+        # 预览：从指定节点开始（仅当节点存在时生效）
+        if self._preview_start_node_id is not None and self.nodes_map:
+            requested = self._preview_start_node_id
+            chosen = None
+            if requested in self.nodes_map:
+                chosen = requested
+            else:
+                try:
+                    req_int = int(requested)
+                    if req_int in self.nodes_map:
+                        chosen = req_int
+                except Exception:
+                    pass
+                if chosen is None:
+                    req_str = str(requested)
+                    if req_str in self.nodes_map:
+                        chosen = req_str
+            if chosen is not None:
+                self.current_node_id = chosen
         self._sub_index = 0
         # 预热节点素材，减少首次进入卡顿
         self._warm_caches_from_flow(nodes, preload_limit=100)
@@ -1977,7 +2316,7 @@ class VNGameRuntime:
                 "window_size": list(self.window_size),
                 "summary": self._build_summary(),
             }
-            save_path = self.save_dir / f"slot_{slot}.json"
+            save_path = slot_file_path(self.save_dir, slot)
             with open(save_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(save_data, f, allow_unicode=True)
             print(f"存档完成：{save_path}")
@@ -1986,7 +2325,7 @@ class VNGameRuntime:
 
     def load_game(self, slot: int = 1):
         try:
-            save_path = self.save_dir / f"slot_{slot}.json"
+            save_path = slot_file_path(self.save_dir, slot)
             if not save_path.exists():
                 print("未找到存档文件")
                 return
@@ -2097,7 +2436,26 @@ class VNGameRuntime:
     def _render_overlay(self):
         overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 160))
-        if self._settings_overlay:
+        if self._help_overlay:
+            title = "帮助 (右键/快捷键关闭)"
+            title_surf = self.name_font.render(title, True, (255, 255, 255))
+            overlay.blit(title_surf, (40, 40))
+            y = 90
+            key_name = self._help_hotkey_name or "F1"
+            info_lines = [
+                "基础：左键/Space/Enter 下一句",
+                "ESC 返回主菜单（会二次确认，并自动存档）",
+                "F5 打开保存  |  F9 打开读取  |  F10 设置",
+                "↑/↓ 翻页（每页10个） | 数字 0-9 选择槽位（0=第10个）",
+                "A 读取自动存档（仅读档界面）",
+                "TAB 切换快进 | 按住 S 快进 | H 历史记录 | F11 全屏",
+                f"帮助菜单：右键 或 {key_name}",
+            ]
+            for line in info_lines:
+                surf = self.font.render(line, True, (230, 230, 230))
+                overlay.blit(surf, (40, y))
+                y += self.font.get_linesize() + 6
+        elif self._settings_overlay:
             title = "设置 (F10)"
             title_surf = self.name_font.render(title, True, (255, 255, 255))
             overlay.blit(title_surf, (40, 40))
@@ -2117,15 +2475,34 @@ class VNGameRuntime:
                 overlay.blit(surf, (40, y))
                 y += self.font.get_linesize() + 6
         else:
-            title = "保存到槽位 (1-5)" if self._save_overlay else "读取槽位 (1-5)"
+            pages = page_count(self._save_slots, self._save_page_size)
+            self._save_page = clamp_page(self._save_page, self._save_slots, self._save_page_size)
+            page_tip = f"第{self._save_page + 1}/{pages}页"
+            title = f"保存到槽位 (0-9) {page_tip}" if self._save_overlay else f"读取槽位 (0-9) {page_tip}"
             title_surf = self.name_font.render(title, True, (255, 255, 255))
             overlay.blit(title_surf, (40, 40))
 
             slots = self._read_slots_meta()
             y = 90
-            for idx in range(1, self._save_slots + 1):
-                meta = slots.get(idx)
-                line = f"[{idx}] "
+            if self._load_overlay:
+                auto_meta = slots.get(AUTO_SAVE_SLOT)
+                auto_line = "[A] 自动存档 "
+                if auto_meta:
+                    auto_line += f"{auto_meta.get('timestamp','')} - {auto_meta.get('summary','')}"
+                else:
+                    auto_line += "<空>"
+                surf = self.font.render(auto_line, True, (220, 220, 240))
+                overlay.blit(surf, (40, y))
+                y += self.font.get_linesize() + 10
+
+            start = self._save_page * self._save_page_size + 1
+            end = min(self._save_slots, start + self._save_page_size - 1)
+            for slot_id in range(start, end + 1):
+                meta = slots.get(slot_id)
+                digit = slot_id - start + 1
+                # digit label: 1..9, 0 for 10th
+                label = str(digit) if digit < 10 else "0"
+                line = f"[{label}] (槽位{slot_id}) "
                 if meta:
                     line += f"{meta.get('timestamp','')} - {meta.get('summary','')}"
                 else:
@@ -2134,7 +2511,7 @@ class VNGameRuntime:
                 overlay.blit(surf, (40, y))
                 y += self.font.get_linesize() + 6
 
-            hint = "ESC 取消" if (self._save_overlay or self._load_overlay) else ""
+            hint = "↑↓翻页 | ESC 取消" if (self._save_overlay or self._load_overlay) else ""
             if hint:
                 hint_surf = self.font.render(hint, True, (200, 200, 200))
                 overlay.blit(hint_surf, (40, y + 10))
@@ -2170,8 +2547,22 @@ class VNGameRuntime:
         meta = {}
         if not self.save_dir.exists():
             return meta
+
+        # autosave
+        auto_path = slot_file_path(self.save_dir, AUTO_SAVE_SLOT)
+        if auto_path.exists():
+            try:
+                with open(auto_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                meta[AUTO_SAVE_SLOT] = {
+                    "timestamp": data.get("timestamp", ""),
+                    "summary": data.get("summary", ""),
+                }
+            except Exception:
+                pass
+
         for idx in range(1, self._save_slots + 1):
-            path = self.save_dir / f"slot_{idx}.json"
+            path = slot_file_path(self.save_dir, idx)
             if not path.exists():
                 continue
             try:
@@ -2185,11 +2576,37 @@ class VNGameRuntime:
                 continue
         return meta
 
+    def _render_exit_confirm_overlay(self):
+        overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 190))
+
+        title = "返回主菜单？"
+        title_surf = self.name_font.render(title, True, (255, 255, 255))
+        overlay.blit(title_surf, (40, 40))
+
+        msg = "将自动保存到【自动存档】。"
+        msg_surf = self.font.render(msg, True, (220, 220, 220))
+        overlay.blit(msg_surf, (40, 90))
+
+        y = 140
+        yes_color = (255, 255, 255) if self._exit_confirm_choice == 1 else (180, 180, 180)
+        no_color = (255, 255, 255) if self._exit_confirm_choice == 0 else (180, 180, 180)
+        yes = self.font.render("[确认] Enter/Space/Y", True, yes_color)
+        no = self.font.render("[取消] ESC/N", True, no_color)
+        overlay.blit(yes, (60, y))
+        overlay.blit(no, (60, y + self.font.get_linesize() + 10))
+
+        hint = "←/→ 或 ↑/↓ 切换选项"
+        hint_surf = self.font.render(hint, True, (200, 200, 200))
+        overlay.blit(hint_surf, (40, y + 90))
+
+        self.render_surface.blit(overlay, (0, 0))
+
     def _load_settings(self) -> dict:
         defaults = {
             "typing_speed": 24.0,
             "master_volume": 1.0,
-            "bgm_volume": 1.0,
+            "bgm_volume": 0.6,
             "voice_volume": 1.0,
         }
         if not self.settings_path.exists():

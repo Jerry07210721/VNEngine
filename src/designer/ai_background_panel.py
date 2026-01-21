@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QFormLayout,
     QFileDialog,
+    QScrollArea,
+    QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -63,12 +65,15 @@ class AIBackgroundPanel(QWidget):
         header.addStretch(1)
         layout.addLayout(header)
 
-        main = QHBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
         self.list_widget = QListWidget()
         self.list_widget.itemSelectionChanged.connect(self.on_item_selected)
-        main.addWidget(self.list_widget, 2)
+        splitter.addWidget(self.list_widget)
 
-        right = QVBoxLayout()
+        right_container = QWidget()
+        right = QVBoxLayout(right_container)
 
         info_group = QGroupBox("背景详情")
         form = QFormLayout()
@@ -242,6 +247,12 @@ class AIBackgroundPanel(QWidget):
         self.flux_num_spin.setValue(1)
         flux_form.addRow("绘图数量", self.flux_num_spin)
 
+        self.flux_size_combo = QComboBox()
+        self.flux_size_combo.addItem("1MP(默认)", "1MP")
+        self.flux_size_combo.addItem("2MP", "2MP")
+        self.flux_size_combo.addItem("4MP", "4MP")
+        flux_form.addRow("分辨率", self.flux_size_combo)
+
         self.flux_params_group.setLayout(flux_form)
         right.addWidget(self.flux_params_group)
 
@@ -311,8 +322,16 @@ class AIBackgroundPanel(QWidget):
         right.addWidget(self.progress_label)
         right.addStretch(1)
 
-        main.addLayout(right, 3)
-        layout.addLayout(main)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setWidget(right_container)
+        splitter.addWidget(right_scroll)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
 
         self.model_combo.currentIndexChanged.connect(self._toggle_mj_group)
         self._toggle_mj_group()
@@ -400,6 +419,8 @@ class AIBackgroundPanel(QWidget):
         self.flux_model_combo.setCurrentIndex(0)
         self.flux_mode_combo.setCurrentIndex(0)
         self.flux_num_spin.setValue(1)
+        if hasattr(self, "flux_size_combo"):
+            self.flux_size_combo.setCurrentIndex(0)
         for i in range(3):
             if i < len(getattr(self, "ref_path_edits", [])):
                 self.ref_path_edits[i].clear()
@@ -604,6 +625,12 @@ class AIBackgroundPanel(QWidget):
                 self.flux_num_spin.setValue(int(num))
             except Exception:
                 pass
+
+        size = state.get("size") or (state.get("params") or {}).get("size")
+        if size and hasattr(self, "flux_size_combo"):
+            idx = self.flux_size_combo.findData(str(size).strip().upper())
+            if idx >= 0:
+                self.flux_size_combo.setCurrentIndex(idx)
         images = state.get("images") if isinstance(state.get("images"), list) else []
         for i in range(3):
             if i < len(images) and isinstance(images[i], dict):
@@ -652,6 +679,7 @@ class AIBackgroundPanel(QWidget):
                 "mode": self.flux_mode_combo.currentData() or "pro",
                 "num": int(self.flux_num_spin.value()),
                 "aspect": self.aspect_combo.currentText(),
+                "size": (self.flux_size_combo.currentData() or "1MP") if hasattr(self, "flux_size_combo") else "1MP",
             },
             "images": images,
         }
@@ -1070,6 +1098,7 @@ class AIBackgroundPanel(QWidget):
         flux_model = self.flux_model_combo.currentData() or "flux-kontext"
         flux_mode = self.flux_mode_combo.currentData() or "pro"
         flux_num = int(self.flux_num_spin.value())
+        flux_size = (self.flux_size_combo.currentData() or "1MP") if hasattr(self, "flux_size_combo") else "1MP"
 
         params = {
             "bg_id": self.current_item.bg_id,
@@ -1083,6 +1112,7 @@ class AIBackgroundPanel(QWidget):
             "flux_model": flux_model,
             "flux_mode": flux_mode,
             "flux_num": flux_num,
+            "flux_size": flux_size,
             "reference_images": ref_paths,
             "project_root": str(self._project_root()),
         }

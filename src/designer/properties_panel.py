@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QLabel,
+    QDoubleSpinBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -132,6 +133,11 @@ class PropertiesDock(QDockWidget):
         sub_portrait_row = self._make_file_row(self.sub_portrait_edit, self._pick_sub_portrait, self._clear_sub_portrait, "选择立绘")
         detail.addRow("立绘", sub_portrait_row)
 
+        self.sub_ui_file_edit = QLineEdit()
+        self.sub_ui_file_edit.textChanged.connect(self._on_sub_detail_changed)
+        sub_ui_row = self._make_file_row(self.sub_ui_file_edit, self._pick_sub_ui_file, self._clear_sub_ui_file, "选择 .json")
+        detail.addRow("UI文件", sub_ui_row)
+
         self.sub_hide_chk = QCheckBox("隐藏文本框")
         self.sub_hide_chk.stateChanged.connect(self._on_sub_detail_changed)
         detail.addRow("", self.sub_hide_chk)
@@ -143,6 +149,27 @@ class PropertiesDock(QDockWidget):
         self.sub_fade_out_chk = QCheckBox("立绘淡出（进入下一子节点前）")
         self.sub_fade_out_chk.stateChanged.connect(self._on_sub_detail_changed)
         detail.addRow("", self.sub_fade_out_chk)
+
+        self.sub_fade_in_duration_spin = QDoubleSpinBox()
+        self.sub_fade_in_duration_spin.setRange(0.0, 10.0)
+        self.sub_fade_in_duration_spin.setSingleStep(0.05)
+        self.sub_fade_in_duration_spin.setDecimals(2)
+        self.sub_fade_in_duration_spin.valueChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("立绘淡入时长(秒)", self.sub_fade_in_duration_spin)
+
+        self.sub_fade_out_duration_spin = QDoubleSpinBox()
+        self.sub_fade_out_duration_spin.setRange(0.0, 10.0)
+        self.sub_fade_out_duration_spin.setSingleStep(0.05)
+        self.sub_fade_out_duration_spin.setDecimals(2)
+        self.sub_fade_out_duration_spin.valueChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("立绘淡出时长(秒)", self.sub_fade_out_duration_spin)
+
+        self.sub_auto_next_spin = QDoubleSpinBox()
+        self.sub_auto_next_spin.setRange(0.0, 600.0)
+        self.sub_auto_next_spin.setSingleStep(0.5)
+        self.sub_auto_next_spin.setDecimals(1)
+        self.sub_auto_next_spin.valueChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("自动进入下一句(秒，0=关闭)", self.sub_auto_next_spin)
 
         layout.addLayout(detail)
 
@@ -333,10 +360,18 @@ class PropertiesDock(QDockWidget):
         self.bg_fade_in_chk.stateChanged.connect(self._on_bg_fade_in_changed)
         form.addRow("", self.bg_fade_in_chk)
 
+        self.bg_fade_duration_spin = QDoubleSpinBox()
+        self.bg_fade_duration_spin.setRange(0.0, 10.0)
+        self.bg_fade_duration_spin.setSingleStep(0.05)
+        self.bg_fade_duration_spin.setDecimals(2)
+        self.bg_fade_duration_spin.valueChanged.connect(self._on_bg_fade_duration_changed)
+        form.addRow("背景渐显时长(秒)", self.bg_fade_duration_spin)
+
         parent_layout.addWidget(group)
 
     def _build_panel_ui(self, parent_layout):
         group = QGroupBox("面板四：UI设计文件")
+        self.ui_group = group
         form = QFormLayout(group)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.ui_file_edit = QLineEdit()
@@ -388,7 +423,13 @@ class PropertiesDock(QDockWidget):
         self.stop_bgm_chk.setChecked(bool(getattr(node, "stop_bgm", False)))
         self.bgm_loop_chk.setChecked(bool(getattr(node, "bgm_loop", True)))
         self.bg_fade_in_chk.setChecked(bool(getattr(node, "bg_fade_in", False)))
+        try:
+            self.bg_fade_duration_spin.setValue(float(getattr(node, "bg_fade_duration", 0.45)))
+        except Exception:
+            self.bg_fade_duration_spin.setValue(0.45)
         self.ui_file_edit.setText(getattr(node, "ui_file", ""))
+        if hasattr(self, "ui_group"):
+            self.ui_group.setVisible(True)
 
         # 选择/条件节点显示信息
         self.choice_speaker_edit.setText(getattr(node, "speaker", ""))
@@ -431,7 +472,11 @@ class PropertiesDock(QDockWidget):
         self.stop_bgm_chk.setChecked(False)
         self.bgm_loop_chk.setChecked(True)
         self.bg_fade_in_chk.setChecked(False)
+        if hasattr(self, "bg_fade_duration_spin"):
+            self.bg_fade_duration_spin.setValue(0.45)
         self.ui_file_edit.setText("")
+        if hasattr(self, "sub_ui_file_edit"):
+            self.sub_ui_file_edit.setText("")
         self.choice_speaker_edit.setText("")
         self.choice_text_edit.setPlainText("")
         self.choice_voice_edit.setText("")
@@ -467,9 +512,13 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit,
             self.sub_voice_edit,
             self.sub_portrait_edit,
+            self.sub_ui_file_edit,
             self.sub_hide_chk,
             self.sub_fade_chk,
             self.sub_fade_out_chk,
+            self.sub_fade_in_duration_spin,
+            self.sub_fade_out_duration_spin,
+            self.sub_auto_next_spin,
             self.option_list,
             self.add_option_btn,
             self.del_option_btn,
@@ -488,6 +537,7 @@ class PropertiesDock(QDockWidget):
             self.stop_bgm_chk,
             self.bgm_loop_chk,
             self.bg_fade_in_chk,
+            self.bg_fade_duration_spin,
             self.choice_speaker_edit,
             self.choice_text_edit,
             self.choice_voice_edit,
@@ -513,15 +563,31 @@ class PropertiesDock(QDockWidget):
         if isinstance(items, list):
             for item in items[: self.MAX_SUB_DIALOGUES]:
                 if isinstance(item, dict):
+                    try:
+                        fade_in_d = float(item.get("portrait_fade_duration", 0.4))
+                    except Exception:
+                        fade_in_d = 0.4
+                    try:
+                        fade_out_d = float(item.get("portrait_fade_out_duration", 0.4))
+                    except Exception:
+                        fade_out_d = 0.4
+                    try:
+                        auto_next = float(item.get("auto_next_seconds", 0.0))
+                    except Exception:
+                        auto_next = 0.0
                     self._sub_dialogues.append(
                         {
                             "speaker": item.get("speaker", ""),
                             "text": item.get("text", ""),
                             "voice": item.get("voice", ""),
                             "portrait": item.get("portrait", ""),
+                            "ui_file": item.get("ui_file", ""),
                             "hide_textbox": bool(item.get("hide_textbox", False)),
                             "portrait_fade": bool(item.get("portrait_fade", False)),
                             "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                            "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
+                            "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                            "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                         }
                     )
         self._refresh_sub_list(select_index=0 if self._sub_dialogues else -1)
@@ -807,6 +873,14 @@ class PropertiesDock(QDockWidget):
             flags.append("隐藏框")
         if item.get("portrait_fade"):
             flags.append("淡入")
+        if item.get("portrait_fade_out"):
+            flags.append("淡出")
+        try:
+            auto_next = float(item.get("auto_next_seconds", 0.0))
+        except Exception:
+            auto_next = 0.0
+        if auto_next and auto_next > 0:
+            flags.append(f"自动{auto_next:g}s")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         return f"{idx + 1}. {speaker} | {text_preview}{flag_str}"
 
@@ -818,7 +892,19 @@ class PropertiesDock(QDockWidget):
             self._update_add_button_state()
             return
         self._sub_dialogues.append(
-            {"speaker": "", "text": "", "voice": "", "portrait": "", "hide_textbox": False, "portrait_fade": False, "portrait_fade_out": False}
+            {
+                "speaker": "",
+                "text": "",
+                "voice": "",
+                "portrait": "",
+                "ui_file": "",
+                "hide_textbox": False,
+                "portrait_fade": False,
+                "portrait_fade_out": False,
+                "portrait_fade_duration": 0.4,
+                "portrait_fade_out_duration": 0.4,
+                "auto_next_seconds": 0.0,
+            }
         )
         self._refresh_sub_list(select_index=len(self._sub_dialogues) - 1)
         self._commit_sub_dialogues()
@@ -840,14 +926,23 @@ class PropertiesDock(QDockWidget):
         if row < 0 or row >= len(self._sub_dialogues):
             return
         src = self._sub_dialogues[row]
+        def _safe_float(val, default: float) -> float:
+            try:
+                return float(val)
+            except Exception:
+                return default
         copied = {
             "speaker": src.get("speaker", ""),
             "text": src.get("text", ""),
             "voice": src.get("voice", ""),
             "portrait": src.get("portrait", ""),
+            "ui_file": src.get("ui_file", ""),
             "hide_textbox": bool(src.get("hide_textbox", False)),
             "portrait_fade": bool(src.get("portrait_fade", False)),
             "portrait_fade_out": bool(src.get("portrait_fade_out", False)),
+            "portrait_fade_duration": _safe_float(src.get("portrait_fade_duration", 0.4), 0.4),
+            "portrait_fade_out_duration": _safe_float(src.get("portrait_fade_out_duration", 0.4), 0.4),
+            "auto_next_seconds": _safe_float(src.get("auto_next_seconds", 0.0), 0.0),
         }
         insert_at = min(row + 1, len(self._sub_dialogues))
         self._sub_dialogues.insert(insert_at, copied)
@@ -882,9 +977,13 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit.setPlainText("")
             self.sub_voice_edit.setText("")
             self.sub_portrait_edit.setText("")
+            self.sub_ui_file_edit.setText("")
             self.sub_hide_chk.setChecked(False)
             self.sub_fade_chk.setChecked(False)
             self.sub_fade_out_chk.setChecked(False)
+            self.sub_fade_in_duration_spin.setValue(0.4)
+            self.sub_fade_out_duration_spin.setValue(0.4)
+            self.sub_auto_next_spin.setValue(0.0)
             detail_enabled = False
         else:
             item = self._sub_dialogues[row]
@@ -892,18 +991,35 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit.setPlainText(item.get("text", ""))
             self.sub_voice_edit.setText(item.get("voice", ""))
             self.sub_portrait_edit.setText(item.get("portrait", ""))
+            self.sub_ui_file_edit.setText(item.get("ui_file", ""))
             self.sub_hide_chk.setChecked(bool(item.get("hide_textbox", False)))
             self.sub_fade_chk.setChecked(bool(item.get("portrait_fade", False)))
             self.sub_fade_out_chk.setChecked(bool(item.get("portrait_fade_out", False)))
+            try:
+                self.sub_fade_in_duration_spin.setValue(float(item.get("portrait_fade_duration", 0.4)))
+            except Exception:
+                self.sub_fade_in_duration_spin.setValue(0.4)
+            try:
+                self.sub_fade_out_duration_spin.setValue(float(item.get("portrait_fade_out_duration", 0.4)))
+            except Exception:
+                self.sub_fade_out_duration_spin.setValue(0.4)
+            try:
+                self.sub_auto_next_spin.setValue(float(item.get("auto_next_seconds", 0.0)))
+            except Exception:
+                self.sub_auto_next_spin.setValue(0.0)
             detail_enabled = True
         for widget in [
             self.sub_speaker_edit,
             self.sub_text_edit,
             self.sub_voice_edit,
             self.sub_portrait_edit,
+            self.sub_ui_file_edit,
             self.sub_hide_chk,
             self.sub_fade_chk,
             self.sub_fade_out_chk,
+            self.sub_fade_in_duration_spin,
+            self.sub_fade_out_duration_spin,
+            self.sub_auto_next_spin,
         ]:
             widget.setEnabled(detail_enabled)
         self._sub_editing = False
@@ -919,9 +1035,13 @@ class PropertiesDock(QDockWidget):
         item["text"] = self.sub_text_edit.toPlainText()
         item["voice"] = self.sub_voice_edit.text()
         item["portrait"] = self.sub_portrait_edit.text()
+        item["ui_file"] = self.sub_ui_file_edit.text()
         item["hide_textbox"] = bool(self.sub_hide_chk.isChecked())
         item["portrait_fade"] = bool(self.sub_fade_chk.isChecked())
         item["portrait_fade_out"] = bool(self.sub_fade_out_chk.isChecked())
+        item["portrait_fade_duration"] = float(self.sub_fade_in_duration_spin.value())
+        item["portrait_fade_out_duration"] = float(self.sub_fade_out_duration_spin.value())
+        item["auto_next_seconds"] = float(self.sub_auto_next_spin.value())
         self.sub_list.item(row).setText(self._sub_display_text(item, row))
         self._commit_sub_dialogues()
 
@@ -1107,6 +1227,18 @@ class PropertiesDock(QDockWidget):
         self.sub_portrait_edit.setText("")
         self._on_sub_detail_changed()
 
+    def _pick_sub_ui_file(self):
+        file_path = self._choose_file("选择子节点UI设计文件", "UI布局 (*.json)", "ui")
+        if not file_path:
+            return
+        stored = self._store_into_project(file_path, "ui")
+        self.sub_ui_file_edit.setText(stored)
+        self._on_sub_detail_changed()
+
+    def _clear_sub_ui_file(self):
+        self.sub_ui_file_edit.setText("")
+        self._on_sub_detail_changed()
+
     # ------- 其他控制 -------
     def _clear_field(self, line_edit: QLineEdit, setter_name: str):
         line_edit.setText("")
@@ -1124,6 +1256,10 @@ class PropertiesDock(QDockWidget):
     def _on_bg_fade_in_changed(self, _state):
         if self._current_node and hasattr(self._current_node, "set_bg_fade_in") and not self._updating:
             self._current_node.set_bg_fade_in(bool(self.bg_fade_in_chk.isChecked()))
+
+    def _on_bg_fade_duration_changed(self, _value):
+        if self._current_node and hasattr(self._current_node, "set_bg_fade_duration") and not self._updating:
+            self._current_node.set_bg_fade_duration(float(self.bg_fade_duration_spin.value()))
 
     def _set_type_index(self, node_type: str):
         idx = {"text": 0, "choice": 1, "condition": 2}.get(node_type, 0)

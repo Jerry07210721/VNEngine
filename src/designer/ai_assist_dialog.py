@@ -44,7 +44,8 @@ class AIAssistDialog(QDialog):
     def __init__(self, config_manager: Optional[ConfigManager] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("AI 辅助配置")
-        self.resize(960, 720)
+        # AI辅助界面默认窗口大小：1280x720
+        self.resize(1280, 720)
         self.config_manager = config_manager or ConfigManager()
 
         self.tabs = QTabWidget(self)

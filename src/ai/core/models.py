@@ -5,7 +5,7 @@ VNEngine 多智能体协作系统 - 数据模型定义
 """
 
 from typing import List, Dict, Optional, Any, Literal
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, model_validator
 from datetime import datetime
 
 
@@ -25,10 +25,13 @@ class StoryConfig(BaseModel):
     title: str = Field(..., description="故事标题")
     style: str = Field(..., description="故事风格（如：日系校园、纯爱、治愈）")
     plot_outline: str = Field(..., description="剧情梗概")
-    text_volume: int = Field(..., description="文本量（字数）", ge=1000, le=100000)
+    # 长篇故事：放宽上限（由 UI/提示词控制实际生成规模）
+    text_volume: int = Field(..., description="文本量（字数）", ge=1000, le=500000)
     chapter_count: int = Field(5, description="章节数量", ge=1, le=100)
-    enable_choice_node: bool = Field(True, description="是否开启选择节点")
-    enable_condition_node: bool = Field(True, description="是否开启条件节点")
+    enable_choice_node: bool = Field(False, description="是否开启选择节点（仅在开启多分支时可用）")
+    enable_condition_node: bool = Field(False, description="是否开启条件节点（仅在开启多分支时可用）")
+    enable_multi_branch: bool = Field(False, description="是否开启多分支章节规划（允许并行路线/多结局）")
+    enable_single_route: bool = Field(False, description="是否启用单线叙事（禁止章节级分支/并行路线）")
     condition_type: str = Field("favorability", description="条件类型（如：好感度）")
     character_hint_weight: float = Field(0.7, ge=0.0, le=1.0, description="角色设定遵循用户配置的权重(0-1)")
     narrative_pov: Literal["first", "third"] = Field("third", description="叙述视角：第一人称/第三人称")
@@ -38,6 +41,22 @@ class StoryConfig(BaseModel):
     first_person_cg_presence: bool = Field(True, description="第一人称是否会出现在CG中")
     first_person_cg_notes: str = Field("", description="第一人称在CG中的表现说明")
     cg_count: int = Field(0, description="每章目标CG数量（用于章节详稿标注）", ge=0, le=20)
+
+    @model_validator(mode="after")
+    def _enforce_story_mode_constraints(self):
+        """强制配置互斥/依赖规则：
+
+        - 单线叙事与多分支互斥：如果同时为 True，优先保留单线叙事并关闭多分支。
+        - 只有开启多分支，才能启用选择/条件节点；否则强制关闭。
+        """
+        if bool(self.enable_single_route) and bool(self.enable_multi_branch):
+            self.enable_multi_branch = False
+
+        if not bool(self.enable_multi_branch):
+            self.enable_choice_node = False
+            self.enable_condition_node = False
+
+        return self
 
     # 语音合成（GPT-SoVITS）相关配置
     voice_tts_style: str = Field("2", description="语音模型版本 style：1=普遍模型, 2=专业模型, 3=多语言模型")
@@ -182,6 +201,7 @@ class FlowNodeData(BaseModel):
     bgm_loop: bool = Field(True, description="BGM是否循环")
     stop_bgm: bool = Field(False, description="是否停止BGM")
     bg_fade_in: bool = Field(False, description="背景是否淡入")
+    bg_fade_duration: float = Field(0.45, description="背景淡入时长（秒）", ge=0.0, le=10.0)
     portrait_fade: bool = Field(False, description="立绘是否淡入")
     portrait_fade_out: bool = Field(False, description="立绘是否淡出")
     hide_textbox: bool = Field(False, description="是否隐藏文本框")
@@ -240,6 +260,16 @@ class GenerationHistory(BaseModel):
     step2_outline: Optional[Dict[str, Any]] = Field(None, description="步骤2：故事大纲")
     # 章节列表使用结构化字典（包含 raw_response/structured/parameters 等），而非纯列表，便于保存上下文
     step3_chapters: Optional[Dict[str, Any]] = Field(None, description="步骤3：章节列表")
+    # 主控面板每步可独立配置的 max_tokens（用于长文本生成）；UI 侧限制最大 64000
+    step_max_tokens: Dict[str, int] = Field(
+        default_factory=lambda: {
+            "step1": 32000,
+            "step2": 48000,
+            "step3": 48000,
+            "step4": 64000,
+        },
+        description="各步骤 LLM max_tokens 上限配置（step1..step4）",
+    )
     step4_chapter_details: Optional[List[Dict[str, Any]]] = Field(None, description="步骤4：章节详细内容")
     step5_full_script: Optional[Dict[str, Any]] = Field(None, description="步骤5：完整剧本")
     step5_flow_nodes: Optional[Dict[str, Any]] = Field(None, description="步骤5：流程节点数据")
@@ -304,6 +334,8 @@ class VoicePendingItem(BaseModel):
     speaker: str = Field(..., description="说话人")
     char_id: str = Field(..., description="角色ID")
     text: str = Field(..., description="对白文本")
+    # 第二语言对白：用于批量翻译/多语言语音生成（默认空）
+    second_text: Optional[str] = Field(None, description="第二语言对白（翻译后文本，默认空）")
     emotion: str = Field("平静", description="语气情绪")
     voice_model_id: Optional[str] = Field(None, description="音色模型ID")
 
@@ -353,6 +385,17 @@ class PendingLists(BaseModel):
     voices: List[VoicePendingItem] = Field(default_factory=list)
     bgms: List[BGMPendingItem] = Field(default_factory=list)
 
+    # 语音面板：选择“使用原文/第二语言”来生成语音
+    voice_text_mode: Literal["original", "second"] = Field(
+        default="original",
+        description="语音生成时对白来源：original=使用 text；second=优先使用 second_text（为空则回退 text）",
+    )
+
+    # 语音面板：批量翻译（LLM）相关输入/结果的持久化
+    voice_translation_target_language: str = Field("", description="语音批量翻译：目标语言（用户输入）")
+    voice_translation_instruction: str = Field("", description="语音批量翻译：指令文本（可编辑）")
+    voice_translation_result: str = Field("", description="语音批量翻译：LLM 返回结果（可编辑/持久化）")
+
 
 class AIProject(BaseModel):
     """AI辅助工程完整数据模型（.vnai文件格式）"""
@@ -376,6 +419,6 @@ def validate_text_volume(cls, v):
         raise ValueError("文本量必须为整数")
     if v < 1000:
         raise ValueError("文本量不能少于1000字")
-    if v > 100000:
-        raise ValueError("文本量不能超过100000字")
+    if v > 500000:
+        raise ValueError("文本量不能超过500000字")
     return v

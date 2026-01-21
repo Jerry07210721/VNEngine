@@ -27,14 +27,18 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QFileDialog,
     QDialog,
+    QScrollArea,
+    QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
 import json
+import yaml
 
 from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
 from src.ai.core.models import PendingLists, VoicePendingItem, TaskAssignment
+from src.ai.api.api_manager import APIManager
 from src.ai.agents.voice_agent import VoiceAgent
 from src.designer.async_elapsed_runner import AsyncElapsedRunner
 from src.ai.utils.voice_emotion import emotion_to_ext, normalize_ext, EXT_KEYS
@@ -51,6 +55,7 @@ class AIVoicePanel(QWidget):
         super().__init__(parent)
         self.project_manager = project_manager
         self.config_manager = config_manager
+        self.api_manager = APIManager(self.config_manager)
         self.pending_items: List[VoicePendingItem] = []
         self.current_item: Optional[VoicePendingItem] = None
         self.voice_agent: Optional[VoiceAgent] = None
@@ -98,12 +103,15 @@ class AIVoicePanel(QWidget):
         header.addStretch(1)
         layout.addLayout(header)
 
-        main = QHBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
         self.list_widget = QListWidget()
         self.list_widget.itemSelectionChanged.connect(self.on_item_selected)
-        main.addWidget(self.list_widget, 2)
+        splitter.addWidget(self.list_widget)
 
-        right = QVBoxLayout()
+        right_container = QWidget()
+        right = QVBoxLayout(right_container)
 
         info_group = QGroupBox("语音详情")
         form = QFormLayout()
@@ -119,6 +127,14 @@ class AIVoicePanel(QWidget):
         self.model_combo.addItem("GPT-SoVITS", "gptsovits")
         self.model_combo.setEnabled(False)
         form.addRow("模型", self.model_combo)
+
+        # 语音生成文本来源（原文/第二语言）
+        self.voice_text_mode_combo = QComboBox()
+        self.voice_text_mode_combo.addItem("应用原对白", "original")
+        self.voice_text_mode_combo.addItem("应用第二语言", "second")
+        self.voice_text_mode_combo.setToolTip("选择语音合成默认使用的对白文本来源；若第二语言为空将自动回退原文")
+        self.voice_text_mode_combo.currentIndexChanged.connect(self._sync_voice_text_mode_to_project)
+        form.addRow("对白来源", self.voice_text_mode_combo)
         self.tts_style_combo = QComboBox()
         self.tts_style_combo.addItem("1 普遍模型", "1")
         self.tts_style_combo.addItem("2 专业模型", "2")
@@ -219,11 +235,21 @@ class AIVoicePanel(QWidget):
         info_group.setLayout(form)
         right.addWidget(info_group)
 
+        preview_group = QGroupBox("对白预览")
+        preview_layout = QVBoxLayout()
         self.text_preview = QTextEdit()
         self.text_preview.setReadOnly(True)
-        self.text_preview.setPlaceholderText("对白预览")
-        self.text_preview.setFixedHeight(100)
-        right.addWidget(self.text_preview)
+        self.text_preview.setPlaceholderText("原对白预览")
+        self.text_preview.setFixedHeight(80)
+        preview_layout.addWidget(self.text_preview)
+
+        self.second_text_preview = QTextEdit()
+        self.second_text_preview.setReadOnly(True)
+        self.second_text_preview.setPlaceholderText("第二语言预览（为空表示尚未翻译/未填写）")
+        self.second_text_preview.setFixedHeight(80)
+        preview_layout.addWidget(self.second_text_preview)
+        preview_group.setLayout(preview_layout)
+        right.addWidget(preview_group)
 
         prompt_group = QGroupBox("提示词/文本")
         prompt_layout = QVBoxLayout()
@@ -242,6 +268,48 @@ class AIVoicePanel(QWidget):
         prompt_layout.addLayout(btn_row)
         prompt_group.setLayout(prompt_layout)
         right.addWidget(prompt_group)
+
+        # ==================== 批量翻译（第二语言） ====================
+        translate_group = QGroupBox("批量翻译为第二语言（LLM）")
+        translate_layout = QVBoxLayout()
+
+        tl_form = QFormLayout()
+        self.voice_translate_target_edit = QLineEdit()
+        self.voice_translate_target_edit.setPlaceholderText("如：英语 / 日语 / 韩语 / 西班牙语...")
+        tl_form.addRow("目标语言", self.voice_translate_target_edit)
+
+        self.voice_translate_instruction_edit = QTextEdit()
+        self.voice_translate_instruction_edit.setPlaceholderText("生成指令后可手动微调")
+        self.voice_translate_instruction_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.voice_translate_instruction_edit.setFixedHeight(120)
+        tl_form.addRow("指令", self.voice_translate_instruction_edit)
+
+        self.voice_translate_result_edit = QTextEdit()
+        self.voice_translate_result_edit.setPlaceholderText("LLM 返回结果会显示在这里；可手动修改后保存/应用")
+        self.voice_translate_result_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.voice_translate_result_edit.setFixedHeight(140)
+        tl_form.addRow("结果", self.voice_translate_result_edit)
+
+        translate_layout.addLayout(tl_form)
+
+        tl_btn_row = QHBoxLayout()
+        self.voice_translate_build_btn = QPushButton("生成指令")
+        self.voice_translate_build_btn.clicked.connect(self._build_voice_translate_instruction)
+        self.voice_translate_call_btn = QPushButton("调用LLM翻译")
+        self.voice_translate_call_btn.clicked.connect(self._call_llm_translate_voices)
+        self.voice_translate_save_btn = QPushButton("保存结果")
+        self.voice_translate_save_btn.clicked.connect(self._save_voice_translate_fields)
+        self.voice_translate_apply_btn = QPushButton("应用到第二语言")
+        self.voice_translate_apply_btn.clicked.connect(self._apply_voice_translate_result)
+        tl_btn_row.addWidget(self.voice_translate_build_btn)
+        tl_btn_row.addWidget(self.voice_translate_call_btn)
+        tl_btn_row.addWidget(self.voice_translate_save_btn)
+        tl_btn_row.addWidget(self.voice_translate_apply_btn)
+        tl_btn_row.addStretch(1)
+        translate_layout.addLayout(tl_btn_row)
+
+        translate_group.setLayout(translate_layout)
+        right.addWidget(translate_group)
 
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
@@ -283,8 +351,16 @@ class AIVoicePanel(QWidget):
         right.addWidget(self.progress_label)
         right.addStretch(1)
 
-        main.addLayout(right, 3)
-        layout.addLayout(main)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setWidget(right_container)
+        splitter.addWidget(right_scroll)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
 
         # 语音TTS设置：变更时自动写回 story_config，便于 .vnai 持久化。
         self.tts_style_combo.currentIndexChanged.connect(self._sync_voice_tts_settings_to_project)
@@ -336,6 +412,24 @@ class AIVoicePanel(QWidget):
 
         self.project_label.setText(f"工程：{project.ai_project_info.name}")
         pending_lists: PendingLists = project.pending_lists or PendingLists()
+
+        # 恢复语音文本来源与翻译面板输入/结果
+        try:
+            self.voice_text_mode_combo.blockSignals(True)
+            mode = getattr(pending_lists, "voice_text_mode", "original") or "original"
+            idx = self.voice_text_mode_combo.findData(mode)
+            if idx >= 0:
+                self.voice_text_mode_combo.setCurrentIndex(idx)
+        finally:
+            self.voice_text_mode_combo.blockSignals(False)
+
+        try:
+            self.voice_translate_target_edit.setText(getattr(pending_lists, "voice_translation_target_language", "") or "")
+            self.voice_translate_instruction_edit.setPlainText(getattr(pending_lists, "voice_translation_instruction", "") or "")
+            self.voice_translate_result_edit.setPlainText(getattr(pending_lists, "voice_translation_result", "") or "")
+        except Exception:
+            pass
+
         self.pending_items = list(pending_lists.voices or [])
         self._populate_list()
         if self.pending_items:
@@ -353,7 +447,10 @@ class AIVoicePanel(QWidget):
             text = f"{item.node_id} | {item.speaker} | {item.emotion} | {item.status} | {style_part} {genre_part}"
             lw = QListWidgetItem(text)
             lw.setData(Qt.ItemDataRole.UserRole, item.item_id)
-            lw.setToolTip(item.text)
+            tip = f"原对白：{item.text}"
+            if getattr(item, "second_text", None):
+                tip += f"\n第二语言：{item.second_text}"
+            lw.setToolTip(tip)
             self.list_widget.addItem(lw)
 
     def on_item_selected(self):
@@ -380,7 +477,9 @@ class AIVoicePanel(QWidget):
         self.emotion_label.setText(item.emotion)
         self.status_label.setText(item.status)
         self.text_preview.setPlainText(item.text)
-        prompt_text = item.prompt or self._default_prompt(item)
+        if hasattr(self, "second_text_preview"):
+            self.second_text_preview.setPlainText(getattr(item, "second_text", "") or "")
+        prompt_text = self._display_prompt_text(item)
         self.prompt_edit.setPlainText(prompt_text)
         self.path_edit.setText(self._resource_path(item.file_path or f"resources/voices/{item.char_id}/{item.voice_id}.mp3").as_posix())
         self.file_label.setText(f"文件：{item.file_path or '待生成'}")
@@ -500,7 +599,60 @@ class AIVoicePanel(QWidget):
     # ==================== 工具 ====================
     def _default_prompt(self, item: VoicePendingItem) -> str:
         # 这里的“提示词/文本”就是要合成的对白文本，不要把情绪标签拼进内容里。
+        # 根据全局选择：优先 second_text（为空则回退 text）。
+        mode = self._get_voice_text_mode()
+        if mode == "second":
+            txt2 = (getattr(item, "second_text", None) or "").strip()
+            if txt2:
+                return txt2
         return item.text or ""
+
+    def _is_custom_prompt(self, item: VoicePendingItem) -> bool:
+        """判定条目 prompt 是否是用户手动定制过的文本。
+
+        规则：若 prompt 为空 => 非自定义；若 prompt 等于原文或等于 second_text => 视为“自动默认”，可随全局切换。
+        只有当 prompt 与两者都不相等时，认为是自定义。
+        """
+        p = (item.prompt or "").strip()
+        if not p:
+            return False
+        if p == (item.text or "").strip():
+            return False
+        if p == (getattr(item, "second_text", None) or "").strip():
+            return False
+        return True
+
+    def _display_prompt_text(self, item: VoicePendingItem) -> str:
+        if self._is_custom_prompt(item):
+            return item.prompt or ""
+        return self._default_prompt(item)
+
+    def _spoken_text_for_generation(self, item: VoicePendingItem) -> str:
+        """批量生成使用的 spoken_text：自定义 prompt 优先，否则随全局对白来源。"""
+        if self._is_custom_prompt(item):
+            return (item.prompt or "").strip()
+        return self._default_prompt(item).strip()
+
+    def _get_voice_text_mode(self) -> str:
+        project = self.project_manager.current_project
+        if not project or not project.pending_lists:
+            return "original"
+        mode = getattr(project.pending_lists, "voice_text_mode", "original") or "original"
+        return "second" if str(mode).strip().lower() == "second" else "original"
+
+    def _sync_voice_text_mode_to_project(self):
+        project = self.project_manager.current_project
+        if not project:
+            return
+        if project.pending_lists is None:
+            project.pending_lists = PendingLists()
+        mode = self.voice_text_mode_combo.currentData() or "original"
+        project.pending_lists.voice_text_mode = "second" if str(mode).strip().lower() == "second" else "original"
+        self.project_manager.update_pending_lists(project.pending_lists)
+        self.modified.emit()
+        # 切换后刷新当前详情的默认文本/预览
+        if self.current_item:
+            self._show_item(self.current_item)
 
     def _ensure_project(self) -> bool:
         if self.project_manager.current_project is None:
@@ -700,7 +852,7 @@ class AIVoicePanel(QWidget):
             for item in pending:
                 if not self._auto_running:
                     break
-                spoken_text = item.prompt or self._default_prompt(item)
+                spoken_text = self._spoken_text_for_generation(item)
 
                 # 条目覆盖优先
                 style = item.tts_style or default_style
@@ -843,9 +995,227 @@ class AIVoicePanel(QWidget):
         project = self.project_manager.current_project
         if project is None:
             return
+        if project.pending_lists is None:
+            project.pending_lists = PendingLists()
+
         project.pending_lists.voices = self.pending_items
+        # 同步语音文本来源与翻译字段（避免只保存 voices 时丢失）
+        try:
+            mode = self.voice_text_mode_combo.currentData() if hasattr(self, "voice_text_mode_combo") else None
+            project.pending_lists.voice_text_mode = "second" if str(mode).strip().lower() == "second" else "original"
+            project.pending_lists.voice_translation_target_language = self.voice_translate_target_edit.text().strip()
+            project.pending_lists.voice_translation_instruction = self.voice_translate_instruction_edit.toPlainText()
+            project.pending_lists.voice_translation_result = self.voice_translate_result_edit.toPlainText()
+        except Exception:
+            pass
+
         self.project_manager.update_pending_lists(project.pending_lists)
         self.modified.emit()
+
+    # ==================== 批量翻译（LLM） ====================
+
+    def _build_voice_translate_instruction(self):
+        if not self._ensure_project():
+            return
+        target = self.voice_translate_target_edit.text().strip()
+        if not target:
+            QMessageBox.warning(self, "提示", "请先填写目标语言。")
+            return
+
+        # 仅打包翻译所需最小字段，避免 token 爆炸。
+        items = []
+        for it in self.pending_items:
+            items.append(
+                {
+                    "item_id": it.item_id,
+                    "speaker": it.speaker,
+                    "emotion": it.emotion,
+                    "text": it.text,
+                }
+            )
+
+        payload = json.dumps({"voices": items}, ensure_ascii=False, indent=2)
+
+        instruction = f"""你是资深 Galgame 本地化翻译与对白润色专家。
+
+任务：把下面 voices 列表中每条对白的 text 翻译为【{target}】，并把翻译写入 second_text 字段。
+
+关键要求（必须遵守）：
+1) 保持 Galgame 对白风格：自然口语、符合情绪（emotion），保留停顿/省略号/感叹号等语气，不一定需要逐字直译，可适当意译以符合目标语言习惯。
+2) 不要翻译 speaker（角色名），不要改动 item_id。
+3) 输出必须严格为 JSON（只输出 JSON，不要解释），结构如下：
+   {{
+     "voices": [
+       {{"item_id": "voice_item_00001", "second_text": "..."}}
+     ]
+   }}
+4) voices 数量必须与输入一致，且顺序保持一致。
+5) 若原文包含称呼/人名/专有名词：优先使用目标语言常见译法；如不确定请音译但保持一致。
+
+输入 voices：
+{payload}
+"""
+
+        self.voice_translate_instruction_edit.setPlainText(instruction)
+        self._save_voice_translate_fields(silent=True)
+
+    def _get_llm_client(self):
+        try:
+            return self.api_manager.get_llm_client(prefer_claude=True)
+        except Exception:
+            return None
+
+    def _extract_llm_text(self, response: dict) -> str:
+        content = (response or {}).get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for blk in content:
+                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                    parts.append(blk.get("text"))
+            return "".join(parts)
+        if isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+
+    def _call_llm_translate_voices(self):
+        if self._is_busy or not self._ensure_project():
+            return
+        prompt = self.voice_translate_instruction_edit.toPlainText().strip()
+        if not prompt:
+            QMessageBox.warning(self, "提示", "请先生成/填写指令。")
+            return
+
+        client = self._get_llm_client()
+        if not client:
+            QMessageBox.warning(self, "提示", "未配置可用的 LLM（Claude/Kimi）。请先在 API 配置中设置。")
+            return
+
+        self._is_busy = True
+        self.voice_translate_call_btn.setEnabled(False)
+
+        def _do_work():
+            resp = client.create_message(
+                messages=[{"role": "user", "content": prompt}],
+                system="你只输出严格 JSON。",
+                temperature=0.2,
+                max_tokens=32000,
+            )
+            return resp
+
+        def _on_success(resp):
+            text = self._extract_llm_text(resp if isinstance(resp, dict) else {})
+            self.voice_translate_result_edit.setPlainText(text)
+            self._save_voice_translate_fields(silent=True)
+            self.progress_label.setText("状态：翻译结果已返回")
+
+        def _on_finally():
+            self._is_busy = False
+            self.voice_translate_call_btn.setEnabled(True)
+
+        started = self._runner.run(
+            label=self.progress_label,
+            base_text="状态：翻译中...",
+            fn=_do_work,
+            on_success=_on_success,
+            on_finally=_on_finally,
+        )
+        if not started:
+            self._is_busy = False
+            self.voice_translate_call_btn.setEnabled(True)
+            QMessageBox.information(self, "提示", "已有任务在运行，请稍候。")
+
+    def _strip_code_fence(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        s = text.strip()
+        if "```" not in s:
+            return s
+        # 尽量取第一个 fenced block 的内容
+        try:
+            _, after = s.split("```", 1)
+            payload, _ = after.split("```", 1)
+            # 去掉可能的语言标识行
+            first, sep, rest = payload.lstrip().partition("\n")
+            if first.strip().lower() in {"json", "yaml", "yml"}:
+                return rest.strip()
+            return payload.strip()
+        except Exception:
+            return s
+
+    def _parse_translate_result(self, text: str):
+        raw = self._strip_code_fence(text)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            try:
+                return yaml.safe_load(raw)
+            except Exception:
+                return None
+
+    def _apply_voice_translate_result(self):
+        if not self._ensure_project():
+            return
+        parsed = self._parse_translate_result(self.voice_translate_result_edit.toPlainText())
+        if parsed is None:
+            QMessageBox.warning(self, "提示", "结果无法解析为 JSON/YAML。请确保输出是结构化 voices 列表。")
+            return
+
+        voices = None
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("voices"), list):
+                voices = parsed.get("voices")
+            elif isinstance(parsed.get("pending_lists"), dict) and isinstance((parsed.get("pending_lists") or {}).get("voices"), list):
+                voices = (parsed.get("pending_lists") or {}).get("voices")
+        elif isinstance(parsed, list):
+            voices = parsed
+
+        if not isinstance(voices, list):
+            QMessageBox.warning(self, "提示", "未找到 voices 列表。期望形如 {\"voices\": [...]}。")
+            return
+
+        key_candidates = ["second_text", "text_second", "text2", "translated", "translation", "second_language"]
+        mapping = {}
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            item_id = str(v.get("item_id") or "").strip()
+            if not item_id:
+                continue
+            val = None
+            for k in key_candidates:
+                if v.get(k) is not None:
+                    val = v.get(k)
+                    break
+            if isinstance(val, str):
+                mapping[item_id] = val
+
+        if not mapping:
+            QMessageBox.warning(self, "提示", "未从结果中提取到 second_text。请确认每条包含 item_id + second_text 字段。")
+            return
+
+        applied = 0
+        for it in self.pending_items:
+            if it.item_id in mapping:
+                it.second_text = mapping[it.item_id]
+                applied += 1
+
+        self._persist_pending_lists()
+        self._refresh_list_texts()
+        if self.current_item:
+            self._show_item(self.current_item)
+        self.progress_label.setText(f"状态：已回填第二语言 {applied}/{len(self.pending_items)}")
+
+    def _save_voice_translate_fields(self, silent: bool = False):
+        if not self._ensure_project():
+            return
+        self._persist_pending_lists()
+        if not silent:
+            self.progress_label.setText("状态：翻译面板内容已保存")
 
     def _refresh_list_texts(self):
         for i in range(self.list_widget.count()):

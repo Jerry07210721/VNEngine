@@ -71,29 +71,47 @@ class CGAgent:
                 time_cost=time.time() - start_time,
             )
 
-    def build_prompt(self, description: str, characters: List[str], atmosphere: str) -> str:
+    def build_prompt(
+        self,
+        scene_description: str,
+        characters: List[str],
+        atmosphere: str,
+        use_reference_images: bool = False,
+    ) -> str:
         chars = ", ".join([c for c in (characters or []) if c])
-        atmos = atmosphere or ""
+        atmos = (atmosphere or "").strip()
         role_part = f"characters: {chars}" if chars else "characters: (not specified)"
+        scene_desc = (scene_description or "").strip() or "(please describe the scene in detail)"
+        consistency = (
+            "STRICT consistency with provided reference character images: same face, same hairstyle, same outfit, same proportions, same color palette. "
+            "Do NOT redesign the character. "
+            if use_reference_images
+            else ""
+        )
+
+        # 预留“用户可编辑的画面描述”段，便于 UI 直接展示并让用户修改
         return (
-            "visual novel event CG, "
-            f"{description}, {role_part}, {atmos}, "
-            "anime style, cinematic lighting, dramatic composition, depth of field, "
-            "highly detailed illustration, high quality game art, clean background, "
-            "no subtitles, no text, no watermark, no logo"
+            "visual novel event CG, anime style, cinematic lighting, dramatic composition, depth of field, highly detailed illustration, high quality game art. "
+            f"{role_part}. "
+            f"atmosphere: {atmos}. "
+            f"SCENE DESCRIPTION (user editable): {scene_desc}. "
+            f"{consistency}"
+            "clean background (if appropriate), no subtitles, no on-screen text, no watermark, no logo"
         )
 
     def _generate_single_cg(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         cg_id = parameters.get("cg_id") or "cg"
-        description = parameters.get("description", "")
+        # 画面详细描述（建议在 UI 中暴露给用户编辑）
+        description = parameters.get("scene_description") or parameters.get("description", "")
         characters = parameters.get("characters", []) or []
         atmosphere = parameters.get("atmosphere", "")
-        prompt = parameters.get("prompt") or self.build_prompt(description, characters, atmosphere)
+        prompt = parameters.get("prompt")
         aspect = parameters.get("aspect", "16:9")
         model_choice = parameters.get("model") or "flux"
         flux_model = parameters.get("flux_model")
         flux_mode = parameters.get("flux_mode")
         flux_num = parameters.get("flux_num")
+        flux_size = parameters.get("flux_size")
         ref_image_paths = parameters.get("reference_images") or []
         project_root = self._project_root(parameters)
 
@@ -108,6 +126,9 @@ class CGAgent:
         else:
             ref_images = self._load_reference_portraits(project_root, characters)
 
+        if not (isinstance(prompt, str) and prompt.strip()):
+            prompt = self.build_prompt(description, characters, atmosphere, use_reference_images=bool(ref_images))
+
         flux_params: Dict[str, Any] = {"aspect": aspect}
         if flux_num is not None:
             try:
@@ -116,6 +137,10 @@ class CGAgent:
                 pass
         if flux_mode:
             flux_params["mode"] = str(flux_mode)
+        if flux_size is not None and str(flux_size).strip():
+            size_str = str(flux_size).strip().upper()
+            if size_str in {"1MP", "2MP", "4MP"}:
+                flux_params["size"] = size_str
 
         file_path = self._generate_and_download(
             prompt=prompt,

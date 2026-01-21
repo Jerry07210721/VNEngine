@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QTextEdit,
+    QSpinBox,
     QGroupBox,
     QWidget,
     QComboBox,
@@ -83,6 +84,62 @@ class AIMasterControlPanel(QWidget):
         self.init_ui()
         self.refresh()
 
+    # ==================== max_tokens（每步持久化） ====================
+
+    def _default_step_max_tokens(self) -> dict:
+        try:
+            return dict(getattr(StepGenerator, "DEFAULT_STEP_MAX_TOKENS", {}) or {})
+        except Exception:
+            return {"step1": 32000, "step2": 48000, "step3": 48000, "step4": 64000}
+
+    def _hard_cap_max_tokens(self) -> int:
+        try:
+            return int(getattr(StepGenerator, "MAX_TOKENS_HARD_CAP", 64000) or 64000)
+        except Exception:
+            return 64000
+
+    def _get_step_max_tokens(self, step_key: str) -> int:
+        defaults = self._default_step_max_tokens()
+        hard_cap = self._hard_cap_max_tokens()
+        value = int(defaults.get(step_key, 32000))
+
+        project = self.project_manager.current_project
+        if project is not None:
+            gh = getattr(project, "generation_history", None)
+            stored = getattr(gh, "step_max_tokens", None) if gh else None
+            if isinstance(stored, dict) and stored.get(step_key) is not None:
+                try:
+                    value = int(stored.get(step_key))
+                except Exception:
+                    pass
+
+        if value <= 0:
+            value = int(defaults.get(step_key, 32000))
+        if value > hard_cap:
+            value = hard_cap
+        return value
+
+    def _set_step_max_tokens(self, step_key: str, value: int) -> None:
+        project = self.project_manager.current_project
+        if project is None:
+            return
+        hard_cap = self._hard_cap_max_tokens()
+        try:
+            value = int(value)
+        except Exception:
+            return
+        if value <= 0:
+            return
+        if value > hard_cap:
+            value = hard_cap
+
+        gh = project.generation_history
+        if not isinstance(getattr(gh, "step_max_tokens", None), dict):
+            gh.step_max_tokens = {}
+        gh.step_max_tokens[step_key] = value
+        project.update_modified_time()
+        self.modified.emit()
+
     # ==================== 异步执行辅助 ====================
 
     def _update_elapsed_label(self):
@@ -151,6 +208,7 @@ class AIMasterControlPanel(QWidget):
         # 步骤1：人设
         self.step1_group = self._build_step_box(
             title="步骤1：生成角色人设",
+            step_key="step1",
             prepare_handler=self.prepare_personas,
             send_handler=self.send_personas,
             save_handler=self.save_personas_result,
@@ -161,6 +219,7 @@ class AIMasterControlPanel(QWidget):
         # 步骤2：故事大纲
         self.step2_group = self._build_step_box(
             title="步骤2：生成故事大纲",
+            step_key="step2",
             prepare_handler=self.prepare_outline,
             send_handler=self.send_outline,
             save_handler=self.save_outline_result,
@@ -171,6 +230,7 @@ class AIMasterControlPanel(QWidget):
         # 步骤3：章节列表
         self.step3_group = self._build_step_box(
             title="步骤3：生成章节列表",
+            step_key="step3",
             prepare_handler=self.prepare_chapters,
             send_handler=self.send_chapters,
             save_handler=self.save_chapters_result,
@@ -203,6 +263,17 @@ class AIMasterControlPanel(QWidget):
         btn_row.addWidget(self.step4_prepare_btn)
         btn_row.addWidget(self.step4_send_btn)
         btn_row.addWidget(self.step4_save_btn)
+
+        self.step4_max_tokens_label = QLabel("maxTokens：")
+        self.step4_max_tokens_spin = QSpinBox()
+        self.step4_max_tokens_spin.setRange(1, self._hard_cap_max_tokens())
+        self.step4_max_tokens_spin.setSingleStep(1000)
+        self.step4_max_tokens_spin.setValue(self._get_step_max_tokens("step4"))
+        self.step4_max_tokens_spin.setToolTip("步骤4 每次调用 LLM 的 max_tokens（最大 64000）")
+        self.step4_max_tokens_spin.valueChanged.connect(lambda v: self._set_step_max_tokens("step4", v))
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self.step4_max_tokens_label)
+        btn_row.addWidget(self.step4_max_tokens_spin)
         btn_row.addStretch(1)
         step4_layout.addLayout(btn_row)
 
@@ -267,7 +338,7 @@ class AIMasterControlPanel(QWidget):
 
         layout.addStretch(1)
 
-    def _build_step_box(self, title: str, prepare_handler, send_handler, save_handler, result_placeholder: str) -> QGroupBox:
+    def _build_step_box(self, title: str, step_key: str, prepare_handler, send_handler, save_handler, result_placeholder: str) -> QGroupBox:
         box = QGroupBox(title)
         vbox = QVBoxLayout()
 
@@ -282,6 +353,17 @@ class AIMasterControlPanel(QWidget):
             save_btn = QPushButton("保存结果")
             save_btn.clicked.connect(save_handler)
             btn_row.addWidget(save_btn)
+
+        max_tokens_label = QLabel("maxTokens：")
+        max_tokens_spin = QSpinBox()
+        max_tokens_spin.setRange(1, self._hard_cap_max_tokens())
+        max_tokens_spin.setSingleStep(1000)
+        max_tokens_spin.setValue(self._get_step_max_tokens(step_key))
+        max_tokens_spin.setToolTip("本步骤 LLM 的 max_tokens（最大 64000）")
+        max_tokens_spin.valueChanged.connect(lambda v: self._set_step_max_tokens(step_key, v))
+        btn_row.addSpacing(12)
+        btn_row.addWidget(max_tokens_label)
+        btn_row.addWidget(max_tokens_spin)
         btn_row.addStretch(1)
         vbox.addLayout(btn_row)
 
@@ -305,6 +387,9 @@ class AIMasterControlPanel(QWidget):
         box._instruction = instruction
         box._result = result
         box._status = status
+        box._max_tokens_label = max_tokens_label
+        box._max_tokens_spin = max_tokens_spin
+        box._step_key = step_key
         return box
 
     @staticmethod
@@ -382,6 +467,9 @@ class AIMasterControlPanel(QWidget):
         self._refresh_chapter_selector()
         self._load_chapter_detail(self.chapter_selector.currentIndex())
 
+        # 刷新每步 maxTokens（从工程持久化数据回填）
+        self._refresh_step_max_tokens_ui()
+
         # 渲染步骤5
         if self.pending_lists:
             summary = self._summarize_pending(self.pending_lists, getattr(history, "step5_flow_nodes", None))
@@ -403,11 +491,41 @@ class AIMasterControlPanel(QWidget):
             box._instruction.clear()
             box._result.clear()
             box._status.setText("状态：等待指令")
+            if hasattr(box, "_max_tokens_spin"):
+                try:
+                    box._max_tokens_spin.setValue(self._get_step_max_tokens(getattr(box, "_step_key", "step1")))
+                except Exception:
+                    pass
         self.step4_instruction.clear()
         self.step4_result.clear()
         self.step4_status.setText("状态：等待指令")
         self.chapter_selector.clear()
         self.chapter_selector.addItem("尚未生成章节列表")
+        if hasattr(self, "step4_max_tokens_spin"):
+            try:
+                self.step4_max_tokens_spin.setValue(self._get_step_max_tokens("step4"))
+            except Exception:
+                pass
+
+    def _refresh_step_max_tokens_ui(self) -> None:
+        groups = [getattr(self, "step1_group", None), getattr(self, "step2_group", None), getattr(self, "step3_group", None)]
+        for g in groups:
+            if not g or not hasattr(g, "_max_tokens_spin"):
+                continue
+            step_key = getattr(g, "_step_key", "step1")
+            spin = getattr(g, "_max_tokens_spin")
+            try:
+                spin.blockSignals(True)
+                spin.setValue(self._get_step_max_tokens(step_key))
+            finally:
+                spin.blockSignals(False)
+
+        if hasattr(self, "step4_max_tokens_spin"):
+            try:
+                self.step4_max_tokens_spin.blockSignals(True)
+                self.step4_max_tokens_spin.setValue(self._get_step_max_tokens("step4"))
+            finally:
+                self.step4_max_tokens_spin.blockSignals(False)
 
     def _refresh_chapter_selector(self):
         self.chapter_selector.blockSignals(True)
@@ -664,6 +782,8 @@ class AIMasterControlPanel(QWidget):
         story_config = self._story_dict()
         characters = self._characters_dict()
         instruction, params = self.step_generator.prepare_personas_instruction(story_config, characters)
+        params = dict(params or {})
+        params["max_tokens"] = self._get_step_max_tokens("step1")
         self.step1_group._instruction.setPlainText(instruction)
         self.step1_group._status.setText("状态：指令已生成，待发送")
         self.step_parameters["step1"] = params
@@ -675,7 +795,8 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
-        params = self.step_parameters.get("step1") or {}
+        params = dict(self.step_parameters.get("step1") or {})
+        params["max_tokens"] = self._get_step_max_tokens("step1")
         instruction = self.step1_group._instruction.toPlainText().strip()
         if not instruction:
             QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
@@ -731,6 +852,8 @@ class AIMasterControlPanel(QWidget):
         story_config = self._story_dict()
         personas = self.personas_data or self.project_manager.current_project.generation_history.step1_personas
         instruction, params = self.step_generator.prepare_outline_instruction(story_config, personas or {})
+        params = dict(params or {})
+        params["max_tokens"] = self._get_step_max_tokens("step2")
         self.step2_group._instruction.setPlainText(instruction)
         self.step2_group._status.setText("状态：指令已生成，待发送")
         self.step_parameters["step2"] = params
@@ -742,7 +865,8 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
-        params = self.step_parameters.get("step2") or {}
+        params = dict(self.step_parameters.get("step2") or {})
+        params["max_tokens"] = self._get_step_max_tokens("step2")
         instruction = self.step2_group._instruction.toPlainText().strip()
         if not instruction:
             QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
@@ -798,6 +922,8 @@ class AIMasterControlPanel(QWidget):
         story_config = self._story_dict()
         outline = self.outline_data or self.project_manager.current_project.generation_history.step2_outline
         instruction, params = self.step_generator.prepare_chapters_instruction(story_config, outline or {})
+        params = dict(params or {})
+        params["max_tokens"] = self._get_step_max_tokens("step3")
         self.step3_group._instruction.setPlainText(instruction)
         self.step3_group._status.setText("状态：指令已生成，待发送")
         self.step_parameters["step3"] = params
@@ -809,7 +935,8 @@ class AIMasterControlPanel(QWidget):
             return
         if not self._ensure_step_gen():
             return
-        params = self.step_parameters.get("step3") or {}
+        params = dict(self.step_parameters.get("step3") or {})
+        params["max_tokens"] = self._get_step_max_tokens("step3")
         instruction = self.step3_group._instruction.toPlainText().strip()
         if not instruction:
             QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
@@ -874,13 +1001,27 @@ class AIMasterControlPanel(QWidget):
         if idx > 0:
             prev = chapters_struct[idx - 1]
             prev_context = prev.get("summary") or prev.get("chapter_summary")
+        chapters_plan = None
+        try:
+            if isinstance(self.chapters_data, dict):
+                s = self.chapters_data.get("structured")
+                if isinstance(s, dict) and isinstance(s.get("chapters"), list):
+                    chapters_plan = s
+                elif isinstance(s, list):
+                    chapters_plan = {"chapters": s}
+        except Exception:
+            chapters_plan = None
+
         instruction, params = self.step_generator.prepare_chapter_detail_instruction(
             idx,
             chapter_info,
             prev_context,
             self._story_dict(),
             self._characters_dict(),
+            chapters_plan,
         )
+        params = dict(params or {})
+        params["max_tokens"] = self._get_step_max_tokens("step4")
         self.step4_instruction.setPlainText(instruction)
         self.step4_status.setText(f"状态：第{idx+1}章指令已生成，待发送")
         self.step_parameters["step4"] = params
@@ -905,8 +1046,9 @@ class AIMasterControlPanel(QWidget):
         if not instruction:
             QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
             return
-        params = self.step_parameters.get("step4") or {"chapter_index": idx}
+        params = dict(self.step_parameters.get("step4") or {"chapter_index": idx})
         params["chapter_index"] = idx
+        params["max_tokens"] = self._get_step_max_tokens("step4")
         def _task():
             return self.step_generator.generate_chapter_detail(instruction, params)
 
@@ -1015,7 +1157,21 @@ class AIMasterControlPanel(QWidget):
         personas = self.personas_data
         if not personas and self.project_manager.current_project:
             personas = self.project_manager.current_project.generation_history.step1_personas
-        result = self.step_generator.build_pending_and_flow(story, chars, self.chapter_details, personas)
+        step3_chapters = None
+        try:
+            if getattr(self, "project_manager", None) and getattr(self.project_manager, "current_project", None):
+                gh = getattr(self.project_manager.current_project, "generation_history", None)
+                step3_chapters = getattr(gh, "step3_chapters", None) if gh else None
+        except Exception:
+            step3_chapters = None
+
+        result = self.step_generator.build_pending_and_flow(
+            story,
+            chars,
+            self.chapter_details,
+            personas,
+            chapters_plan=step3_chapters,
+        )
 
         self.pending_lists = result.get("pending_lists")
         self.flow_nodes = result.get("flow_nodes") or []

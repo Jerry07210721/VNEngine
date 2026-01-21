@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QSpinBox,
+    QProgressDialog,
     QWidget,
 )
 from pathlib import Path
@@ -191,14 +192,52 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.1")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.3")
+        # 设计模式默认窗口大小：1280x720
+        self.setGeometry(100, 100, 1280, 720)
         icon_path = self._resolve_icon()
         if icon_path:
             app = QApplication.instance()
             if app:
                 app.setWindowIcon(QIcon(str(icon_path)))
             self.setWindowIcon(QIcon(str(icon_path)))
+
+    def _show_busy_dialog(self, text: str) -> QProgressDialog:
+        """显示一个不可取消的忙碌提示，用于大文件打开/保存时避免“卡死”错觉。"""
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle("请稍候")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setValue(0)
+        dlg.show()
+        QApplication.processEvents()
+        return dlg
+
+    def _find_neighbor_ai_project(self) -> Path | None:
+        """在设计模式工程文件同级目录寻找 AI 工程（*.vnai）。
+
+        优先：与 .vngproj 同名的 .vnai；其次：同级目录下最新修改的 .vnai。
+        """
+        if not self.current_project_path:
+            return None
+        try:
+            base = Path(self.current_project_path)
+        except Exception:
+            return None
+        if not base.exists():
+            return None
+        folder = base.parent
+        preferred = folder / f"{base.stem}.vnai"
+        if preferred.exists():
+            return preferred
+        candidates = list(folder.glob("*.vnai"))
+        if not candidates:
+            return None
+        try:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+        except Exception:
+            return sorted(candidates)[0]
 
     def _resolve_icon(self) -> Path | None:
         return _resolve_app_icon_path()
@@ -285,6 +324,9 @@ class VNDesignerMainWindow(QMainWindow):
         # 当场景选择变化时更新属性面板
         self.graph_view.scene.selectionChanged.connect(self.on_selection_changed)
 
+        # 预览：从指定节点开始（右键节点）
+        self.graph_view.previewFromNodeRequested.connect(self.preview_game_from_node)
+
     def init_resource_dock(self):
         self.resource_dock = ResourceDock(self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.resource_dock)
@@ -306,7 +348,19 @@ class VNDesignerMainWindow(QMainWindow):
     def open_ai_project_window(self):
         """打开AI辅助工程窗口（新架构）"""
         if self.ai_project_window is None:
-            self.ai_project_window = AIProjectWindow(self)
+            # 必须是独立顶层窗口（无 parent），否则会变成“从属窗口”：
+            # - 始终压在父窗口上层
+            # - Windows 任务栏不显示独立窗口
+            self.ai_project_window = AIProjectWindow(None)
+
+        # 若设计模式已打开工程，则尝试加载同级目录下的 AI 工程文件（*.vnai）
+        ai_path = self._find_neighbor_ai_project()
+        if ai_path is not None:
+            try:
+                self.ai_project_window.load_project_file(str(ai_path))
+            except Exception:
+                # 自动加载失败时不影响窗口打开，保持原逻辑
+                pass
         
         self.ai_project_window.show()
         self.ai_project_window.raise_()
@@ -391,8 +445,10 @@ class VNDesignerMainWindow(QMainWindow):
             plot_outline=story_cfg.get("plot_outline", ""),
             text_volume=int(story_cfg.get("text_volume", 5000)),
             chapter_count=int(story_cfg.get("chapter_count", 5)),
-            enable_choice_node=True,
-            enable_condition_node=True,
+            enable_choice_node=bool(story_cfg.get("enable_choice_node", False)),
+            enable_condition_node=bool(story_cfg.get("enable_condition_node", False)),
+            enable_multi_branch=bool(story_cfg.get("enable_multi_branch", False)),
+            enable_single_route=bool(story_cfg.get("enable_single_route", False)),
             condition_type="favorability",
             character_hint_weight=float(story_cfg.get("character_hint_weight", 0.7)),
             narrative_pov=story_cfg.get("narrative_pov", "third"),
@@ -529,7 +585,9 @@ class VNDesignerMainWindow(QMainWindow):
             self.current_project_path = file_path
             self._apply_project_dir(Path(file_path).parent)
 
+        busy = None
         try:
+            busy = self._show_busy_dialog("正在保存工程文件，请稍候...")
             # 同步画布数据到工程数据
             self.project_manager.project_data["flow_nodes"] = self.graph_view.export_scene()
             self.project_manager.project_data["resources"] = self.resource_dock.export_data()
@@ -541,6 +599,13 @@ class VNDesignerMainWindow(QMainWindow):
             QMessageBox.information(self, "提示", f"工程「{project_name}」保存成功。")
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"保存工程失败：{str(exc)}")
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
 
     def _load_flow_nodes_from_data(self, data: dict):
         flow_data = data.get("flow_nodes") if isinstance(data, dict) else None
@@ -587,7 +652,9 @@ class VNDesignerMainWindow(QMainWindow):
         (project_dir / "saves").mkdir(parents=True, exist_ok=True)
 
     def _create_or_overwrite_project(self, project_dir: Path, project_name: str, project_file: Path, width: int, height: int):
+        busy = None
         try:
+            busy = self._show_busy_dialog("正在创建/保存工程文件，请稍候...")
             self.project_manager.new_project(project_name, width, height)
             self.current_project_path = str(project_file)
             self._apply_project_dir(project_dir)
@@ -599,9 +666,18 @@ class VNDesignerMainWindow(QMainWindow):
             QMessageBox.information(self, "提示", f"工程「{project_name}」已创建。\n分辨率：{width}x{height}")
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"新建工程失败：{str(exc)}")
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
 
     def _load_project_file(self, path: Path):
+        busy = None
         try:
+            busy = self._show_busy_dialog("正在打开工程文件，请稍候...")
             data = self.project_manager.open_project(str(path))
             self.current_project_path = str(path)
             self._apply_project_dir(path.parent)
@@ -614,6 +690,13 @@ class VNDesignerMainWindow(QMainWindow):
             QMessageBox.information(self, "提示", f"工程「{project_name}」打开成功。")
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"打开工程失败：{str(exc)}")
+        finally:
+            if busy is not None:
+                try:
+                    busy.close()
+                    busy.deleteLater()
+                except Exception:
+                    pass
 
     def preview_game(self):
         try:
@@ -647,6 +730,20 @@ class VNDesignerMainWindow(QMainWindow):
             self.project_manager.project_data["resources"] = self.resource_dock.export_data()
             self.project_manager.save_project(self.current_project_path)
             self._start_preview_process()
+        except Exception as exc:
+            QMessageBox.critical(self, "错误", f"启动游戏预览失败：{str(exc)}")
+
+    def preview_game_from_node(self, node_id: int):
+        """从指定流程节点启动预览（由流程图右键菜单触发）。"""
+        try:
+            if not self.current_project_path:
+                QMessageBox.warning(self, "提示", "请先保存工程，再进行预览。")
+                return
+            # 先保存一次，保证数据与画布同步
+            self.project_manager.project_data["flow_nodes"] = self.graph_view.export_scene()
+            self.project_manager.project_data["resources"] = self.resource_dock.export_data()
+            self.project_manager.save_project(self.current_project_path)
+            self._start_preview_process(start_node_id=int(node_id))
         except Exception as exc:
             QMessageBox.critical(self, "错误", f"启动游戏预览失败：{str(exc)}")
 
@@ -804,7 +901,7 @@ class VNDesignerMainWindow(QMainWindow):
             QMessageBox.critical(self, "打包失败", f"打包失败，退出码 {exit_code}\n最近输出：\n{log_text}")
         self.packager_process = None
 
-    def _start_preview_process(self):
+    def _start_preview_process(self, start_node_id: int | None = None):
         # 若已有预览进程，先终止
         if self.preview_process and self.preview_process.state() != QProcess.ProcessState.NotRunning:
             self.preview_process.kill()
@@ -817,12 +914,18 @@ class VNDesignerMainWindow(QMainWindow):
             # 已打包环境：复用自身 exe，使用 --preview 路由到预览
             program = sys.executable
             self.preview_process.setProgram(program)
-            self.preview_process.setArguments(["--preview", self.current_project_path])
+            args = ["--preview", self.current_project_path]
+            if start_node_id is not None:
+                args += ["--start-node", str(int(start_node_id))]
+            self.preview_process.setArguments(args)
         else:
             program = sys.executable
             module_path = "src.game.preview_runner"
             self.preview_process.setProgram(program)
-            self.preview_process.setArguments(["-m", module_path, self.current_project_path])
+            args = ["-m", module_path, self.current_project_path]
+            if start_node_id is not None:
+                args += ["--start-node", str(int(start_node_id))]
+            self.preview_process.setArguments(args)
         self.preview_process.readyReadStandardOutput.connect(self._on_preview_stdout)
         self.preview_process.readyReadStandardError.connect(self._on_preview_stderr)
         self.preview_process.finished.connect(self._on_preview_finished)

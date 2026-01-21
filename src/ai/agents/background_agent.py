@@ -90,6 +90,7 @@ class BackgroundAgent:
         flux_model = parameters.get("flux_model")
         flux_mode = parameters.get("flux_mode")
         flux_num = parameters.get("flux_num")
+        flux_size = parameters.get("flux_size")
         ref_image_paths = parameters.get("reference_images") or []
         project_root = self._project_root(parameters)
 
@@ -109,6 +110,10 @@ class BackgroundAgent:
                 pass
         if flux_mode:
             flux_params["mode"] = str(flux_mode)
+        if flux_size is not None and str(flux_size).strip():
+            size_str = str(flux_size).strip().upper()
+            if size_str in {"1MP", "2MP", "4MP"}:
+                flux_params["size"] = size_str
 
         file_path = self._generate_and_download(
             prompt=prompt,

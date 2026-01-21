@@ -45,6 +45,8 @@ def test_story_config_save_load():
         text_volume=8000,
         enable_choice_node=True,
         enable_condition_node=True,
+        enable_multi_branch=True,
+        enable_single_route=True,
         condition_type="favorability",
         character_hint_weight=0.8
     )
@@ -64,6 +66,9 @@ def test_story_config_save_load():
     assert loaded_project.story_config.style == "日系校园、治愈、青春"
     assert loaded_project.story_config.text_volume == 8000
     assert loaded_project.story_config.character_hint_weight == 0.8
+    # 单线叙事与多分支互斥：同时为 True 时，优先保留单线叙事并关闭多分支
+    assert bool(getattr(loaded_project.story_config, 'enable_multi_branch', False)) is False
+    assert bool(getattr(loaded_project.story_config, 'enable_single_route', False)) is True
     
     print("✓ 剧情配置加载验证通过")
     print(f"  - 标题: {loaded_project.story_config.title}")

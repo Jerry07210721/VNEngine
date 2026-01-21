@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QFormLayout,
     QFileDialog,
+    QScrollArea,
+    QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -67,13 +69,15 @@ class AIPortraitPanel(QWidget):
         header.addStretch(1)
         layout.addLayout(header)
 
-        main = QHBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
         self.list_widget = QListWidget()
         self.list_widget.itemSelectionChanged.connect(self.on_item_selected)
-        main.addWidget(self.list_widget, 2)
+        splitter.addWidget(self.list_widget)
 
-        right = QVBoxLayout()
+        right_container = QWidget()
+        right = QVBoxLayout(right_container)
 
         # 基本信息
         info_group = QGroupBox("立绘详情")
@@ -147,6 +151,12 @@ class AIPortraitPanel(QWidget):
         self.design_flux_num_spin.setRange(1, 4)
         self.design_flux_num_spin.setValue(1)
         d_flux_form.addRow("绘图数量", self.design_flux_num_spin)
+
+        self.design_flux_size_combo = QComboBox()
+        self.design_flux_size_combo.addItem("1MP(默认)", "1MP")
+        self.design_flux_size_combo.addItem("2MP", "2MP")
+        self.design_flux_size_combo.addItem("4MP", "4MP")
+        d_flux_form.addRow("分辨率", self.design_flux_size_combo)
 
         self.design_flux_params_group.setLayout(d_flux_form)
         design_layout.addWidget(self.design_flux_params_group)
@@ -360,6 +370,12 @@ class AIPortraitPanel(QWidget):
         self.full_flux_num_spin.setRange(1, 4)
         self.full_flux_num_spin.setValue(1)
         f_flux_form.addRow("绘图数量", self.full_flux_num_spin)
+
+        self.full_flux_size_combo = QComboBox()
+        self.full_flux_size_combo.addItem("1MP(默认)", "1MP")
+        self.full_flux_size_combo.addItem("2MP", "2MP")
+        self.full_flux_size_combo.addItem("4MP", "4MP")
+        f_flux_form.addRow("分辨率", self.full_flux_size_combo)
         self.full_flux_params_group.setLayout(f_flux_form)
         full_layout.addWidget(self.full_flux_params_group)
 
@@ -434,8 +450,17 @@ class AIPortraitPanel(QWidget):
         right.addWidget(self.progress_label)
 
         right.addStretch(1)
-        main.addLayout(right, 3)
-        layout.addLayout(main)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setWidget(right_container)
+        splitter.addWidget(right_scroll)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
 
         self._on_mode_changed()
         self._toggle_design_mj_group()
@@ -542,6 +567,8 @@ class AIPortraitPanel(QWidget):
             self.design_flux_model_combo.setCurrentIndex(0)
             self.design_flux_mode_combo.setCurrentIndex(0)
             self.design_flux_num_spin.setValue(1)
+            if hasattr(self, "design_flux_size_combo"):
+                self.design_flux_size_combo.setCurrentIndex(0)
         if hasattr(self, "design_ref_path_edits"):
             for i in range(3):
                 self.design_ref_path_edits[i].clear()
@@ -551,6 +578,8 @@ class AIPortraitPanel(QWidget):
             self.full_flux_model_combo.setCurrentIndex(0)
             self.full_flux_mode_combo.setCurrentIndex(0)
             self.full_flux_num_spin.setValue(1)
+            if hasattr(self, "full_flux_size_combo"):
+                self.full_flux_size_combo.setCurrentIndex(0)
         if hasattr(self, "full_ref_path_edits"):
             for i in range(3):
                 self.full_ref_path_edits[i].clear()
@@ -700,6 +729,7 @@ class AIPortraitPanel(QWidget):
                 "mode": self.design_flux_mode_combo.currentData() or "pro",
                 "num": int(self.design_flux_num_spin.value()),
                 "aspect": self.aspect_combo.currentText(),
+                "size": (self.design_flux_size_combo.currentData() or "1MP") if hasattr(self, "design_flux_size_combo") else "1MP",
             },
             "images": images,
         }
@@ -728,6 +758,7 @@ class AIPortraitPanel(QWidget):
                 "mode": self.full_flux_mode_combo.currentData() or "pro",
                 "num": int(self.full_flux_num_spin.value()),
                 "aspect": self.aspect_combo.currentText(),
+                "size": (self.full_flux_size_combo.currentData() or "1MP") if hasattr(self, "full_flux_size_combo") else "1MP",
             },
             "images": images,
             "diff_prompt_template": self.diff_prompt.toPlainText().strip(),
@@ -755,6 +786,11 @@ class AIPortraitPanel(QWidget):
                 self.design_flux_num_spin.setValue(int(d_num))
             except Exception:
                 pass
+        d_size = (d.get("params") or {}).get("size")
+        if d_size and hasattr(self, "design_flux_size_combo"):
+            idx = self.design_flux_size_combo.findData(str(d_size).strip().upper())
+            if idx >= 0:
+                self.design_flux_size_combo.setCurrentIndex(idx)
         d_images = d.get("images") if isinstance(d.get("images"), list) else []
         for i in range(3):
             if i < len(d_images) and isinstance(d_images[i], dict):
@@ -785,6 +821,11 @@ class AIPortraitPanel(QWidget):
                 self.full_flux_num_spin.setValue(int(f_num))
             except Exception:
                 pass
+        f_size = (f.get("params") or {}).get("size")
+        if f_size and hasattr(self, "full_flux_size_combo"):
+            idx = self.full_flux_size_combo.findData(str(f_size).strip().upper())
+            if idx >= 0:
+                self.full_flux_size_combo.setCurrentIndex(idx)
         f_images = f.get("images") if isinstance(f.get("images"), list) else []
         for i in range(3):
             if i < len(f_images) and isinstance(f_images[i], dict):
@@ -1363,11 +1404,13 @@ class AIPortraitPanel(QWidget):
             flux_model = self.design_flux_model_combo.currentData() or "flux-kontext"
             flux_mode = self.design_flux_mode_combo.currentData() or "pro"
             flux_num = int(self.design_flux_num_spin.value())
+            flux_size = (self.design_flux_size_combo.currentData() or "1MP") if hasattr(self, "design_flux_size_combo") else "1MP"
         else:
             ref_paths = []
             flux_model = None
             flux_mode = None
             flux_num = None
+            flux_size = None
 
         params = {
             "character_name": self.current_item.char_name,
@@ -1379,6 +1422,7 @@ class AIPortraitPanel(QWidget):
             "flux_model": flux_model,
             "flux_mode": flux_mode,
             "flux_num": flux_num,
+            "flux_size": flux_size,
             "reference_images": ref_paths,
         }
 
@@ -1481,6 +1525,7 @@ class AIPortraitPanel(QWidget):
         flux_model = self.full_flux_model_combo.currentData() or "flux-kontext"
         flux_mode = self.full_flux_mode_combo.currentData() or "pro"
         flux_num = int(self.full_flux_num_spin.value())
+        flux_size = (self.full_flux_size_combo.currentData() or "1MP") if hasattr(self, "full_flux_size_combo") else "1MP"
         params = {
             "char_id": self.current_item.char_id,
             "character_name": self.current_item.char_name,
@@ -1492,6 +1537,7 @@ class AIPortraitPanel(QWidget):
             "flux_model": flux_model,
             "flux_mode": flux_mode,
             "flux_num": flux_num,
+            "flux_size": flux_size,
             "reference_images": ref_paths,
         }
         task = TaskAssignment(
@@ -1565,6 +1611,7 @@ class AIPortraitPanel(QWidget):
         flux_model = self.full_flux_model_combo.currentData() or "flux-kontext"
         flux_mode = self.full_flux_mode_combo.currentData() or "pro"
         flux_num = int(self.full_flux_num_spin.value())
+        flux_size = (self.full_flux_size_combo.currentData() or "1MP") if hasattr(self, "full_flux_size_combo") else "1MP"
         prompt_template = self.diff_prompt.toPlainText().strip()
         persona_text = self._persona_text_from_step1(self.current_item.char_id) or (self.current_item.description or "").strip()
 
@@ -1594,6 +1641,7 @@ class AIPortraitPanel(QWidget):
                 "flux_model": flux_model,
                 "flux_mode": flux_mode,
                 "flux_num": flux_num,
+                "flux_size": flux_size,
                 "base_image_path": base_image_abs,
                 "output_dir": output_dir,
                 "reference_images": ref_paths,
