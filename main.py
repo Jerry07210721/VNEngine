@@ -16,10 +16,10 @@ def _dispatch(argv):
     # 预览模式：在打包后的环境中由设计器子进程启动
     if len(argv) >= 2 and argv[1] == "--preview":
         if len(argv) < 3:
-            print("用法: --preview <工程文件.vngproj>")
+            print("用法: --preview <工程文件.vngproj> [--start-node <node_id>]")
             sys.exit(1)
-        sys.argv = [argv[0], argv[2]]
-        preview_main()
+        # 透传预览参数给 preview_runner（支持 --start-node 等）
+        preview_main(argv[2:])
         return
 
     print("VNEngine 视觉小说引擎启动中...")

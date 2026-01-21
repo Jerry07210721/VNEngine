@@ -13,8 +13,8 @@ class VNProjectManager:
         self.project_data = {
             "project_info": {
                 "name": "未命名工程",
-                "version": "0.1",
-                "engine_version": "VNEngine V0.1",
+                "version": "2.3",
+                "engine_version": "VNEngine V2.3",
                 "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_modify_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             },
@@ -27,6 +27,18 @@ class VNProjectManager:
                 "menu_background": "",
                 "menu_bgm": "",
                 "menu_bgm_loop": True,
+                "menu_video": "",
+                "menu_video_loop": False,
+                    "menu_overlay_alpha": 0,
+                "menu_title_pos": [60, 60],
+                "menu_title_color": [240, 240, 255],
+                "menu_option_pos": [80, 140],
+                "menu_option_color": [255, 255, 255],
+                "menu_title_image": "",
+                "menu_title_image_pos": [400, 80],
+                "menu_title_scale": 1.0,
+                "menu_title_image_scale": 1.0,
+                "menu_option_scale": 1.0,
             },
             "resources": {
                 "images": [],
@@ -39,12 +51,15 @@ class VNProjectManager:
             "flow_nodes": {"nodes": [], "connections": []},
         }
 
-    def new_project(self, project_name: str = "未命名工程"):
-        """新建空工程"""
+    def new_project(self, project_name: str = "未命名工程", window_width: int = 800, window_height: int = 600):
+        """新建空工程并固定窗口分辨率。"""
         self.project_data["project_info"]["name"] = project_name
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.project_data["project_info"]["create_time"] = now
         self.project_data["project_info"]["last_modify_time"] = now
+        # 记录用户选择的窗口分辨率（项目创建后不再修改）
+        self.project_data["game_config"]["window_width"] = int(max(320, window_width))
+        self.project_data["game_config"]["window_height"] = int(max(240, window_height))
         self.project_data["flow_nodes"] = {"nodes": [], "connections": []}
         return self.project_data
 

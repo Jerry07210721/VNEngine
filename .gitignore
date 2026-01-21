@@ -16,20 +16,37 @@ pack_venv/
 # Packaging / build
 build/
 dist/
-*.spec
+*.spec.bak
+*.spec~
 _game_launcher.py
 
+# Local machine config (contains user-specific settings and encrypted secrets)
+config/ai_config.yaml
+config/ai_config.local.yaml
+config/*local*.yaml
+
 # Logs / caches
+logs/
 *.log
 .pytest_cache/
 .coverage
 htmlcov/
 .mypy_cache/
 .cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+
+# Runtime generated content
+output/
 
 # IDE / tooling
 .vscode/
 .idea/
+
+# Python packaging
+*.egg-info/
+pip-wheel-metadata/
 
 # OS junk
 Thumbs.db

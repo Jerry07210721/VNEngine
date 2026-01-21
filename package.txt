@@ -1,3 +1,8 @@
+## VNEngine v2.1 打包建议：优先使用 spec（更可复现）
+# pyinstaller .\VNEngineDesigner.spec --noconfirm --clean
+#   --add-data "config;config" `
+
+
 python -m PyInstaller `
   --name VNEngineDesigner `
   --onedir `
