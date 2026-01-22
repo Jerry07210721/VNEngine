@@ -449,8 +449,7 @@ class VNDesignerMainWindow(QMainWindow):
             "VNEngine\n\n"
             "如需联系/反馈建议，可通过以下方式：\n"
             "1) GitHub: https://github.com/Jerry07210721/VNEngine\n"
-            "2) Issues: https://github.com/Jerry07210721/VNEngine/issues\n\n"
-            "（如需展示QQ群/邮箱/微信等，可在此处替换为你的联系方式。）",
+            "2) E-mail: 1732769392@qq.com\n\n",
         )
 
     def start_ai_generation(self):
