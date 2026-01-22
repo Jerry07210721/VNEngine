@@ -11,6 +11,7 @@ python -m PyInstaller `
   --add-data "src;src" `
   --add-data "requirements.txt;." `
   --add-data "icon.ico;." `
+  --add-data "docs;docs" `
   --paths . `
   --collect-submodules src `
   --collect-submodules PyQt6 `
