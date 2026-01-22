@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('src', 'src'), ('requirements.txt', '.'), ('icon.ico', '.')]
+datas = [('src', 'src'), ('requirements.txt', '.'), ('icon.ico', '.'), ('docs', 'docs')]
 binaries = []
 hiddenimports = ['numpy', 'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets', 'pygame']
 hiddenimports += collect_submodules('src')
