@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -172,10 +173,28 @@ class MainMenuDesigner(QDialog):
         self.resize(980, 640)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        content = QWidget(scroll)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+
         top_row = QHBoxLayout()
 
         # 左侧表单（参考 UI 设计器的布局）
         form = QFormLayout()
+        try:
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        except Exception:
+            pass
         form.addRow(self._section_label("标题"))
 
         self.title_edit = QLineEdit(data.get("menu_title", ""))
@@ -277,10 +296,14 @@ class MainMenuDesigner(QDialog):
 
         top_row.addLayout(form, 1)
         top_row.addLayout(preview_wrap, 1)
-        layout.addLayout(top_row)
+        content_layout.addLayout(top_row)
 
         hint = QLabel("说明：背景/视频/BGM/标题图会复制到工程目录 (images/videos/audios)。遮罩透明度 0 不加深，255 全黑；颜色用 #RRGGBB。")
-        layout.addWidget(hint)
+        hint.setWordWrap(True)
+        content_layout.addWidget(hint)
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
 
         btn_row = QHBoxLayout()
         btn_save = QPushButton("保存")

@@ -3,6 +3,7 @@
 import sys
 from PyQt6.QtWidgets import (
     QApplication,
+    QCommandLinkButton,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -12,6 +13,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStyle,
     QStatusBar,
     QToolBar,
     QTextEdit,
@@ -67,7 +69,9 @@ class StartDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择操作")
+        self.setWindowTitle("VNEngine")
+        self.setObjectName("StartDialog")
+        self.setMinimumWidth(520)
 
         icon_path = _resolve_app_icon_path()
         if icon_path:
@@ -78,19 +82,45 @@ class StartDialog(QDialog):
         self.mode: str | None = None
         self.project_path: Path | None = None
         self.project_name: str | None = None
+
         layout = QVBoxLayout(self)
-        tip = QLabel("请选择操作：")
-        layout.addWidget(tip)
-        btn_new = QPushButton("新建工程")
-        btn_open = QPushButton("加载工程")
-        btn_exit = QPushButton("退出")
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("欢迎使用 VNEngine")
+        title.setProperty("role", "title")
+        subtitle = QLabel("请选择开始方式：新建工程、加载工程，或退出")
+        subtitle.setProperty("role", "subtitle")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        icon_new = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        icon_open = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton)
+        icon_exit = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton)
+
+        btn_new = QCommandLinkButton("新建工程", "创建一个新的 VNEngine 工程（.vngproj）")
+        btn_new.setIcon(icon_new)
+        btn_new.setProperty("variant", "primary")
         btn_new.clicked.connect(self._choose_new)
+
+        btn_open = QCommandLinkButton("加载工程", "打开已有工程并继续编辑")
+        btn_open.setIcon(icon_open)
         btn_open.clicked.connect(self._choose_open)
+
+        btn_exit = QCommandLinkButton("退出", "关闭 VNEngine")
+        btn_exit.setIcon(icon_exit)
+        btn_exit.setProperty("variant", "danger")
         btn_exit.clicked.connect(self.reject)
-        for btn in (btn_new, btn_open, btn_exit):
-            layout.addWidget(btn)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+
+        layout.addSpacing(6)
+        layout.addWidget(btn_new)
+        layout.addWidget(btn_open)
+        layout.addWidget(btn_exit)
+        layout.addStretch(1)
+
+        # keyboard friendly defaults
+        btn_new.setDefault(True)
+        btn_new.setAutoDefault(True)
 
     def _choose_new(self):
         self.mode = "new"
@@ -192,7 +222,8 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.3")
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.4")
+        self.setObjectName("VNDesignerMainWindow")
         # 设计模式默认窗口大小：1280x720
         self.setGeometry(100, 100, 1280, 720)
         icon_path = self._resolve_icon()
@@ -304,13 +335,40 @@ class VNDesignerMainWindow(QMainWindow):
         ai_menu.addAction(ai_help)
         self.menuBar().addMenu(ai_menu)
 
+        help_menu = QMenu("帮助(&H)", self)
+        contact_action = QAction("联系我们", self)
+        contact_action.triggered.connect(self.open_contact_us)
+        help_menu.addAction(contact_action)
+        self.menuBar().addMenu(help_menu)
+
     def init_tool_bar(self):
         tool_bar = QToolBar("常用工具", self)
         self.addToolBar(tool_bar)
 
         preview_button = QPushButton("预览游戏")
+        try:
+            preview_button.setProperty("variant", "primary")
+            preview_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        except Exception:
+            pass
         preview_button.clicked.connect(self.preview_game)
         tool_bar.addWidget(preview_button)
+
+        save_btn = QPushButton("保存工程")
+        try:
+            save_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        except Exception:
+            pass
+        save_btn.clicked.connect(self.save_project)
+        tool_bar.addWidget(save_btn)
+
+        ai_btn = QPushButton("AI辅助生成")
+        try:
+            ai_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        except Exception:
+            pass
+        ai_btn.clicked.connect(self.open_ai_project_window)
+        tool_bar.addWidget(ai_btn)
 
     def init_central_widget(self):
         central_widget = QWidget()
@@ -381,6 +439,18 @@ class VNDesignerMainWindow(QMainWindow):
             self,
             "AI 辅助使用帮助",
             f"未能自动打开帮助文档。请手动查看：{help_path}",
+        )
+
+    def open_contact_us(self):
+        # UI-only: contact/help information dialog
+        QMessageBox.about(
+            self,
+            "联系我们",
+            "VNEngine\n\n"
+            "如需联系/反馈建议，可通过以下方式：\n"
+            "1) GitHub: https://github.com/Jerry07210721/VNEngine\n"
+            "2) Issues: https://github.com/Jerry07210721/VNEngine/issues\n\n"
+            "（如需展示QQ群/邮箱/微信等，可在此处替换为你的联系方式。）",
         )
 
     def start_ai_generation(self):
@@ -971,6 +1041,14 @@ class VNDesignerMainWindow(QMainWindow):
 
 def run_designer():
     app = QApplication(sys.argv)
+    # Apply VNEngine commercial theme (UI only)
+    try:
+        from src.designer.ui_theme import apply_vnengine_theme
+
+        apply_vnengine_theme(app)
+    except Exception:
+        # Theme failure must not block app startup
+        pass
     icon_path = _resolve_app_icon_path()
     if icon_path:
         app.setWindowIcon(QIcon(str(icon_path)))

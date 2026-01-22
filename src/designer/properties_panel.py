@@ -21,8 +21,55 @@ from PyQt6.QtWidgets import (
     QWidget,
     QLabel,
     QDoubleSpinBox,
+    QToolButton,
 )
 from PyQt6.QtCore import Qt
+
+
+class _CollapsibleSection(QWidget):
+    """A lightweight collapsible section with a rotating arrow indicator."""
+
+    def __init__(self, title: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._expanded = True
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        header = QWidget(self)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 6, 6, 6)
+        header_layout.setSpacing(6)
+
+        self._toggle = QToolButton(header)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self._toggle.setAutoRaise(True)
+        self._toggle.clicked.connect(self._on_toggled)
+        header_layout.addWidget(self._toggle)
+
+        self._title = QLabel(title, header)
+        self._title.setStyleSheet("font-weight: 700;")
+        header_layout.addWidget(self._title, 1)
+
+        root.addWidget(header)
+
+        self._content = QWidget(self)
+        root.addWidget(self._content)
+
+    def setContentLayout(self, layout):  # noqa: N802
+        self._content.setLayout(layout)
+
+    def setExpanded(self, expanded: bool):  # noqa: N802
+        self._expanded = bool(expanded)
+        self._toggle.setChecked(self._expanded)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow)
+        self._content.setVisible(self._expanded)
+
+    def _on_toggled(self):
+        self.setExpanded(self._toggle.isChecked())
 
 
 class PropertiesDock(QDockWidget):
@@ -32,6 +79,7 @@ class PropertiesDock(QDockWidget):
 
     def __init__(self, parent=None):
         super().__init__("属性", parent)
+        self.setObjectName("PropertiesDock")
         self._current_node = None
         self._updating = False
         self._sub_editing = False
@@ -62,8 +110,8 @@ class PropertiesDock(QDockWidget):
 
     # ------- UI 构建 -------
     def _build_panel_basic(self, parent_layout):
-        group = QGroupBox("面板一：基础")
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板一：基础")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.title_edit = QLineEdit()
         self.title_edit.editingFinished.connect(self._on_title_changed)
@@ -73,17 +121,20 @@ class PropertiesDock(QDockWidget):
         self.type_combo.addItems(["文本", "选择", "条件"])
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("节点类型", self.type_combo)
-        parent_layout.addWidget(group)
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _build_panel_content(self, parent_layout):
-        group = QGroupBox("面板二：节点内容")
-        vbox = QVBoxLayout(group)
+        section = _CollapsibleSection("面板二：节点内容")
+        vbox = QVBoxLayout()
+        vbox.setContentsMargins(6, 0, 6, 6)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self._build_text_page())
         self.content_stack.addWidget(self._build_choice_page())
         self.content_stack.addWidget(self._build_condition_page())
         vbox.addWidget(self.content_stack)
-        parent_layout.addWidget(group)
+        section.setContentLayout(vbox)
+        parent_layout.addWidget(section)
 
     def _build_text_page(self) -> QWidget:
         page = QWidget()
@@ -112,6 +163,8 @@ class PropertiesDock(QDockWidget):
         layout.addLayout(btn_row)
 
         self.sub_list = QListWidget()
+        # UI-only: increase list height for better editing experience (3-4x of previous feel)
+        self.sub_list.setMinimumHeight(320)
         self.sub_list.currentRowChanged.connect(self._on_sub_selection_changed)
         layout.addWidget(self.sub_list)
 
@@ -394,8 +447,8 @@ class PropertiesDock(QDockWidget):
         return page
 
     def _build_panel_media(self, parent_layout):
-        group = QGroupBox("面板三：媒体配置")
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板三：媒体配置")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.bg_edit = QLineEdit()
@@ -434,17 +487,19 @@ class PropertiesDock(QDockWidget):
         self.bg_fade_duration_spin.valueChanged.connect(self._on_bg_fade_duration_changed)
         form.addRow("背景渐显时长(秒)", self.bg_fade_duration_spin)
 
-        parent_layout.addWidget(group)
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _build_panel_ui(self, parent_layout):
-        group = QGroupBox("面板四：UI设计文件")
-        self.ui_group = group
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板四：UI设计文件")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.ui_file_edit = QLineEdit()
         ui_row = self._make_file_row(self.ui_file_edit, self._on_pick_ui_file, lambda: self._clear_field(self.ui_file_edit, "set_ui_file"), "选择 .json")
         form.addRow("UI文件", ui_row)
-        parent_layout.addWidget(group)
+
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _make_file_row(self, edit: QLineEdit, pick_handler, clear_handler=None, pick_label="选择") -> QWidget:
         row = QWidget()

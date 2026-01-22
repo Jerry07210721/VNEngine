@@ -22,13 +22,19 @@ class GraphScene(QGraphicsScene):
         super().__init__(parent)
         self.grid_size = grid_size
         self.setSceneRect(QRectF(-2000, -2000, 4000, 4000))
+        # UI-only: warm white background for a softer, commercial look
+        try:
+            self.setBackgroundBrush(QColor("#FFFCFA"))
+        except Exception:
+            pass
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
         super().drawBackground(painter, rect)
         left = int(rect.left()) - (int(rect.left()) % self.grid_size)
         top = int(rect.top()) - (int(rect.top()) % self.grid_size)
 
-        grid_pen = QPen(QColor(220, 220, 220))
+        # UI-only: softer grid lines
+        grid_pen = QPen(QColor("#EEF2F7"))
         painter.setPen(grid_pen)
 
         x = float(left)
@@ -84,26 +90,33 @@ class FlowTextNode(QGraphicsRectItem):
         self.portrait_bounce = False
         self.portrait2_bounce = False
         self.is_start = False
-        self._normal_pen = QPen(QColor(120, 120, 120))
-        self._selected_pen = QPen(QColor(60, 130, 255), 2)
+        self._hovered = False
+        self._header_h = 26.0
+        # UI-only: align to VNEngine theme (white + orange)
+        self._normal_pen = QPen(QColor("#D1D5DB"))
+        self._selected_pen = QPen(QColor("#FB8138"), 2)
         self._port_radius = 7
         self._on_position_changed = on_position_changed
 
-        self.setBrush(QColor(250, 250, 250))
+        self.setBrush(QColor("#FFFFFF"))
         self.setPen(self._normal_pen)
         self.setFlags(
             QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
+        self.setAcceptHoverEvents(True)
 
         self.label = QGraphicsSimpleTextItem(self._title, self)
-        self.label.setBrush(QColor(30, 30, 30))
+        self.label.setBrush(QColor("#111827"))
         self._recenter_label()
 
     def _recenter_label(self):
         label_rect = self.label.boundingRect()
-        self.label.setPos((self._size[0] - label_rect.width()) / 2, (self._size[1] - label_rect.height()) / 2)
+        pad_x = 14.0
+        y = max(0.0, (float(self._header_h) - label_rect.height()) / 2.0)
+        # Keep title in the header for a more professional node card.
+        self.label.setPos(pad_x, y)
 
     def set_title(self, title: str):
         self._title = title
@@ -324,14 +337,83 @@ class FlowTextNode(QGraphicsRectItem):
         super().mouseDoubleClickEvent(event)
 
     def paint(self, painter, option, widget=None):  # noqa: D401
-        # Highlight selection with a thicker blue border.
-        self.setPen(self._selected_pen if self.isSelected() else self._normal_pen)
-        super().paint(painter, option, widget)
-        self.paint_ports(painter)
-        if self.is_start:
-            painter.setBrush(QColor(90, 200, 120))
+        # UI-only: rounded card + subtle shadow (professional editor feel)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        radius = 10.0
+        rect = self.rect()
+
+        hovered = bool(getattr(self, "_hovered", False))
+
+        # shadow (skip when selected for crisper highlight)
+        if not self.isSelected():
+            shadow_alpha = 40 if hovered else 28
+            shadow_offset = 3.0 if hovered else 2.0
+            shadow_rect = rect.adjusted(1.0, 1.0, 1.0, 1.0).translated(shadow_offset, shadow_offset)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(QRectF(self.rect().x(), self.rect().y(), self.rect().width(), 6.0))
+            painter.setBrush(QColor(0, 0, 0, shadow_alpha))
+            painter.drawRoundedRect(shadow_rect, radius, radius)
+
+        # main body
+        if self.isSelected():
+            pen = self._selected_pen
+        elif hovered:
+            hover_pen = QPen(QColor(251, 129, 56, 160))
+            hover_pen.setWidthF(1.6)
+            pen = hover_pen
+        else:
+            pen = self._normal_pen
+
+        painter.setPen(pen)
+        painter.setBrush(self.brush())
+        painter.drawRoundedRect(rect, radius, radius)
+
+        # header background, clipped to rounded rect
+        header_h = float(getattr(self, "_header_h", 26.0))
+        header_rect = QRectF(rect.x(), rect.y(), rect.width(), min(header_h, rect.height()))
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(rect, radius, radius)
+        painter.save()
+        painter.setClipPath(clip_path)
+        painter.fillRect(header_rect, QColor("#F9FAFB"))
+
+        # type color strip (in header)
+        node_type = (self.node_type or "text").lower()
+        type_color = {
+            "text": QColor("#FB8138"),
+            "choice": QColor("#3B82F6"),
+            "condition": QColor("#8B5CF6"),
+        }.get(node_type, QColor("#6B7280"))
+        strip_rect = QRectF(rect.x() + 8.0, rect.y() + 7.0, 3.0, max(0.0, header_rect.height() - 14.0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(type_color)
+        painter.drawRoundedRect(strip_rect, 1.5, 1.5)
+
+        # start marker: inset rounded top strip (fits rounded card better than a hard rect)
+        if self.is_start:
+            start_rect = QRectF(rect.x() + 10.0, rect.y() + 3.0, max(0.0, rect.width() - 20.0), 3.5)
+            painter.setBrush(QColor("#22C55E"))
+            painter.drawRoundedRect(start_rect, 1.75, 1.75)
+
+        # subtle header divider
+        painter.setPen(QPen(QColor("#E5E7EB"), 1))
+        painter.drawLine(QPointF(rect.x() + 1.0, rect.y() + header_rect.height()), QPointF(rect.right() - 1.0, rect.y() + header_rect.height()))
+        painter.restore()
+
+        painter.restore()
+
+        self.paint_ports(painter)
+
+    def hoverEnterEvent(self, event):  # noqa: N802
+        self._hovered = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):  # noqa: N802
+        self._hovered = False
+        self.update()
+        super().hoverLeaveEvent(event)
 
     def itemChange(self, change, value):  # noqa: N802
         if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
@@ -369,8 +451,9 @@ class ConnectionPath(QGraphicsPathItem):
         super().__init__()
         self.source_node = source_node
         self.target_node = target_node
-        self._normal_pen = QPen(QColor(120, 120, 120), 2)
-        self._selected_pen = QPen(QColor(60, 130, 255), 3)
+        # UI-only: lighter default and orange selection to match theme
+        self._normal_pen = QPen(QColor("#9CA3AF"), 2)
+        self._selected_pen = QPen(QColor("#FB8138"), 3)
         self.setFlags(
             QGraphicsPathItem.GraphicsItemFlag.ItemIsSelectable
         )

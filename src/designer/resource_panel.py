@@ -30,10 +30,15 @@ class ResourceDock(QDockWidget):
 
     def __init__(self, parent=None):
         super().__init__("资源管理", parent)
+        self.setObjectName("ResourceDock")
         self.setAllowedAreas(self.allowedAreas())
         self._project_dir: Path | None = None
 
         self._tabs = QTabWidget()
+        try:
+            self._tabs.setDocumentMode(True)
+        except Exception:
+            pass
         self._image_list = QListWidget()
         self._audio_list = QListWidget()
         self._portrait_list = QListWidget()

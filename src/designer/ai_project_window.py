@@ -70,6 +70,7 @@ class AIProjectWindow(QMainWindow):
     def init_ui(self):
         """初始化UI"""
         self.setWindowTitle("VNEngine - AI辅助工程")
+        self.setObjectName("AIProjectWindow")
         # AI辅助界面默认窗口大小：1280x720
         self.resize(1280, 720)
         
@@ -177,6 +178,10 @@ class AIProjectWindow(QMainWindow):
         
         # 快捷按钮
         new_btn = QPushButton("新建工程")
+        try:
+            new_btn.setProperty("variant", "primary")
+        except Exception:
+            pass
         new_btn.clicked.connect(self.new_project)
         tool_bar.addWidget(new_btn)
         
@@ -185,6 +190,10 @@ class AIProjectWindow(QMainWindow):
         tool_bar.addWidget(open_btn)
         
         save_btn = QPushButton("保存工程")
+        try:
+            save_btn.setProperty("variant", "primary")
+        except Exception:
+            pass
         save_btn.clicked.connect(self.save_project)
         tool_bar.addWidget(save_btn)
         
@@ -192,6 +201,10 @@ class AIProjectWindow(QMainWindow):
         
         # 工程信息显示
         self.project_info_label = QLabel("未打开工程")
+        try:
+            self.project_info_label.setProperty("pill", "true")
+        except Exception:
+            pass
         tool_bar.addWidget(self.project_info_label)
 
     def open_voice_model_manager(self):
@@ -213,6 +226,10 @@ class AIProjectWindow(QMainWindow):
         
         # 创建标签页
         self.tab_widget = QTabWidget()
+        try:
+            self.tab_widget.setDocumentMode(True)
+        except Exception:
+            pass
 
         # 滚动包装函数，避免超大内容撑开窗口
         def wrap_with_scroll(widget: QWidget) -> QScrollArea:
@@ -591,7 +608,7 @@ class AIProjectWindow(QMainWindow):
             self,
             "关于",
             "VNEngine AI辅助工程\n\n"
-            "版本: V2.3\n"
+            "版本: V2.4\n"
             "多智能体协作GalGame制作引擎\n\n"
             "© 2026 VNEngine Team"
         )
@@ -607,6 +624,12 @@ class AIProjectWindow(QMainWindow):
 def run_ai_project_window():
     """独立运行AI辅助工程窗口"""
     app = QApplication(sys.argv)
+    try:
+        from src.designer.ui_theme import apply_vnengine_theme
+
+        apply_vnengine_theme(app)
+    except Exception:
+        pass
     window = AIProjectWindow()
     window.show()
     sys.exit(app.exec())

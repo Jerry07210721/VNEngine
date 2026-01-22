@@ -96,6 +96,10 @@ class AIVoicePanel(QWidget):
 
         header = QHBoxLayout()
         self.project_label = QLabel("未加载AI工程")
+        try:
+            self.project_label.setProperty("pill", "true")
+        except Exception:
+            pass
         header.addWidget(self.project_label)
         self.reload_btn = QPushButton("刷新待生成列表")
         self.reload_btn.clicked.connect(self.refresh)
