@@ -564,6 +564,7 @@ class Integrator:
             _add(images, getattr(node, "background", "") or "")
             _add(audios, getattr(node, "bgm", "") or "")
             _add(portraits, getattr(node, "portrait", "") or "")
+            _add(portraits, getattr(node, "portrait2", "") or "")
             _add(voices, getattr(node, "voice", "") or "")
             _add(videos, getattr(node, "video", "") or "")
 
@@ -572,6 +573,7 @@ class Integrator:
                     if not isinstance(sub, dict):
                         continue
                     _add(portraits, sub.get("portrait") or "")
+                    _add(portraits, sub.get("portrait2") or "")
                     _add(voices, sub.get("voice") or "")
 
         return {

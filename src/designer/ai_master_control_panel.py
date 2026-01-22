@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QSpinBox,
     QGroupBox,
+    QFrame,
+    QSplitter,
     QWidget,
     QComboBox,
     QMessageBox,
@@ -202,7 +204,10 @@ class AIMasterControlPanel(QWidget):
 
         # 顶部提示
         self.project_label = QLabel("当前未加载AI工程")
-        self.project_label.setStyleSheet("font-weight: bold;")
+        try:
+            self.project_label.setProperty("pill", "true")
+        except Exception:
+            pass
         layout.addWidget(self.project_label)
 
         # 步骤1：人设
@@ -239,8 +244,22 @@ class AIMasterControlPanel(QWidget):
         layout.addWidget(self.step3_group)
 
         # 步骤4：章节详细内容（逐章）
-        self.step4_group = QGroupBox("步骤4：逐章生成详细内容")
-        step4_layout = QVBoxLayout()
+        self.step4_group = QFrame()
+        self.step4_group.setProperty("card", "true")
+        step4_layout = QVBoxLayout(self.step4_group)
+        step4_layout.setContentsMargins(12, 12, 12, 12)
+        step4_layout.setSpacing(10)
+
+        step4_header = QHBoxLayout()
+        step4_title = QLabel("步骤4：逐章生成详细内容")
+        step4_title.setProperty("role", "cardTitle")
+        step4_header.addWidget(step4_title)
+        self.step4_status = QLabel("状态：等待指令")
+        self.step4_status.setProperty("pill", "true")
+        step4_header.addWidget(self.step4_status)
+        step4_header.addStretch(1)
+        step4_layout.addLayout(step4_header)
+
         selector_row = QHBoxLayout()
         selector_row.addWidget(QLabel("选择章节："))
         self.chapter_selector = QComboBox()
@@ -250,19 +269,13 @@ class AIMasterControlPanel(QWidget):
         self.load_chapter_btn.clicked.connect(self.load_chapter_list)
         selector_row.addWidget(self.load_chapter_btn)
         self.chapter_selector.currentIndexChanged.connect(self.on_chapter_changed)
-        selector_row.addStretch(1)
-        step4_layout.addLayout(selector_row)
 
-        btn_row = QHBoxLayout()
         self.step4_prepare_btn = QPushButton("准备指令")
         self.step4_send_btn = QPushButton("发送/生成")
         self.step4_save_btn = QPushButton("保存结果")
         self.step4_prepare_btn.clicked.connect(self.prepare_chapter_detail)
         self.step4_send_btn.clicked.connect(self.send_chapter_detail)
         self.step4_save_btn.clicked.connect(self.save_chapter_detail)
-        btn_row.addWidget(self.step4_prepare_btn)
-        btn_row.addWidget(self.step4_send_btn)
-        btn_row.addWidget(self.step4_save_btn)
 
         self.step4_max_tokens_label = QLabel("maxTokens：")
         self.step4_max_tokens_spin = QSpinBox()
@@ -271,33 +284,67 @@ class AIMasterControlPanel(QWidget):
         self.step4_max_tokens_spin.setValue(self._get_step_max_tokens("step4"))
         self.step4_max_tokens_spin.setToolTip("步骤4 每次调用 LLM 的 max_tokens（最大 64000）")
         self.step4_max_tokens_spin.valueChanged.connect(lambda v: self._set_step_max_tokens("step4", v))
-        btn_row.addSpacing(12)
-        btn_row.addWidget(self.step4_max_tokens_label)
-        btn_row.addWidget(self.step4_max_tokens_spin)
-        btn_row.addStretch(1)
-        step4_layout.addLayout(btn_row)
 
+        # Put step controls on the right side (match step1-3 header layout)
+        selector_row.addStretch(1)
+        selector_row.addWidget(self.step4_prepare_btn)
+        selector_row.addWidget(self.step4_send_btn)
+        selector_row.addWidget(self.step4_save_btn)
+        selector_row.addSpacing(10)
+        selector_row.addWidget(self.step4_max_tokens_label)
+        selector_row.addWidget(self.step4_max_tokens_spin)
+        step4_layout.addLayout(selector_row)
+
+        step4_splitter = QSplitter(Qt.Orientation.Horizontal)
+        step4_splitter.setChildrenCollapsible(False)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        left_layout.addWidget(QLabel("指令（可编辑）"))
         self.step4_instruction = QTextEdit()
         self.step4_instruction.setPlaceholderText("章节指令，生成后可手动编辑...")
         self.step4_instruction.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self._set_textedit_min_lines(self.step4_instruction, 7)
-        step4_layout.addWidget(self.step4_instruction)
+        self._set_textedit_min_lines(self.step4_instruction, 12)
+        left_layout.addWidget(self.step4_instruction)
+        step4_splitter.addWidget(left)
 
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        right_layout.addWidget(QLabel("结果（可编辑）"))
         self.step4_result = QTextEdit()
         self.step4_result.setPlaceholderText("章节详细内容（可编辑）")
         self.step4_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._set_textedit_min_lines(self.step4_result, 12)
-        step4_layout.addWidget(self.step4_result)
+        right_layout.addWidget(self.step4_result)
+        step4_splitter.addWidget(right)
 
-        self.step4_status = QLabel("状态：等待指令")
-        step4_layout.addWidget(self.step4_status)
+        step4_splitter.setStretchFactor(0, 1)
+        step4_splitter.setStretchFactor(1, 1)
+        step4_layout.addWidget(step4_splitter)
 
-        self.step4_group.setLayout(step4_layout)
         layout.addWidget(self.step4_group)
 
         # 步骤5：待生成列表 + 流程骨架
-        self.step5_group = QGroupBox("步骤5：生成待生成列表与流程骨架")
-        step5_layout = QVBoxLayout()
+        self.step5_group = QFrame()
+        self.step5_group.setProperty("card", "true")
+        step5_layout = QVBoxLayout(self.step5_group)
+        step5_layout.setContentsMargins(12, 12, 12, 12)
+        step5_layout.setSpacing(10)
+
+        step5_header = QHBoxLayout()
+        step5_title = QLabel("步骤5：生成待生成列表与流程骨架")
+        step5_title.setProperty("role", "cardTitle")
+        step5_header.addWidget(step5_title)
+        self.step5_status = QLabel("状态：等待生成")
+        self.step5_status.setProperty("pill", "true")
+        step5_header.addWidget(self.step5_status)
+        step5_header.addStretch(1)
+        step5_layout.addLayout(step5_header)
+
         btn_row5 = QHBoxLayout()
         self.step5_generate_btn = QPushButton("生成列表")
         self.step5_save_btn = QPushButton("保存到工程")
@@ -312,14 +359,25 @@ class AIMasterControlPanel(QWidget):
         self.step5_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._set_textedit_min_lines(self.step5_result, 10)
         step5_layout.addWidget(self.step5_result)
-        self.step5_status = QLabel("状态：等待生成")
-        step5_layout.addWidget(self.step5_status)
-        self.step5_group.setLayout(step5_layout)
         layout.addWidget(self.step5_group)
 
         # 步骤6：生成工程文件（虚拟资源路径）
-        self.step6_group = QGroupBox("步骤6：生成工程文件（先填路径，后补资源）")
-        step6_layout = QVBoxLayout()
+        self.step6_group = QFrame()
+        self.step6_group.setProperty("card", "true")
+        step6_layout = QVBoxLayout(self.step6_group)
+        step6_layout.setContentsMargins(12, 12, 12, 12)
+        step6_layout.setSpacing(10)
+
+        step6_header = QHBoxLayout()
+        step6_title = QLabel("步骤6：生成工程文件（先填路径，后补资源）")
+        step6_title.setProperty("role", "cardTitle")
+        step6_header.addWidget(step6_title)
+        self.step6_status = QLabel("状态：等待生成")
+        self.step6_status.setProperty("pill", "true")
+        step6_header.addWidget(self.step6_status)
+        step6_header.addStretch(1)
+        step6_layout.addLayout(step6_header)
+
         btn_row6 = QHBoxLayout()
         self.step6_generate_btn = QPushButton("生成 .vngproj")
         self.step6_generate_btn.clicked.connect(self.generate_project_file)
@@ -331,28 +389,41 @@ class AIMasterControlPanel(QWidget):
         self.step6_result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._set_textedit_min_lines(self.step6_result, 8)
         step6_layout.addWidget(self.step6_result)
-        self.step6_status = QLabel("状态：等待生成")
-        step6_layout.addWidget(self.step6_status)
-        self.step6_group.setLayout(step6_layout)
         layout.addWidget(self.step6_group)
 
         layout.addStretch(1)
 
-    def _build_step_box(self, title: str, step_key: str, prepare_handler, send_handler, save_handler, result_placeholder: str) -> QGroupBox:
-        box = QGroupBox(title)
-        vbox = QVBoxLayout()
+    def _build_step_box(self, title: str, step_key: str, prepare_handler, send_handler, save_handler, result_placeholder: str) -> QWidget:
+        # UI-only: Card style container with header + two-column editors
+        card = QFrame()
+        card.setProperty("card", "true")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
 
-        btn_row = QHBoxLayout()
+        header = QHBoxLayout()
+        header.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setProperty("role", "cardTitle")
+        header.addWidget(title_label)
+
+        status = QLabel("状态：等待指令")
+        status.setProperty("pill", "true")
+        header.addWidget(status)
+
+        header.addStretch(1)
+
         prepare_btn = QPushButton("准备指令")
         send_btn = QPushButton("发送/生成")
         prepare_btn.clicked.connect(prepare_handler)
         send_btn.clicked.connect(send_handler)
-        btn_row.addWidget(prepare_btn)
-        btn_row.addWidget(send_btn)
+        header.addWidget(prepare_btn)
+        header.addWidget(send_btn)
         if save_handler:
             save_btn = QPushButton("保存结果")
             save_btn.clicked.connect(save_handler)
-            btn_row.addWidget(save_btn)
+            header.addWidget(save_btn)
 
         max_tokens_label = QLabel("maxTokens：")
         max_tokens_spin = QSpinBox()
@@ -361,36 +432,51 @@ class AIMasterControlPanel(QWidget):
         max_tokens_spin.setValue(self._get_step_max_tokens(step_key))
         max_tokens_spin.setToolTip("本步骤 LLM 的 max_tokens（最大 64000）")
         max_tokens_spin.valueChanged.connect(lambda v: self._set_step_max_tokens(step_key, v))
-        btn_row.addSpacing(12)
-        btn_row.addWidget(max_tokens_label)
-        btn_row.addWidget(max_tokens_spin)
-        btn_row.addStretch(1)
-        vbox.addLayout(btn_row)
+        header.addSpacing(10)
+        header.addWidget(max_tokens_label)
+        header.addWidget(max_tokens_spin)
 
+        outer.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        left_layout.addWidget(QLabel("指令（可编辑）"))
         instruction = QTextEdit()
         instruction.setPlaceholderText("生成的指令会显示在这里，发送前可自由修改...")
         instruction.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self._set_textedit_min_lines(instruction, 7)
-        vbox.addWidget(instruction)
+        self._set_textedit_min_lines(instruction, 12)
+        left_layout.addWidget(instruction)
+        splitter.addWidget(left)
 
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        right_layout.addWidget(QLabel("结果（可编辑）"))
         result = QTextEdit()
         result.setPlaceholderText(result_placeholder)
         result.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self._set_textedit_min_lines(result, 10)
-        vbox.addWidget(result)
+        self._set_textedit_min_lines(result, 12)
+        right_layout.addWidget(result)
+        splitter.addWidget(right)
 
-        status = QLabel("状态：等待指令")
-        vbox.addWidget(status)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        outer.addWidget(splitter)
 
-        box.setLayout(vbox)
-
-        box._instruction = instruction
-        box._result = result
-        box._status = status
-        box._max_tokens_label = max_tokens_label
-        box._max_tokens_spin = max_tokens_spin
-        box._step_key = step_key
-        return box
+        # Keep attribute contracts used by existing logic
+        card._instruction = instruction
+        card._result = result
+        card._status = status
+        card._max_tokens_label = max_tokens_label
+        card._max_tokens_spin = max_tokens_spin
+        card._step_key = step_key
+        return card
 
     @staticmethod
     def _set_textedit_min_lines(edit: QTextEdit, min_lines: int) -> None:

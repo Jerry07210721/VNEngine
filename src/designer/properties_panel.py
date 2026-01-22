@@ -21,8 +21,55 @@ from PyQt6.QtWidgets import (
     QWidget,
     QLabel,
     QDoubleSpinBox,
+    QToolButton,
 )
 from PyQt6.QtCore import Qt
+
+
+class _CollapsibleSection(QWidget):
+    """A lightweight collapsible section with a rotating arrow indicator."""
+
+    def __init__(self, title: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._expanded = True
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        header = QWidget(self)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 6, 6, 6)
+        header_layout.setSpacing(6)
+
+        self._toggle = QToolButton(header)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self._toggle.setAutoRaise(True)
+        self._toggle.clicked.connect(self._on_toggled)
+        header_layout.addWidget(self._toggle)
+
+        self._title = QLabel(title, header)
+        self._title.setStyleSheet("font-weight: 700;")
+        header_layout.addWidget(self._title, 1)
+
+        root.addWidget(header)
+
+        self._content = QWidget(self)
+        root.addWidget(self._content)
+
+    def setContentLayout(self, layout):  # noqa: N802
+        self._content.setLayout(layout)
+
+    def setExpanded(self, expanded: bool):  # noqa: N802
+        self._expanded = bool(expanded)
+        self._toggle.setChecked(self._expanded)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow)
+        self._content.setVisible(self._expanded)
+
+    def _on_toggled(self):
+        self.setExpanded(self._toggle.isChecked())
 
 
 class PropertiesDock(QDockWidget):
@@ -32,6 +79,7 @@ class PropertiesDock(QDockWidget):
 
     def __init__(self, parent=None):
         super().__init__("属性", parent)
+        self.setObjectName("PropertiesDock")
         self._current_node = None
         self._updating = False
         self._sub_editing = False
@@ -62,8 +110,8 @@ class PropertiesDock(QDockWidget):
 
     # ------- UI 构建 -------
     def _build_panel_basic(self, parent_layout):
-        group = QGroupBox("面板一：基础")
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板一：基础")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.title_edit = QLineEdit()
         self.title_edit.editingFinished.connect(self._on_title_changed)
@@ -73,17 +121,20 @@ class PropertiesDock(QDockWidget):
         self.type_combo.addItems(["文本", "选择", "条件"])
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("节点类型", self.type_combo)
-        parent_layout.addWidget(group)
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _build_panel_content(self, parent_layout):
-        group = QGroupBox("面板二：节点内容")
-        vbox = QVBoxLayout(group)
+        section = _CollapsibleSection("面板二：节点内容")
+        vbox = QVBoxLayout()
+        vbox.setContentsMargins(6, 0, 6, 6)
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self._build_text_page())
         self.content_stack.addWidget(self._build_choice_page())
         self.content_stack.addWidget(self._build_condition_page())
         vbox.addWidget(self.content_stack)
-        parent_layout.addWidget(group)
+        section.setContentLayout(vbox)
+        parent_layout.addWidget(section)
 
     def _build_text_page(self) -> QWidget:
         page = QWidget()
@@ -112,6 +163,8 @@ class PropertiesDock(QDockWidget):
         layout.addLayout(btn_row)
 
         self.sub_list = QListWidget()
+        # UI-only: increase list height for better editing experience (3-4x of previous feel)
+        self.sub_list.setMinimumHeight(320)
         self.sub_list.currentRowChanged.connect(self._on_sub_selection_changed)
         layout.addWidget(self.sub_list)
 
@@ -133,6 +186,10 @@ class PropertiesDock(QDockWidget):
         sub_portrait_row = self._make_file_row(self.sub_portrait_edit, self._pick_sub_portrait, self._clear_sub_portrait, "选择立绘")
         detail.addRow("立绘", sub_portrait_row)
 
+        self.sub_portrait2_edit = QLineEdit()
+        sub_portrait2_row = self._make_file_row(self.sub_portrait2_edit, self._pick_sub_portrait2, self._clear_sub_portrait2, "选择立绘")
+        detail.addRow("立绘2", sub_portrait2_row)
+
         self.sub_ui_file_edit = QLineEdit()
         self.sub_ui_file_edit.textChanged.connect(self._on_sub_detail_changed)
         sub_ui_row = self._make_file_row(self.sub_ui_file_edit, self._pick_sub_ui_file, self._clear_sub_ui_file, "选择 .json")
@@ -150,6 +207,23 @@ class PropertiesDock(QDockWidget):
         self.sub_fade_out_chk.stateChanged.connect(self._on_sub_detail_changed)
         detail.addRow("", self.sub_fade_out_chk)
 
+        # 子节点级：进入该子节点时的立绘弹跳（与淡入/淡出放在一起）
+        self.sub_portrait_bounce_chk = QCheckBox("立绘弹跳（进入该子节点时）")
+        self.sub_portrait_bounce_chk.stateChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("", self.sub_portrait_bounce_chk)
+
+        self.sub_fade2_chk = QCheckBox("立绘2淡入")
+        self.sub_fade2_chk.stateChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("", self.sub_fade2_chk)
+
+        self.sub_fade2_out_chk = QCheckBox("立绘2淡出（进入下一子节点前）")
+        self.sub_fade2_out_chk.stateChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("", self.sub_fade2_out_chk)
+
+        self.sub_portrait2_bounce_chk = QCheckBox("立绘2弹跳（进入该子节点时）")
+        self.sub_portrait2_bounce_chk.stateChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("", self.sub_portrait2_bounce_chk)
+
         self.sub_fade_in_duration_spin = QDoubleSpinBox()
         self.sub_fade_in_duration_spin.setRange(0.0, 10.0)
         self.sub_fade_in_duration_spin.setSingleStep(0.05)
@@ -163,6 +237,20 @@ class PropertiesDock(QDockWidget):
         self.sub_fade_out_duration_spin.setDecimals(2)
         self.sub_fade_out_duration_spin.valueChanged.connect(self._on_sub_detail_changed)
         detail.addRow("立绘淡出时长(秒)", self.sub_fade_out_duration_spin)
+
+        self.sub_fade2_in_duration_spin = QDoubleSpinBox()
+        self.sub_fade2_in_duration_spin.setRange(0.0, 10.0)
+        self.sub_fade2_in_duration_spin.setSingleStep(0.05)
+        self.sub_fade2_in_duration_spin.setDecimals(2)
+        self.sub_fade2_in_duration_spin.valueChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("立绘2淡入时长(秒)", self.sub_fade2_in_duration_spin)
+
+        self.sub_fade2_out_duration_spin = QDoubleSpinBox()
+        self.sub_fade2_out_duration_spin.setRange(0.0, 10.0)
+        self.sub_fade2_out_duration_spin.setSingleStep(0.05)
+        self.sub_fade2_out_duration_spin.setDecimals(2)
+        self.sub_fade2_out_duration_spin.valueChanged.connect(self._on_sub_detail_changed)
+        detail.addRow("立绘2淡出时长(秒)", self.sub_fade2_out_duration_spin)
 
         self.sub_auto_next_spin = QDoubleSpinBox()
         self.sub_auto_next_spin.setRange(0.0, 600.0)
@@ -257,6 +345,10 @@ class PropertiesDock(QDockWidget):
         choice_portrait_row = self._make_file_row(self.choice_portrait_edit, lambda: self._pick_generic_media(self.choice_portrait_edit, "图片文件 (*.png *.jpg *.jpeg *.bmp)", "resources/portraits"), lambda: self._clear_field(self.choice_portrait_edit, "set_portrait"), "选择立绘")
         info_form.addRow("立绘", choice_portrait_row)
 
+        self.choice_portrait2_edit = QLineEdit()
+        choice_portrait2_row = self._make_file_row(self.choice_portrait2_edit, lambda: self._pick_generic_media(self.choice_portrait2_edit, "图片文件 (*.png *.jpg *.jpeg *.bmp)", "resources/portraits"), lambda: self._clear_field(self.choice_portrait2_edit, "set_portrait2"), "选择立绘")
+        info_form.addRow("立绘2", choice_portrait2_row)
+
         self.choice_hide_chk = QCheckBox("隐藏文本框")
         self.choice_hide_chk.stateChanged.connect(self._on_choice_info_changed)
         info_form.addRow("", self.choice_hide_chk)
@@ -264,6 +356,18 @@ class PropertiesDock(QDockWidget):
         self.choice_portrait_fade_chk = QCheckBox("立绘淡入")
         self.choice_portrait_fade_chk.stateChanged.connect(self._on_choice_info_changed)
         info_form.addRow("", self.choice_portrait_fade_chk)
+
+        self.choice_portrait_bounce_chk = QCheckBox("立绘弹跳（进入节点时）")
+        self.choice_portrait_bounce_chk.stateChanged.connect(self._on_portrait_bounce_changed)
+        info_form.addRow("", self.choice_portrait_bounce_chk)
+
+        self.choice_portrait2_fade_chk = QCheckBox("立绘2淡入")
+        self.choice_portrait2_fade_chk.stateChanged.connect(self._on_choice_info_changed)
+        info_form.addRow("", self.choice_portrait2_fade_chk)
+
+        self.choice_portrait2_bounce_chk = QCheckBox("立绘2弹跳（进入节点时）")
+        self.choice_portrait2_bounce_chk.stateChanged.connect(self._on_portrait_bounce_changed)
+        info_form.addRow("", self.choice_portrait2_bounce_chk)
 
         layout.addLayout(info_form)
         return page
@@ -306,6 +410,10 @@ class PropertiesDock(QDockWidget):
         cond_portrait_row = self._make_file_row(self.cond_portrait_edit, lambda: self._pick_generic_media(self.cond_portrait_edit, "图片文件 (*.png *.jpg *.jpeg *.bmp)", "resources/portraits"), lambda: self._clear_field(self.cond_portrait_edit, "set_portrait"), "选择立绘")
         form.addRow("立绘", cond_portrait_row)
 
+        self.cond_portrait2_edit = QLineEdit()
+        cond_portrait2_row = self._make_file_row(self.cond_portrait2_edit, lambda: self._pick_generic_media(self.cond_portrait2_edit, "图片文件 (*.png *.jpg *.jpeg *.bmp)", "resources/portraits"), lambda: self._clear_field(self.cond_portrait2_edit, "set_portrait2"), "选择立绘")
+        form.addRow("立绘2", cond_portrait2_row)
+
         self.cond_hide_chk = QCheckBox("隐藏文本框")
         self.cond_hide_chk.stateChanged.connect(self._on_cond_info_changed)
         form.addRow("", self.cond_hide_chk)
@@ -313,6 +421,18 @@ class PropertiesDock(QDockWidget):
         self.cond_portrait_fade_chk = QCheckBox("立绘淡入")
         self.cond_portrait_fade_chk.stateChanged.connect(self._on_cond_info_changed)
         form.addRow("", self.cond_portrait_fade_chk)
+
+        self.cond_portrait_bounce_chk = QCheckBox("立绘弹跳（进入节点时）")
+        self.cond_portrait_bounce_chk.stateChanged.connect(self._on_portrait_bounce_changed)
+        form.addRow("", self.cond_portrait_bounce_chk)
+
+        self.cond_portrait2_fade_chk = QCheckBox("立绘2淡入")
+        self.cond_portrait2_fade_chk.stateChanged.connect(self._on_cond_info_changed)
+        form.addRow("", self.cond_portrait2_fade_chk)
+
+        self.cond_portrait2_bounce_chk = QCheckBox("立绘2弹跳（进入节点时）")
+        self.cond_portrait2_bounce_chk.stateChanged.connect(self._on_portrait_bounce_changed)
+        form.addRow("", self.cond_portrait2_bounce_chk)
 
         target_row = QVBoxLayout()
         self.cond_true_label = QLabel("真分支: -")
@@ -327,8 +447,8 @@ class PropertiesDock(QDockWidget):
         return page
 
     def _build_panel_media(self, parent_layout):
-        group = QGroupBox("面板三：媒体配置")
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板三：媒体配置")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self.bg_edit = QLineEdit()
@@ -367,17 +487,19 @@ class PropertiesDock(QDockWidget):
         self.bg_fade_duration_spin.valueChanged.connect(self._on_bg_fade_duration_changed)
         form.addRow("背景渐显时长(秒)", self.bg_fade_duration_spin)
 
-        parent_layout.addWidget(group)
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _build_panel_ui(self, parent_layout):
-        group = QGroupBox("面板四：UI设计文件")
-        self.ui_group = group
-        form = QFormLayout(group)
+        section = _CollapsibleSection("面板四：UI设计文件")
+        form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         self.ui_file_edit = QLineEdit()
         ui_row = self._make_file_row(self.ui_file_edit, self._on_pick_ui_file, lambda: self._clear_field(self.ui_file_edit, "set_ui_file"), "选择 .json")
         form.addRow("UI文件", ui_row)
-        parent_layout.addWidget(group)
+
+        section.setContentLayout(form)
+        parent_layout.addWidget(section)
 
     def _make_file_row(self, edit: QLineEdit, pick_handler, clear_handler=None, pick_label="选择") -> QWidget:
         row = QWidget()
@@ -427,6 +549,8 @@ class PropertiesDock(QDockWidget):
             self.bg_fade_duration_spin.setValue(float(getattr(node, "bg_fade_duration", 0.45)))
         except Exception:
             self.bg_fade_duration_spin.setValue(0.45)
+
+        self._sync_bounce_checkboxes_from_node(node)
         self.ui_file_edit.setText(getattr(node, "ui_file", ""))
         if hasattr(self, "ui_group"):
             self.ui_group.setVisible(True)
@@ -436,15 +560,19 @@ class PropertiesDock(QDockWidget):
         self.choice_text_edit.setPlainText(getattr(node, "content", ""))
         self.choice_voice_edit.setText(getattr(node, "voice", ""))
         self.choice_portrait_edit.setText(getattr(node, "portrait", ""))
+        self.choice_portrait2_edit.setText(getattr(node, "portrait2", ""))
         self.choice_hide_chk.setChecked(bool(getattr(node, "hide_textbox", False)))
         self.choice_portrait_fade_chk.setChecked(bool(getattr(node, "portrait_fade", False)))
+        self.choice_portrait2_fade_chk.setChecked(bool(getattr(node, "portrait2_fade", False)))
 
         self.cond_speaker_edit.setText(getattr(node, "speaker", ""))
         self.cond_text_edit.setPlainText(getattr(node, "content", ""))
         self.cond_voice_edit.setText(getattr(node, "voice", ""))
         self.cond_portrait_edit.setText(getattr(node, "portrait", ""))
+        self.cond_portrait2_edit.setText(getattr(node, "portrait2", ""))
         self.cond_hide_chk.setChecked(bool(getattr(node, "hide_textbox", False)))
         self.cond_portrait_fade_chk.setChecked(bool(getattr(node, "portrait_fade", False)))
+        self.cond_portrait2_fade_chk.setChecked(bool(getattr(node, "portrait2_fade", False)))
 
         self._update_condition_targets()
 
@@ -474,6 +602,7 @@ class PropertiesDock(QDockWidget):
         self.bg_fade_in_chk.setChecked(False)
         if hasattr(self, "bg_fade_duration_spin"):
             self.bg_fade_duration_spin.setValue(0.45)
+        self._sync_bounce_checkboxes(False, False)
         self.ui_file_edit.setText("")
         if hasattr(self, "sub_ui_file_edit"):
             self.sub_ui_file_edit.setText("")
@@ -481,14 +610,18 @@ class PropertiesDock(QDockWidget):
         self.choice_text_edit.setPlainText("")
         self.choice_voice_edit.setText("")
         self.choice_portrait_edit.setText("")
+        self.choice_portrait2_edit.setText("")
         self.choice_hide_chk.setChecked(False)
         self.choice_portrait_fade_chk.setChecked(False)
+        self.choice_portrait2_fade_chk.setChecked(False)
         self.cond_speaker_edit.setText("")
         self.cond_text_edit.setPlainText("")
         self.cond_voice_edit.setText("")
         self.cond_portrait_edit.setText("")
+        self.cond_portrait2_edit.setText("")
         self.cond_hide_chk.setChecked(False)
         self.cond_portrait_fade_chk.setChecked(False)
+        self.cond_portrait2_fade_chk.setChecked(False)
         self.cond_true_label.setText("真分支: -")
         self.cond_false_label.setText("假分支: -")
         self.cond_swap_btn.setEnabled(False)
@@ -512,12 +645,19 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit,
             self.sub_voice_edit,
             self.sub_portrait_edit,
+            self.sub_portrait2_edit,
             self.sub_ui_file_edit,
             self.sub_hide_chk,
             self.sub_fade_chk,
             self.sub_fade_out_chk,
+            self.sub_portrait_bounce_chk,
+            self.sub_fade2_chk,
+            self.sub_fade2_out_chk,
+            self.sub_portrait2_bounce_chk,
             self.sub_fade_in_duration_spin,
             self.sub_fade_out_duration_spin,
+            self.sub_fade2_in_duration_spin,
+            self.sub_fade2_out_duration_spin,
             self.sub_auto_next_spin,
             self.option_list,
             self.add_option_btn,
@@ -538,24 +678,76 @@ class PropertiesDock(QDockWidget):
             self.bgm_loop_chk,
             self.bg_fade_in_chk,
             self.bg_fade_duration_spin,
+            self.choice_portrait_bounce_chk,
+            self.choice_portrait2_bounce_chk,
+            self.cond_portrait_bounce_chk,
+            self.cond_portrait2_bounce_chk,
             self.choice_speaker_edit,
             self.choice_text_edit,
             self.choice_voice_edit,
             self.choice_portrait_edit,
+            self.choice_portrait2_edit,
             self.choice_hide_chk,
             self.choice_portrait_fade_chk,
+            self.choice_portrait2_fade_chk,
             self.cond_speaker_edit,
             self.cond_text_edit,
             self.cond_voice_edit,
             self.cond_portrait_edit,
+            self.cond_portrait2_edit,
             self.cond_hide_chk,
             self.cond_portrait_fade_chk,
+            self.cond_portrait2_fade_chk,
             self.var_op_list,
             self.add_var_op_btn,
             self.edit_var_op_btn,
             self.del_var_op_btn,
         ]:
             widget.setEnabled(enabled)
+
+    def _on_portrait_bounce_changed(self, _state):
+        if not self._current_node or self._updating:
+            return
+
+        sender = self.sender()
+        portrait_bounce_senders = {
+            getattr(self, "choice_portrait_bounce_chk", None),
+            getattr(self, "cond_portrait_bounce_chk", None),
+        }
+        portrait2_bounce_senders = {
+            getattr(self, "choice_portrait2_bounce_chk", None),
+            getattr(self, "cond_portrait2_bounce_chk", None),
+        }
+
+        if sender in portrait_bounce_senders and hasattr(self._current_node, "set_portrait_bounce"):
+            self._current_node.set_portrait_bounce(bool(sender.isChecked()))
+        if sender in portrait2_bounce_senders and hasattr(self._current_node, "set_portrait2_bounce"):
+            self._current_node.set_portrait2_bounce(bool(sender.isChecked()))
+
+        # 保持三个页面上的弹跳开关一致
+        self._sync_bounce_checkboxes_from_node(self._current_node)
+
+    def _sync_bounce_checkboxes_from_node(self, node):
+        if node is None:
+            self._sync_bounce_checkboxes(False, False)
+            return
+        self._sync_bounce_checkboxes(
+            bool(getattr(node, "portrait_bounce", False)),
+            bool(getattr(node, "portrait2_bounce", False)),
+        )
+
+    def _sync_bounce_checkboxes(self, portrait_bounce: bool, portrait2_bounce: bool):
+        prev = self._updating
+        self._updating = True
+        try:
+            for attr in ("choice_portrait_bounce_chk", "cond_portrait_bounce_chk"):
+                if hasattr(self, attr):
+                    getattr(self, attr).setChecked(bool(portrait_bounce))
+            for attr in ("choice_portrait2_bounce_chk", "cond_portrait2_bounce_chk"):
+                if hasattr(self, attr):
+                    getattr(self, attr).setChecked(bool(portrait2_bounce))
+        finally:
+            self._updating = prev
 
     # ------- 子对话操作 -------
     def _load_sub_dialogues(self, items: list[dict]):
@@ -575,18 +767,33 @@ class PropertiesDock(QDockWidget):
                         auto_next = float(item.get("auto_next_seconds", 0.0))
                     except Exception:
                         auto_next = 0.0
+                    try:
+                        fade2_in_d = float(item.get("portrait2_fade_duration", item.get("portrait_fade_duration", 0.4)))
+                    except Exception:
+                        fade2_in_d = fade_in_d
+                    try:
+                        fade2_out_d = float(item.get("portrait2_fade_out_duration", item.get("portrait_fade_out_duration", 0.4)))
+                    except Exception:
+                        fade2_out_d = fade_out_d
                     self._sub_dialogues.append(
                         {
                             "speaker": item.get("speaker", ""),
                             "text": item.get("text", ""),
                             "voice": item.get("voice", ""),
                             "portrait": item.get("portrait", ""),
+                            "portrait2": item.get("portrait2", ""),
                             "ui_file": item.get("ui_file", ""),
                             "hide_textbox": bool(item.get("hide_textbox", False)),
                             "portrait_fade": bool(item.get("portrait_fade", False)),
                             "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                            "portrait2_fade": bool(item.get("portrait2_fade", False)),
+                            "portrait2_fade_out": bool(item.get("portrait2_fade_out", False)),
+                            "portrait_bounce": bool(item.get("portrait_bounce", False)),
+                            "portrait2_bounce": bool(item.get("portrait2_bounce", False)),
                             "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
                             "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                            "portrait2_fade_duration": max(0.0, min(10.0, fade2_in_d)),
+                            "portrait2_fade_out_duration": max(0.0, min(10.0, fade2_out_d)),
                             "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                         }
                     )
@@ -875,6 +1082,10 @@ class PropertiesDock(QDockWidget):
             flags.append("淡入")
         if item.get("portrait_fade_out"):
             flags.append("淡出")
+        if item.get("portrait_bounce"):
+            flags.append("弹跳")
+        if item.get("portrait2_bounce"):
+            flags.append("2弹跳")
         try:
             auto_next = float(item.get("auto_next_seconds", 0.0))
         except Exception:
@@ -897,12 +1108,19 @@ class PropertiesDock(QDockWidget):
                 "text": "",
                 "voice": "",
                 "portrait": "",
+                "portrait2": "",
                 "ui_file": "",
                 "hide_textbox": False,
                 "portrait_fade": False,
                 "portrait_fade_out": False,
+                "portrait2_fade": False,
+                "portrait2_fade_out": False,
+                "portrait_bounce": False,
+                "portrait2_bounce": False,
                 "portrait_fade_duration": 0.4,
                 "portrait_fade_out_duration": 0.4,
+                "portrait2_fade_duration": 0.4,
+                "portrait2_fade_out_duration": 0.4,
                 "auto_next_seconds": 0.0,
             }
         )
@@ -936,12 +1154,19 @@ class PropertiesDock(QDockWidget):
             "text": src.get("text", ""),
             "voice": src.get("voice", ""),
             "portrait": src.get("portrait", ""),
+            "portrait2": src.get("portrait2", ""),
             "ui_file": src.get("ui_file", ""),
             "hide_textbox": bool(src.get("hide_textbox", False)),
             "portrait_fade": bool(src.get("portrait_fade", False)),
             "portrait_fade_out": bool(src.get("portrait_fade_out", False)),
+            "portrait2_fade": bool(src.get("portrait2_fade", False)),
+            "portrait2_fade_out": bool(src.get("portrait2_fade_out", False)),
+            "portrait_bounce": bool(src.get("portrait_bounce", False)),
+            "portrait2_bounce": bool(src.get("portrait2_bounce", False)),
             "portrait_fade_duration": _safe_float(src.get("portrait_fade_duration", 0.4), 0.4),
             "portrait_fade_out_duration": _safe_float(src.get("portrait_fade_out_duration", 0.4), 0.4),
+            "portrait2_fade_duration": _safe_float(src.get("portrait2_fade_duration", src.get("portrait_fade_duration", 0.4)), 0.4),
+            "portrait2_fade_out_duration": _safe_float(src.get("portrait2_fade_out_duration", src.get("portrait_fade_out_duration", 0.4)), 0.4),
             "auto_next_seconds": _safe_float(src.get("auto_next_seconds", 0.0), 0.0),
         }
         insert_at = min(row + 1, len(self._sub_dialogues))
@@ -977,12 +1202,21 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit.setPlainText("")
             self.sub_voice_edit.setText("")
             self.sub_portrait_edit.setText("")
+            self.sub_portrait2_edit.setText("")
             self.sub_ui_file_edit.setText("")
             self.sub_hide_chk.setChecked(False)
             self.sub_fade_chk.setChecked(False)
             self.sub_fade_out_chk.setChecked(False)
+            self.sub_fade2_chk.setChecked(False)
+            self.sub_fade2_out_chk.setChecked(False)
+            if hasattr(self, "sub_portrait_bounce_chk"):
+                self.sub_portrait_bounce_chk.setChecked(False)
+            if hasattr(self, "sub_portrait2_bounce_chk"):
+                self.sub_portrait2_bounce_chk.setChecked(False)
             self.sub_fade_in_duration_spin.setValue(0.4)
             self.sub_fade_out_duration_spin.setValue(0.4)
+            self.sub_fade2_in_duration_spin.setValue(0.4)
+            self.sub_fade2_out_duration_spin.setValue(0.4)
             self.sub_auto_next_spin.setValue(0.0)
             detail_enabled = False
         else:
@@ -991,10 +1225,17 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit.setPlainText(item.get("text", ""))
             self.sub_voice_edit.setText(item.get("voice", ""))
             self.sub_portrait_edit.setText(item.get("portrait", ""))
+            self.sub_portrait2_edit.setText(item.get("portrait2", ""))
             self.sub_ui_file_edit.setText(item.get("ui_file", ""))
             self.sub_hide_chk.setChecked(bool(item.get("hide_textbox", False)))
             self.sub_fade_chk.setChecked(bool(item.get("portrait_fade", False)))
             self.sub_fade_out_chk.setChecked(bool(item.get("portrait_fade_out", False)))
+            self.sub_fade2_chk.setChecked(bool(item.get("portrait2_fade", False)))
+            self.sub_fade2_out_chk.setChecked(bool(item.get("portrait2_fade_out", False)))
+            if hasattr(self, "sub_portrait_bounce_chk"):
+                self.sub_portrait_bounce_chk.setChecked(bool(item.get("portrait_bounce", False)))
+            if hasattr(self, "sub_portrait2_bounce_chk"):
+                self.sub_portrait2_bounce_chk.setChecked(bool(item.get("portrait2_bounce", False)))
             try:
                 self.sub_fade_in_duration_spin.setValue(float(item.get("portrait_fade_duration", 0.4)))
             except Exception:
@@ -1003,6 +1244,14 @@ class PropertiesDock(QDockWidget):
                 self.sub_fade_out_duration_spin.setValue(float(item.get("portrait_fade_out_duration", 0.4)))
             except Exception:
                 self.sub_fade_out_duration_spin.setValue(0.4)
+            try:
+                self.sub_fade2_in_duration_spin.setValue(float(item.get("portrait2_fade_duration", item.get("portrait_fade_duration", 0.4))))
+            except Exception:
+                self.sub_fade2_in_duration_spin.setValue(0.4)
+            try:
+                self.sub_fade2_out_duration_spin.setValue(float(item.get("portrait2_fade_out_duration", item.get("portrait_fade_out_duration", 0.4))))
+            except Exception:
+                self.sub_fade2_out_duration_spin.setValue(0.4)
             try:
                 self.sub_auto_next_spin.setValue(float(item.get("auto_next_seconds", 0.0)))
             except Exception:
@@ -1013,12 +1262,19 @@ class PropertiesDock(QDockWidget):
             self.sub_text_edit,
             self.sub_voice_edit,
             self.sub_portrait_edit,
+            self.sub_portrait2_edit,
             self.sub_ui_file_edit,
             self.sub_hide_chk,
             self.sub_fade_chk,
             self.sub_fade_out_chk,
+            self.sub_portrait_bounce_chk,
             self.sub_fade_in_duration_spin,
             self.sub_fade_out_duration_spin,
+            self.sub_fade2_chk,
+            self.sub_fade2_out_chk,
+            self.sub_portrait2_bounce_chk,
+            self.sub_fade2_in_duration_spin,
+            self.sub_fade2_out_duration_spin,
             self.sub_auto_next_spin,
         ]:
             widget.setEnabled(detail_enabled)
@@ -1035,12 +1291,21 @@ class PropertiesDock(QDockWidget):
         item["text"] = self.sub_text_edit.toPlainText()
         item["voice"] = self.sub_voice_edit.text()
         item["portrait"] = self.sub_portrait_edit.text()
+        item["portrait2"] = self.sub_portrait2_edit.text()
         item["ui_file"] = self.sub_ui_file_edit.text()
         item["hide_textbox"] = bool(self.sub_hide_chk.isChecked())
         item["portrait_fade"] = bool(self.sub_fade_chk.isChecked())
         item["portrait_fade_out"] = bool(self.sub_fade_out_chk.isChecked())
+        item["portrait2_fade"] = bool(self.sub_fade2_chk.isChecked())
+        item["portrait2_fade_out"] = bool(self.sub_fade2_out_chk.isChecked())
+        if hasattr(self, "sub_portrait_bounce_chk"):
+            item["portrait_bounce"] = bool(self.sub_portrait_bounce_chk.isChecked())
+        if hasattr(self, "sub_portrait2_bounce_chk"):
+            item["portrait2_bounce"] = bool(self.sub_portrait2_bounce_chk.isChecked())
         item["portrait_fade_duration"] = float(self.sub_fade_in_duration_spin.value())
         item["portrait_fade_out_duration"] = float(self.sub_fade_out_duration_spin.value())
+        item["portrait2_fade_duration"] = float(self.sub_fade2_in_duration_spin.value())
+        item["portrait2_fade_out_duration"] = float(self.sub_fade2_out_duration_spin.value())
         item["auto_next_seconds"] = float(self.sub_auto_next_spin.value())
         self.sub_list.item(row).setText(self._sub_display_text(item, row))
         self._commit_sub_dialogues()
@@ -1053,6 +1318,10 @@ class PropertiesDock(QDockWidget):
                 self._current_node.set_content(first.get("text", ""))
             if first and hasattr(self._current_node, "set_speaker"):
                 self._current_node.set_speaker(first.get("speaker", ""))
+            if first and hasattr(self._current_node, "set_portrait"):
+                self._current_node.set_portrait(first.get("portrait", ""))
+            if first and hasattr(self._current_node, "set_portrait2"):
+                self._current_node.set_portrait2(first.get("portrait2", ""))
 
     # ------- 事件处理：通用字段 -------
     def _on_title_changed(self):
@@ -1118,10 +1387,14 @@ class PropertiesDock(QDockWidget):
             self._current_node.set_voice(self.choice_voice_edit.text())
         if hasattr(self._current_node, "set_portrait"):
             self._current_node.set_portrait(self.choice_portrait_edit.text())
+        if hasattr(self._current_node, "set_portrait2"):
+            self._current_node.set_portrait2(self.choice_portrait2_edit.text())
         if hasattr(self._current_node, "set_hide_textbox"):
             self._current_node.set_hide_textbox(bool(self.choice_hide_chk.isChecked()))
         if hasattr(self._current_node, "set_portrait_fade"):
             self._current_node.set_portrait_fade(bool(self.choice_portrait_fade_chk.isChecked()))
+        if hasattr(self._current_node, "set_portrait2_fade"):
+            self._current_node.set_portrait2_fade(bool(self.choice_portrait2_fade_chk.isChecked()))
 
     def _on_cond_info_changed(self):
         if not self._current_node or self._updating:
@@ -1134,10 +1407,14 @@ class PropertiesDock(QDockWidget):
             self._current_node.set_voice(self.cond_voice_edit.text())
         if hasattr(self._current_node, "set_portrait"):
             self._current_node.set_portrait(self.cond_portrait_edit.text())
+        if hasattr(self._current_node, "set_portrait2"):
+            self._current_node.set_portrait2(self.cond_portrait2_edit.text())
         if hasattr(self._current_node, "set_hide_textbox"):
             self._current_node.set_hide_textbox(bool(self.cond_hide_chk.isChecked()))
         if hasattr(self._current_node, "set_portrait_fade"):
             self._current_node.set_portrait_fade(bool(self.cond_portrait_fade_chk.isChecked()))
+        if hasattr(self._current_node, "set_portrait2_fade"):
+            self._current_node.set_portrait2_fade(bool(self.cond_portrait2_fade_chk.isChecked()))
 
     # ------- 事件处理：文件选择 -------
     def _on_pick_bg(self):
@@ -1225,6 +1502,18 @@ class PropertiesDock(QDockWidget):
 
     def _clear_sub_portrait(self):
         self.sub_portrait_edit.setText("")
+        self._on_sub_detail_changed()
+
+    def _pick_sub_portrait2(self):
+        file_path = self._choose_file("选择子节点立绘2", "图片文件 (*.png *.jpg *.jpeg *.bmp)", "resources/portraits")
+        if not file_path:
+            return
+        stored = self._store_into_project(file_path, "resources/portraits")
+        self.sub_portrait2_edit.setText(stored)
+        self._on_sub_detail_changed()
+
+    def _clear_sub_portrait2(self):
+        self.sub_portrait2_edit.setText("")
         self._on_sub_detail_changed()
 
     def _pick_sub_ui_file(self):

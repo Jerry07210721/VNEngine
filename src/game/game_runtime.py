@@ -7,6 +7,7 @@ from pathlib import Path
 import pygame
 import yaml
 import json
+import math
 import numpy as np
 
 from src.game.save_slot_utils import (
@@ -70,10 +71,14 @@ class VNGameRuntime:
         self.name_area = None
         self.portrait_pos = None
         self.portrait_size = None
+        self.portrait2_pos = None
+        self.portrait2_size = None
         self._portrait_cache = {}
         self._portrait_scaled_cache = {}
+        self._portrait2_scaled_cache = {}
         self._bg_cache = {}
         self.portrait_scale = 1.0
+        self.portrait2_scale = 1.0
         self._ui_layout_cache: dict[Path, dict] = {}
         self._active_ui_layout: dict | None = None
         self._apply_window_size(self.window_size)
@@ -128,7 +133,28 @@ class VNGameRuntime:
         self._portrait_fade_out_duration = 0.4
         self._portrait_fade_time = 0.0
         self._portrait_fadeout_active = False
+        self._portrait_bounce_active = False
+        self._portrait_bounce_time = 0.0
+        self._portrait_bounce_duration = 0.22
+        self._portrait_bounce_amplitude = 18
+        self._portrait2_surface = None
+        self._portrait2_target_surface = None
+        self._portrait2_current_path = None
+        self._portrait2_fade_alpha = 255
+        self._portrait_bounce_played_key = None
+        self._portrait2_bounce_played_key = None
+        self._portrait2_target_alpha = 255
+        self._portrait2_fade_start_alpha = 255
+        self._portrait2_fade_in_duration = 0.4
+        self._portrait2_fade_out_duration = 0.4
+        self._portrait2_fade_time = 0.0
+        self._portrait2_fadeout_active = False
+        self._portrait2_bounce_active = False
+        self._portrait2_bounce_time = 0.0
+        self._portrait2_bounce_duration = 0.22
+        self._portrait2_bounce_amplitude = 18
         self._pending_sub_advance = False
+        self._pending_sub_advance_waiting = 0
         self._auto_next_remaining: float | None = None
         self._voice_cache: dict[Path, pygame.mixer.Sound] = {}
         self._voice_channel = None
@@ -961,7 +987,9 @@ class VNGameRuntime:
             if node_type == "text":
                 subs = (self.nodes_map.get(self.current_node_id, {}) or {}).get("sub_dialogues") or []
                 if subs and self._sub_index < len(subs) - 1:
-                    if self._maybe_start_portrait_fade_out(subs[self._sub_index]):
+                    started_1 = self._maybe_start_portrait_fade_out(subs[self._sub_index])
+                    started_2 = self._maybe_start_portrait2_fade_out(subs[self._sub_index])
+                    if started_1 or started_2:
                         return
                     self._sub_index += 1
                     self._voice_played_index = None
@@ -990,6 +1018,7 @@ class VNGameRuntime:
         content = entry.get("content") or entry.get("title") or ""
         bg_path = entry.get("background") or ""
         portrait_path = entry.get("portrait") or ""
+        portrait2_path = entry.get("portrait2") or ""
         voice_path = entry.get("voice") or ""
         video_path = entry.get("video") or ""
         bgm_path = entry.get("bgm") or ""
@@ -997,6 +1026,8 @@ class VNGameRuntime:
         hide_textbox = bool(entry.get("hide_textbox", False))
         portrait_fade = bool(entry.get("portrait_fade", False))
         portrait_fade_duration = entry.get("portrait_fade_duration", None)
+        portrait2_fade = bool(entry.get("portrait2_fade", False))
+        portrait2_fade_duration = entry.get("portrait2_fade_duration", None)
         bg_fade_duration = entry.get("bg_fade_duration", None)
 
         # draw video or background image
@@ -1017,7 +1048,8 @@ class VNGameRuntime:
             self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)), duration=bg_fade_duration)
             self._render_background(dt)
 
-        # draw portrait (character sprite) if available
+        # draw portraits (character sprites) if available
+        self._draw_portrait2(portrait2_path, portrait2_fade, dt, fade_in_duration=portrait2_fade_duration)
         self._draw_portrait(portrait_path, portrait_fade, dt, fade_in_duration=portrait_fade_duration)
 
         # ensure bgm if provided and not explicitly stopped on this node
@@ -1425,6 +1457,17 @@ class VNGameRuntime:
         # per-sub UI：即使 skip_media=True（避免重复刷新 BGM），也需要允许切换 UI 布局。
         self._apply_ui_file(ui_file)
 
+        # one-shot portrait bounce per current entry (node or sub-dialogue).
+        # Use a key to avoid duplicate triggering if _on_enter_node is called repeatedly for the same entry.
+        if entry:
+            bounce_key = (self.current_node_id, self._sub_index) if self.graph_mode else self.current_index
+            if bool(entry.get("portrait_bounce", False)) and self._portrait_bounce_played_key != bounce_key:
+                self._start_portrait_bounce(is_second=False)
+                self._portrait_bounce_played_key = bounce_key
+            if bool(entry.get("portrait2_bounce", False)) and self._portrait2_bounce_played_key != bounce_key:
+                self._start_portrait_bounce(is_second=True)
+                self._portrait2_bounce_played_key = bounce_key
+
         # avoid replaying voice if already played for this index
         voice_key = (self.current_node_id, self._sub_index) if self.graph_mode else self.current_index
         if self._voice_played_index != voice_key:
@@ -1720,7 +1763,7 @@ class VNGameRuntime:
                 self._portrait_target_surface = None
                 self._portrait_current_path = None
                 self._portrait_fadeout_active = False
-                self._pending_sub_advance = True
+                self._on_sub_fade_out_done()
         elif fade_in and self._portrait_surface is not None:
             self._portrait_fade_time += dt
             progress = min(1.0, self._portrait_fade_time / max(0.001, self._portrait_fade_in_duration))
@@ -1732,17 +1775,21 @@ class VNGameRuntime:
 
         if img is None:
             return
+        bounce_offset_y = self._update_bounce(dt, is_second=False)
+
         if self.portrait_pos:
             x = int(self.portrait_pos[0] - img.get_width() / 2)
-            y = int(self.portrait_pos[1] - img.get_height() / 2)
+            y = int(self.portrait_pos[1] - img.get_height() / 2) + bounce_offset_y
         else:
             x = self.render_size[0] - img.get_width() - 40
-            y = self.render_size[1] - img.get_height() - 60
+            y = self.render_size[1] - img.get_height() - 60 + bounce_offset_y
         self.render_surface.blit(img, (x, y))
 
     def _maybe_start_portrait_fade_out(self, sub_entry: dict) -> bool:
         if not sub_entry or not sub_entry.get("portrait_fade_out"):
             return False
+        if self._portrait_fadeout_active:
+            return True
         if self._portrait_surface is None:
             return False
         try:
@@ -1754,7 +1801,187 @@ class VNGameRuntime:
         current_alpha = self._portrait_surface.get_alpha()
         self._portrait_fade_start_alpha = current_alpha if current_alpha is not None else 255
         self._portrait_fade_time = 0.0
+        self._pending_sub_advance_waiting += 1
         return True
+
+    def _on_sub_fade_out_done(self):
+        if self._pending_sub_advance_waiting > 0:
+            self._pending_sub_advance_waiting -= 1
+        if self._pending_sub_advance_waiting <= 0:
+            self._pending_sub_advance_waiting = 0
+            self._pending_sub_advance = True
+
+    def _maybe_start_portrait2_fade_out(self, sub_entry: dict) -> bool:
+        if not sub_entry or not sub_entry.get("portrait2_fade_out"):
+            return False
+        if self._portrait2_fadeout_active:
+            return True
+        if self._portrait2_surface is None:
+            return False
+        try:
+            d = float(sub_entry.get("portrait2_fade_out_duration", self._portrait2_fade_out_duration))
+            self._portrait2_fade_out_duration = max(0.0, min(10.0, d))
+        except Exception:
+            pass
+        self._portrait2_fadeout_active = True
+        current_alpha = self._portrait2_surface.get_alpha()
+        self._portrait2_fade_start_alpha = current_alpha if current_alpha is not None else 255
+        self._portrait2_fade_time = 0.0
+        self._pending_sub_advance_waiting += 1
+        return True
+
+    def _draw_portrait2(self, portrait_path: str, fade_in: bool, dt: float, fade_in_duration: float | None = None):
+        # allow fade-out to continue even if next sub has no portrait2
+        if not portrait_path:
+            if not self._portrait2_fadeout_active:
+                self._portrait2_surface = None
+                self._portrait2_target_surface = None
+                self._portrait2_current_path = None
+                return
+            abs_path = self._portrait2_current_path
+        else:
+            abs_path = self._resolve_path(portrait_path)
+            if not abs_path.exists() and self.project_path:
+                alt = (self.project_path.parent / "resources" / "portraits" / Path(portrait_path).name)
+                if alt.exists():
+                    abs_path = alt
+            if not abs_path.exists():
+                return
+        if abs_path is None:
+            return
+
+        if abs_path not in self._portrait_cache:
+            try:
+                img = pygame.image.load(str(abs_path)).convert_alpha()
+                self._portrait_cache[abs_path] = img
+            except Exception:
+                return
+
+        raw_img = self._portrait_cache[abs_path]
+
+        # Determine base size (independent from portrait2_scale).
+        base_w = None
+        base_h = None
+        psz = getattr(self, "portrait2_size", None)
+        if isinstance(psz, (list, tuple)) and len(psz) == 2:
+            try:
+                w0 = int(psz[0])
+                h0 = int(psz[1])
+                if w0 > 0 and h0 > 0:
+                    base_w, base_h = w0, h0
+            except Exception:
+                base_w, base_h = None, None
+
+        if base_w is None or base_h is None:
+            max_w = int(self.render_size[0] * 0.35)
+            max_h = int(self.render_size[1] * 0.7)
+            rw, rh = raw_img.get_size()
+            fit_scale = min(max_w / max(1, rw), max_h / max(1, rh), 1.0)
+            base_w = max(1, int(rw * fit_scale))
+            base_h = max(1, int(rh * fit_scale))
+
+        scale = getattr(self, "portrait2_scale", 1.0) or 1.0
+        scale = max(0.1, min(5.0, float(scale)))
+        final_w = max(1, int(base_w * scale))
+        final_h = max(1, int(base_h * scale))
+
+        key = (abs_path, final_w, final_h)
+        target_img = self._portrait2_scaled_cache.get(key)
+        if target_img is None:
+            target_img = pygame.transform.smoothscale(raw_img, (final_w, final_h))
+            self._portrait2_scaled_cache[key] = target_img
+
+        # manage fade state
+        if self._portrait2_current_path != abs_path:
+            self._portrait2_current_path = abs_path
+            self._portrait2_fadeout_active = False
+            self._portrait2_fade_start_alpha = 255
+            if fade_in:
+                if fade_in_duration is not None:
+                    try:
+                        d = float(fade_in_duration)
+                        self._portrait2_fade_in_duration = max(0.0, min(10.0, d))
+                    except Exception:
+                        pass
+                self._portrait2_target_surface = target_img
+                self._portrait2_surface = target_img.copy()
+                self._portrait2_fade_alpha = 0
+                self._portrait2_target_alpha = 255
+                self._portrait2_fade_time = 0.0
+            else:
+                self._portrait2_surface = target_img
+                self._portrait2_target_surface = None
+                self._portrait2_fade_alpha = 255
+                self._portrait2_target_alpha = 255
+                self._portrait2_fade_time = 0.0
+
+        # IMPORTANT: fade-out has priority
+        if self._portrait2_fadeout_active and self._portrait2_surface is not None:
+            self._portrait2_fade_time += dt
+            progress = min(1.0, self._portrait2_fade_time / max(0.001, self._portrait2_fade_out_duration))
+            start_alpha = self._portrait2_fade_start_alpha if self._portrait2_fade_start_alpha is not None else 255
+            self._portrait2_fade_alpha = int(start_alpha * max(0.0, 1.0 - progress))
+            img = self._portrait2_surface.copy()
+            img.set_alpha(self._portrait2_fade_alpha)
+            if progress >= 1.0:
+                self._portrait2_surface = None
+                self._portrait2_target_surface = None
+                self._portrait2_current_path = None
+                self._portrait2_fadeout_active = False
+                self._on_sub_fade_out_done()
+        elif fade_in and self._portrait2_surface is not None:
+            self._portrait2_fade_time += dt
+            progress = min(1.0, self._portrait2_fade_time / max(0.001, self._portrait2_fade_in_duration))
+            self._portrait2_fade_alpha = int(self._portrait2_target_alpha * progress)
+            img = self._portrait2_surface.copy()
+            img.set_alpha(self._portrait2_fade_alpha)
+        else:
+            img = self._portrait2_surface if self._portrait2_surface is not None else target_img
+
+        if img is None:
+            return
+        bounce_offset_y = self._update_bounce(dt, is_second=True)
+
+        if self.portrait2_pos:
+            x = int(self.portrait2_pos[0] - img.get_width() / 2)
+            y = int(self.portrait2_pos[1] - img.get_height() / 2) + bounce_offset_y
+        else:
+            x = 40
+            y = self.render_size[1] - img.get_height() - 60 + bounce_offset_y
+        self.render_surface.blit(img, (x, y))
+
+    def _start_portrait_bounce(self, is_second: bool):
+        # Only start if currently visible (or will be visible this frame).
+        if is_second:
+            self._portrait2_bounce_active = True
+            self._portrait2_bounce_time = 0.0
+        else:
+            self._portrait_bounce_active = True
+            self._portrait_bounce_time = 0.0
+
+    def _update_bounce(self, dt: float, is_second: bool) -> int:
+        if is_second:
+            if not self._portrait2_bounce_active:
+                return 0
+            self._portrait2_bounce_time += max(0.0, float(dt))
+            duration = max(0.01, float(self._portrait2_bounce_duration))
+            p = min(1.0, self._portrait2_bounce_time / duration)
+            amp = int(self._portrait2_bounce_amplitude)
+            offset = -int(round(amp * math.sin(math.pi * p)))
+            if p >= 1.0:
+                self._portrait2_bounce_active = False
+            return offset
+
+        if not self._portrait_bounce_active:
+            return 0
+        self._portrait_bounce_time += max(0.0, float(dt))
+        duration = max(0.01, float(self._portrait_bounce_duration))
+        p = min(1.0, self._portrait_bounce_time / duration)
+        amp = int(self._portrait_bounce_amplitude)
+        offset = -int(round(amp * math.sin(math.pi * p)))
+        if p >= 1.0:
+            self._portrait_bounce_active = False
+        return offset
 
     def _resolve_path(self, path_str: str) -> Path:
         p = Path(path_str)
@@ -1798,14 +2025,21 @@ class VNGameRuntime:
                         "speaker": sub.get("speaker", merged.get("speaker", "")),
                         "content": sub.get("text", merged.get("content", "")),
                         "portrait": sub.get("portrait", merged.get("portrait", "")),
+                        "portrait2": sub.get("portrait2", merged.get("portrait2", "")),
                         "voice": sub.get("voice", merged.get("voice", "")),
                         # UI 配置迁移：优先使用子对话的 ui_file；若未配置则回退到节点级（兼容旧数据）
                         "ui_file": sub.get("ui_file") or merged.get("ui_file", ""),
                         "hide_textbox": bool(sub.get("hide_textbox", False)),
                         "portrait_fade": bool(sub.get("portrait_fade", False)),
                         "portrait_fade_out": bool(sub.get("portrait_fade_out", False)),
+                        "portrait2_fade": bool(sub.get("portrait2_fade", False)),
+                        "portrait2_fade_out": bool(sub.get("portrait2_fade_out", False)),
+                        "portrait_bounce": bool(sub.get("portrait_bounce", False)),
+                        "portrait2_bounce": bool(sub.get("portrait2_bounce", False)),
                         "portrait_fade_duration": sub.get("portrait_fade_duration", None),
                         "portrait_fade_out_duration": sub.get("portrait_fade_out_duration", None),
+                        "portrait2_fade_duration": sub.get("portrait2_fade_duration", None),
+                        "portrait2_fade_out_duration": sub.get("portrait2_fade_out_duration", None),
                         "auto_next_seconds": sub.get("auto_next_seconds", None),
                     })
                     return merged
@@ -2150,6 +2384,15 @@ class VNGameRuntime:
         else:
             self.portrait_pos = None
 
+        portrait2_pos = layout.get("portrait2_pos") if isinstance(layout, dict) else None
+        if isinstance(portrait2_pos, (list, tuple)) and len(portrait2_pos) == 2:
+            try:
+                self.portrait2_pos = (int(portrait2_pos[0]), int(portrait2_pos[1]))
+            except Exception:
+                self.portrait2_pos = None
+        else:
+            self.portrait2_pos = None
+
         ps = 1.0
         if isinstance(layout, dict):
             try:
@@ -2157,6 +2400,14 @@ class VNGameRuntime:
             except Exception:
                 ps = 1.0
         self.portrait_scale = max(0.1, min(5.0, ps))
+
+        ps2 = 1.0
+        if isinstance(layout, dict):
+            try:
+                ps2 = float(layout.get("portrait2_scale", 1.0) or 1.0)
+            except Exception:
+                ps2 = 1.0
+        self.portrait2_scale = max(0.1, min(5.0, ps2))
 
         self.portrait_size = None
         if isinstance(layout, dict):
@@ -2169,8 +2420,21 @@ class VNGameRuntime:
                         self.portrait_size = (pw, ph)
                 except Exception:
                     self.portrait_size = None
+
+        self.portrait2_size = None
+        if isinstance(layout, dict):
+            psz2 = layout.get("portrait2_size")
+            if isinstance(psz2, (list, tuple)) and len(psz2) == 2:
+                try:
+                    pw2 = int(psz2[0])
+                    ph2 = int(psz2[1])
+                    if pw2 > 0 and ph2 > 0:
+                        self.portrait2_size = (pw2, ph2)
+                except Exception:
+                    self.portrait2_size = None
         self._bg_cache.clear()
         self._portrait_scaled_cache.clear()
+        self._portrait2_scaled_cache.clear()
 
     def _append_history(self, entry: dict | None):
         if not entry:

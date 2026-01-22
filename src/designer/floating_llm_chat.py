@@ -42,16 +42,17 @@ class FloatingBall(QPushButton):
         super().__init__("AI", parent)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setFixedSize(46, 46)
+        self.setObjectName("VNEngineFloatingBall")
         self.setStyleSheet(
-            "QPushButton {"
-            "  background: rgba(45, 140, 240, 220);"
+            "#VNEngineFloatingBall {"
+            "  background: #FB8138;"
             "  color: white;"
-            "  border: 1px solid rgba(255,255,255,120);"
+            "  border: 1px solid rgba(255,255,255,160);"
             "  border-radius: 23px;"
-            "  font-weight: 700;"
+            "  font-weight: 800;"
             "}"
-            "QPushButton:hover { background: rgba(45, 140, 240, 255); }"
-            "QPushButton:pressed { background: rgba(30, 110, 200, 255); }"
+            "#VNEngineFloatingBall:hover { background: #F97316; }"
+            "#VNEngineFloatingBall:pressed { background: #EA580C; }"
         )
         self._drag = _DragState()
         self._moved = False
@@ -201,13 +202,16 @@ class FloatingChatWidget(QWidget):
         self._max_history_turns = 12  # user+assistant pairs
 
         self.setFixedSize(420, 320)
+        self.setObjectName("VNEngineFloatingChat")
+        # Keep style minimal here and let the global VNEngine theme handle input widgets.
         self.setStyleSheet(
-            "QWidget {"
-            "  background: rgba(25, 28, 36, 245);"
-            "  border: 1px solid rgba(255,255,255,60);"
-            "  border-radius: 10px;"
+            "#VNEngineFloatingChat {"
+            "  background: rgba(255, 255, 255, 252);"
+            "  border: 1px solid #E5E7EB;"
+            "  border-radius: 12px;"
             "}"
-            "QLabel { color: rgba(235,235,240,230); }"
+            "#VNEngineFloatingChat QLabel { color: #111827; }"
+            "#VNEngineFloatingChat QLabel#VNEngineFloatingStatus { color: #FB8138; font-weight: 700; }"
         )
 
         root = QVBoxLayout(self)
@@ -222,46 +226,16 @@ class FloatingChatWidget(QWidget):
         title_row.addStretch(1)
 
         self._status = QLabel("")
-        self._status.setStyleSheet("color: rgba(180,200,255,220);")
+        self._status.setObjectName("VNEngineFloatingStatus")
         title_row.addWidget(self._status)
 
         self._min_btn = QPushButton("最小化")
         self._min_btn.setFixedHeight(30)
-        self._min_btn.setStyleSheet(
-            "QPushButton {"
-            "  background: rgba(255, 255, 255, 70);"
-            "  color: rgba(20, 24, 32, 245);"
-            "  border: 1px solid rgba(255, 255, 255, 140);"
-            "  border-radius: 6px;"
-            "  padding: 0 12px;"
-            "  font-weight: 700;"
-            "}"
-            "QPushButton:hover {"
-            "  background: rgba(255, 255, 255, 95);"
-            "  border: 1px solid rgba(80, 170, 255, 200);"
-            "}"
-            "QPushButton:pressed { background: rgba(255, 255, 255, 55); }"
-        )
         self._min_btn.clicked.connect(self._on_minimize)
         title_row.addWidget(self._min_btn)
 
         self._clear_btn = QPushButton("清空上下文")
         self._clear_btn.setFixedHeight(30)
-        self._clear_btn.setStyleSheet(
-    "QPushButton {"
-    "  background: rgba(255, 255, 255, 70);"
-    "  color: rgba(20, 24, 32, 245);"
-    "  border: 1px solid rgba(255, 255, 255, 140);"
-    "  border-radius: 6px;"
-    "  padding: 0 12px;"  # 原10px改为和最小化按钮一致的12px
-    "  font-weight: 700;"  # 新增：和最小化按钮一致的加粗字体
-    "}"
-    "QPushButton:hover {"
-    "  background: rgba(255, 255, 255, 95);"
-    "  border: 1px solid rgba(80, 170, 255, 200);"  # 新增：hover时的边框样式
-    "}"
-    "QPushButton:pressed { background: rgba(255, 255, 255, 55); }"  # 新增：按下状态的背景
-        )
         self._clear_btn.clicked.connect(self._clear_context)
         title_row.addWidget(self._clear_btn)
 
@@ -270,41 +244,11 @@ class FloatingChatWidget(QWidget):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setPlaceholderText("这里显示回复（不保存历史）")
-        self.output.setStyleSheet(
-            "QTextEdit {"
-            "  background: rgba(10, 12, 18, 210);"
-            "  color: rgba(245, 247, 252, 245);"
-            "  border: 1px solid rgba(255,255,255,45);"
-            "  border-radius: 8px;"
-            "}"
-            "QTextEdit:focus {"
-            "  border: 1px solid rgba(80, 170, 255, 200);"
-            "}"
-            "QTextEdit::selection {"
-            "  background: rgba(80, 170, 255, 140);"
-            "}"
-        )
         root.addWidget(self.output, 1)
 
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText("输入要问LLM的内容…")
         self.input.setFixedHeight(70)
-        self.input.setStyleSheet(
-            "QPlainTextEdit {"
-            "  background: rgba(12, 14, 20, 230);"
-            "  color: rgba(255, 255, 255, 245);"
-            "  border: 1px solid rgba(255,255,255,55);"
-            "  border-radius: 8px;"
-            "  padding: 6px;"
-            "  font-size: 12px;"
-            "}"
-            "QPlainTextEdit:focus {"
-            "  border: 1px solid rgba(80, 170, 255, 220);"
-            "}"
-            "QPlainTextEdit::selection {"
-            "  background: rgba(80, 170, 255, 150);"
-            "}"
-        )
         root.addWidget(self.input)
 
         btn_row = QHBoxLayout()
@@ -312,18 +256,10 @@ class FloatingChatWidget(QWidget):
         self.send_btn = QPushButton("发送")
         self.send_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.send_btn.setFixedHeight(30)
-        self.send_btn.setStyleSheet(
-            "QPushButton {"
-            "  background: rgba(45, 140, 240, 220);"
-            "  color: white;"
-            "  border: 1px solid rgba(255,255,255,50);"
-            "  border-radius: 8px;"
-            "  padding: 0 14px;"
-            "  font-weight: 700;"
-            "}"
-            "QPushButton:hover { background: rgba(45, 140, 240, 255); }"
-            "QPushButton:disabled { background: rgba(45, 140, 240, 120); }"
-        )
+        try:
+            self.send_btn.setProperty("variant", "primary")
+        except Exception:
+            pass
         self.send_btn.clicked.connect(self._on_send)
         btn_row.addWidget(self.send_btn)
         root.addLayout(btn_row)
