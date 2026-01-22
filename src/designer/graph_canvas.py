@@ -49,7 +49,7 @@ class GraphScene(QGraphicsScene):
 class FlowTextNode(QGraphicsRectItem):
     """Draggable text/choice/condition node with inline title editing."""
 
-    def __init__(self, title: str = "文本节点", speaker: str = "", content: str = "", background: str = "", portrait: str = "", voice: str = "", bgm: str = "", stop_bgm: bool = False, bgm_loop: bool = True, bg_fade_in: bool = False, node_type: str = "text", options: list[str] | None = None, condition_var: str = "", condition_value: str = "", condition_op: str = "==", condition_const: bool = False, sub_dialogues: list[dict] | None = None, ui_file: str = "", video: str = "", video_loop: bool = False, var_ops: list[dict] | None = None, size=(200, 70), node_id: int | None = None, on_position_changed=None):
+    def __init__(self, title: str = "文本节点", speaker: str = "", content: str = "", background: str = "", portrait: str = "", portrait2: str = "", voice: str = "", bgm: str = "", stop_bgm: bool = False, bgm_loop: bool = True, bg_fade_in: bool = False, node_type: str = "text", options: list[str] | None = None, condition_var: str = "", condition_value: str = "", condition_op: str = "==", condition_const: bool = False, sub_dialogues: list[dict] | None = None, ui_file: str = "", video: str = "", video_loop: bool = False, var_ops: list[dict] | None = None, size=(200, 70), node_id: int | None = None, on_position_changed=None):
         super().__init__(0, 0, size[0], size[1])
         self.node_id = node_id
         self._size = size
@@ -58,6 +58,7 @@ class FlowTextNode(QGraphicsRectItem):
         self.content = content
         self.background = background
         self.portrait = portrait
+        self.portrait2 = portrait2
         self.voice = voice
         self.bgm = bgm
         self.stop_bgm = stop_bgm
@@ -78,6 +79,10 @@ class FlowTextNode(QGraphicsRectItem):
         self.hide_textbox = False
         self.portrait_fade = False
         self.portrait_fade_out = False
+        self.portrait2_fade = False
+        self.portrait2_fade_out = False
+        self.portrait_bounce = False
+        self.portrait2_bounce = False
         self.is_start = False
         self._normal_pen = QPen(QColor(120, 120, 120))
         self._selected_pen = QPen(QColor(60, 130, 255), 2)
@@ -116,6 +121,15 @@ class FlowTextNode(QGraphicsRectItem):
 
     def set_portrait(self, portrait: str):
         self.portrait = portrait
+
+    def set_portrait2(self, portrait: str):
+        self.portrait2 = portrait
+
+    def set_portrait_bounce(self, bounce: bool):
+        self.portrait_bounce = bool(bounce)
+
+    def set_portrait2_bounce(self, bounce: bool):
+        self.portrait2_bounce = bool(bounce)
 
     def set_voice(self, voice: str):
         self.voice = voice
@@ -174,6 +188,12 @@ class FlowTextNode(QGraphicsRectItem):
     def set_portrait_fade_out(self, fade: bool):
         self.portrait_fade_out = bool(fade)
 
+    def set_portrait2_fade(self, fade: bool):
+        self.portrait2_fade = bool(fade)
+
+    def set_portrait2_fade_out(self, fade: bool):
+        self.portrait2_fade_out = bool(fade)
+
     def set_sub_dialogues(self, items: list[dict]):
         # enforce bounded list with normalized keys
         normalized = []
@@ -189,6 +209,14 @@ class FlowTextNode(QGraphicsRectItem):
             except Exception:
                 fade_out_d = 0.4
             try:
+                fade2_in_d = float(item.get("portrait2_fade_duration", fade_in_d))
+            except Exception:
+                fade2_in_d = fade_in_d
+            try:
+                fade2_out_d = float(item.get("portrait2_fade_out_duration", fade_out_d))
+            except Exception:
+                fade2_out_d = fade_out_d
+            try:
                 auto_next = float(item.get("auto_next_seconds", 0.0))
             except Exception:
                 auto_next = 0.0
@@ -198,12 +226,19 @@ class FlowTextNode(QGraphicsRectItem):
                     "text": item.get("text", ""),
                     "voice": item.get("voice", ""),
                     "portrait": item.get("portrait", ""),
+                    "portrait2": item.get("portrait2", ""),
                     "ui_file": item.get("ui_file", ""),
                     "hide_textbox": bool(item.get("hide_textbox", False)),
                     "portrait_fade": bool(item.get("portrait_fade", False)),
                     "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                    "portrait2_fade": bool(item.get("portrait2_fade", False)),
+                    "portrait2_fade_out": bool(item.get("portrait2_fade_out", False)),
+                    "portrait_bounce": bool(item.get("portrait_bounce", False)),
+                    "portrait2_bounce": bool(item.get("portrait2_bounce", False)),
                     "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
                     "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                    "portrait2_fade_duration": max(0.0, min(10.0, fade2_in_d)),
+                    "portrait2_fade_out_duration": max(0.0, min(10.0, fade2_out_d)),
                     "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                 }
             )
@@ -224,6 +259,14 @@ class FlowTextNode(QGraphicsRectItem):
                 except Exception:
                     fade_out_d = 0.4
                 try:
+                    fade2_in_d = float(item.get("portrait2_fade_duration", fade_in_d))
+                except Exception:
+                    fade2_in_d = fade_in_d
+                try:
+                    fade2_out_d = float(item.get("portrait2_fade_out_duration", fade_out_d))
+                except Exception:
+                    fade2_out_d = fade_out_d
+                try:
                     auto_next = float(item.get("auto_next_seconds", 0.0))
                 except Exception:
                     auto_next = 0.0
@@ -233,12 +276,19 @@ class FlowTextNode(QGraphicsRectItem):
                         "text": item.get("text", ""),
                         "voice": item.get("voice", ""),
                         "portrait": item.get("portrait", ""),
+                        "portrait2": item.get("portrait2", ""),
                         "ui_file": item.get("ui_file", ""),
                         "hide_textbox": bool(item.get("hide_textbox", False)),
                         "portrait_fade": bool(item.get("portrait_fade", False)),
                         "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
+                        "portrait2_fade": bool(item.get("portrait2_fade", False)),
+                        "portrait2_fade_out": bool(item.get("portrait2_fade_out", False)),
+                        "portrait_bounce": bool(item.get("portrait_bounce", False)),
+                        "portrait2_bounce": bool(item.get("portrait2_bounce", False)),
                         "portrait_fade_duration": max(0.0, min(10.0, fade_in_d)),
                         "portrait_fade_out_duration": max(0.0, min(10.0, fade_out_d)),
+                        "portrait2_fade_duration": max(0.0, min(10.0, fade2_in_d)),
+                        "portrait2_fade_out_duration": max(0.0, min(10.0, fade2_out_d)),
                         "auto_next_seconds": max(0.0, min(600.0, auto_next)),
                     }
                 )
@@ -599,6 +649,7 @@ class GraphView(QGraphicsView):
                     "content": getattr(item, "content", ""),
                     "background": getattr(item, "background", ""),
                     "portrait": getattr(item, "portrait", ""),
+                    "portrait2": getattr(item, "portrait2", ""),
                     "voice": getattr(item, "voice", ""),
                     "video": getattr(item, "video", ""),
                     "video_loop": getattr(item, "video_loop", False),
@@ -610,6 +661,10 @@ class GraphView(QGraphicsView):
                     "hide_textbox": getattr(item, "hide_textbox", False),
                     "portrait_fade": getattr(item, "portrait_fade", False),
                     "portrait_fade_out": getattr(item, "portrait_fade_out", False),
+                    "portrait2_fade": getattr(item, "portrait2_fade", False),
+                    "portrait2_fade_out": getattr(item, "portrait2_fade_out", False),
+                    "portrait_bounce": getattr(item, "portrait_bounce", False),
+                    "portrait2_bounce": getattr(item, "portrait2_bounce", False),
                     "node_type": getattr(item, "node_type", "text"),
                     "options": getattr(item, "options", []),
                     "condition_var": getattr(item, "condition_var", ""),
@@ -644,6 +699,7 @@ class GraphView(QGraphicsView):
                 content=node_data.get("content", ""),
                 background=node_data.get("background", ""),
                 portrait=node_data.get("portrait", ""),
+                portrait2=node_data.get("portrait2", ""),
                 voice=node_data.get("voice", ""),
                 video=node_data.get("video", ""),
                 video_loop=bool(node_data.get("video_loop", False)),
@@ -666,6 +722,10 @@ class GraphView(QGraphicsView):
             node.hide_textbox = bool(node_data.get("hide_textbox", False))
             node.portrait_fade = bool(node_data.get("portrait_fade", False))
             node.portrait_fade_out = bool(node_data.get("portrait_fade_out", False))
+            node.portrait2_fade = bool(node_data.get("portrait2_fade", False))
+            node.portrait2_fade_out = bool(node_data.get("portrait2_fade_out", False))
+            node.portrait_bounce = bool(node_data.get("portrait_bounce", False))
+            node.portrait2_bounce = bool(node_data.get("portrait2_bounce", False))
             try:
                 node.set_bg_fade_duration(float(node_data.get("bg_fade_duration", getattr(node, "bg_fade_duration", 0.45))))
             except Exception:
@@ -699,6 +759,7 @@ class GraphView(QGraphicsView):
                 "content": getattr(n, "content", ""),
                 "background": getattr(n, "background", ""),
                 "portrait": getattr(n, "portrait", ""),
+                "portrait2": getattr(n, "portrait2", ""),
                 "voice": getattr(n, "voice", ""),
                 "video": getattr(n, "video", ""),
                 "video_loop": getattr(n, "video_loop", False),
@@ -710,6 +771,10 @@ class GraphView(QGraphicsView):
                 "hide_textbox": getattr(n, "hide_textbox", False),
                 "portrait_fade": getattr(n, "portrait_fade", False),
                 "portrait_fade_out": getattr(n, "portrait_fade_out", False),
+                "portrait2_fade": getattr(n, "portrait2_fade", False),
+                "portrait2_fade_out": getattr(n, "portrait2_fade_out", False),
+                "portrait_bounce": getattr(n, "portrait_bounce", False),
+                "portrait2_bounce": getattr(n, "portrait2_bounce", False),
                 "node_type": getattr(n, "node_type", "text"),
                 "options": getattr(n, "options", []),
                 "condition_var": getattr(n, "condition_var", ""),
@@ -737,6 +802,7 @@ class GraphView(QGraphicsView):
                 content=item.get("content", ""),
                 background=item.get("background", ""),
                 portrait=item.get("portrait", ""),
+                portrait2=item.get("portrait2", ""),
                 voice=item.get("voice", ""),
                 video=item.get("video", ""),
                 video_loop=bool(item.get("video_loop", False)),
@@ -759,6 +825,10 @@ class GraphView(QGraphicsView):
             node.hide_textbox = bool(item.get("hide_textbox", False))
             node.portrait_fade = bool(item.get("portrait_fade", False))
             node.portrait_fade_out = bool(item.get("portrait_fade_out", False))
+            node.portrait2_fade = bool(item.get("portrait2_fade", False))
+            node.portrait2_fade_out = bool(item.get("portrait2_fade_out", False))
+            node.portrait_bounce = bool(item.get("portrait_bounce", False))
+            node.portrait2_bounce = bool(item.get("portrait2_bounce", False))
             try:
                 node.set_bg_fade_duration(float(item.get("bg_fade_duration", getattr(node, "bg_fade_duration", 0.45))))
             except Exception:
