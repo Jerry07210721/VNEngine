@@ -321,9 +321,12 @@ class AIPortraitPanel(QWidget):
         self.design_save_prompt_btn.clicked.connect(self._save_prompt_only)
         self.design_generate_btn = QPushButton("生成设定图")
         self.design_generate_btn.clicked.connect(self._generate_design_sheet)
+        self.design_force_stop_btn = QPushButton("强制停止")
+        self.design_force_stop_btn.clicked.connect(self._force_stop_task)
         action_row_d.addWidget(self.design_fill_btn)
         action_row_d.addWidget(self.design_save_prompt_btn)
         action_row_d.addWidget(self.design_generate_btn)
+        action_row_d.addWidget(self.design_force_stop_btn)
         design_layout.addWidget(self.design_action_row_widget)
 
         self.design_group.setLayout(design_layout)
@@ -419,6 +422,9 @@ class AIPortraitPanel(QWidget):
         self.base_generate_btn = QPushButton("生成基准图")
         self.base_generate_btn.clicked.connect(self._generate_base)
         full_btn_row1.addWidget(self.base_generate_btn)
+        self.base_force_stop_btn = QPushButton("强制停止")
+        self.base_force_stop_btn.clicked.connect(self._force_stop_task)
+        full_btn_row1.addWidget(self.base_force_stop_btn)
         full_btn_row1.addStretch(1)
         full_layout.addLayout(full_btn_row1)
 
@@ -429,6 +435,9 @@ class AIPortraitPanel(QWidget):
         self.expr_generate_btn = QPushButton("生成表情差分")
         self.expr_generate_btn.clicked.connect(self._generate_expressions)
         full_btn_row2.addWidget(self.expr_generate_btn)
+        self.expr_force_stop_btn = QPushButton("强制停止")
+        self.expr_force_stop_btn.clicked.connect(self._force_stop_task)
+        full_btn_row2.addWidget(self.expr_force_stop_btn)
         full_btn_row2.addStretch(1)
         full_layout.addLayout(full_btn_row2)
 
@@ -470,6 +479,11 @@ class AIPortraitPanel(QWidget):
         self._toggle_design_mj_group()
         self._on_design_flux_model_changed()
         self._on_full_flux_model_changed()
+
+    def _force_stop_task(self):
+        if self._runner.force_stop(stopped_text="状态：已强制停止"):
+            return
+        QMessageBox.information(self, "提示", "当前没有正在执行的任务。")
 
     # ==================== 基础状态 ====================
     def refresh(self):

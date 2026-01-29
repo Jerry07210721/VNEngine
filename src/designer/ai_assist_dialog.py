@@ -231,7 +231,8 @@ class AIAssistDialog(QDialog):
         key_row.addWidget(open_btn)
         form.addRow("加密密钥位置", key_row)
 
-        self.api_fields: Dict[str, Dict[str, QLineEdit]] = {}
+        # api_fields: api_name -> field_name -> widget (QLineEdit/QSpinBox...)
+        self.api_fields: Dict[str, Dict[str, QWidget]] = {}
         api_defs = {
             "claude": {},
             "kimi": {},
@@ -242,15 +243,17 @@ class AIAssistDialog(QDialog):
         }
 
         for api_name, extra in api_defs.items():
-            field: Dict[str, QLineEdit] = {}
+            field: Dict[str, QWidget] = {}
             key_edit = QLineEdit(); key_edit.setEchoMode(QLineEdit.EchoMode.Password)
             model_edit = QLineEdit()
             fallback_edit = QLineEdit()
             base_url = QLineEdit()
+            timeout_spin = QSpinBox(); timeout_spin.setRange(10, 86_400)
             field["api_key"] = key_edit
             field["primary_model"] = model_edit
             field["fallback_model"] = fallback_edit
             field["base_url"] = base_url
+            field["timeout"] = timeout_spin
 
             toggle_btn = QPushButton("显示/隐藏")
             toggle_btn.setCheckable(True)
@@ -262,7 +265,10 @@ class AIAssistDialog(QDialog):
             row_layout.addWidget(QLabel("备选模型"), 2, 0); row_layout.addWidget(fallback_edit, 2, 1)
             row_layout.addWidget(QLabel("Base URL"), 3, 0); row_layout.addWidget(base_url, 3, 1)
 
-            row_idx = 4
+            row_layout.addWidget(QLabel("超时(s)"), 4, 0)
+            row_layout.addWidget(timeout_spin, 4, 1)
+
+            row_idx = 5
             for extra_key, mask in extra.items():
                 edit = QLineEdit()
                 if mask:
@@ -368,13 +374,14 @@ class AIAssistDialog(QDialog):
         gpt_cfg = (cfg.get("api_keys") or {}).get("gptsovits", {})
         sign = gpt_cfg.get("sign", "")
         base_url = gpt_cfg.get("base_url", "https://openapi.lipvoice.cn")
+        timeout = gpt_cfg.get("timeout", 300)
 
         if not sign:
             QMessageBox.warning(self, "缺少签名", "请先在 API 配置中填写 gptsovits 的 sign")
             return None
 
         try:
-            return GPTSoVITSClient(sign=sign, base_url=base_url)
+            return GPTSoVITSClient(sign=sign, base_url=base_url, timeout=int(timeout) if timeout is not None else 300)
         except Exception as exc:
             QMessageBox.critical(self, "初始化失败", f"无法创建 gptsovits 客户端：{exc}")
             return None
@@ -589,12 +596,36 @@ class AIAssistDialog(QDialog):
     def _load_api(self, api_cfg: Dict[str, Any]):
         for name, fields in self.api_fields.items():
             data = api_cfg.get(name, {})
-            fields["api_key"].setText(data.get("api_key", ""))
-            fields["primary_model"].setText(data.get("primary_model", ""))
-            fields["fallback_model"].setText(data.get("fallback_model", ""))
-            fields["base_url"].setText(data.get("base_url", ""))
-            for extra_key in [k for k in fields.keys() if k not in ["api_key", "primary_model", "fallback_model", "base_url"]]:
-                fields[extra_key].setText(data.get(extra_key, ""))
+            # known text fields
+            api_key = fields.get("api_key")
+            if isinstance(api_key, QLineEdit):
+                api_key.setText(data.get("api_key", ""))
+            primary = fields.get("primary_model")
+            if isinstance(primary, QLineEdit):
+                primary.setText(data.get("primary_model", ""))
+            fallback = fields.get("fallback_model")
+            if isinstance(fallback, QLineEdit):
+                fallback.setText(data.get("fallback_model", ""))
+            base_url = fields.get("base_url")
+            if isinstance(base_url, QLineEdit):
+                base_url.setText(data.get("base_url", ""))
+
+            timeout_w = fields.get("timeout")
+            if isinstance(timeout_w, QSpinBox):
+                try:
+                    timeout_w.setValue(int(data.get("timeout", timeout_w.value() or 300)))
+                except Exception:
+                    timeout_w.setValue(timeout_w.value() or 300)
+
+            for extra_key in [k for k in fields.keys() if k not in ["api_key", "primary_model", "fallback_model", "base_url", "timeout"]]:
+                w = fields[extra_key]
+                if isinstance(w, QLineEdit):
+                    w.setText(str(data.get(extra_key, "") or ""))
+                elif isinstance(w, QSpinBox):
+                    try:
+                        w.setValue(int(data.get(extra_key, w.value())))
+                    except Exception:
+                        pass
 
     def save_to_config(self):
         cfg = self.config_manager.config_data or {}
@@ -675,39 +706,65 @@ class AIAssistDialog(QDialog):
     def _collect_api(self, existing: Dict[str, Any]) -> Dict[str, Any]:
         data = existing.copy()
         for name, fields in self.api_fields.items():
-            payload = {
-                "api_key": fields["api_key"].text().strip(),
-                "primary_model": fields["primary_model"].text().strip(),
-                "fallback_model": fields["fallback_model"].text().strip(),
-                "base_url": fields["base_url"].text().strip(),
-            }
+            payload: Dict[str, Any] = {}
+            api_key = fields.get("api_key")
+            if isinstance(api_key, QLineEdit):
+                payload["api_key"] = api_key.text().strip()
+            primary = fields.get("primary_model")
+            if isinstance(primary, QLineEdit):
+                payload["primary_model"] = primary.text().strip()
+            fallback = fields.get("fallback_model")
+            if isinstance(fallback, QLineEdit):
+                payload["fallback_model"] = fallback.text().strip()
+            base_url = fields.get("base_url")
+            if isinstance(base_url, QLineEdit):
+                payload["base_url"] = base_url.text().strip()
+
+            timeout_w = fields.get("timeout")
+            if isinstance(timeout_w, QSpinBox):
+                payload["timeout"] = int(timeout_w.value())
+
             for extra_key in [k for k in fields.keys() if k not in payload]:
-                payload[extra_key] = fields[extra_key].text().strip()
+                w = fields[extra_key]
+                if isinstance(w, QLineEdit):
+                    payload[extra_key] = w.text().strip()
+                elif isinstance(w, QSpinBox):
+                    payload[extra_key] = int(w.value())
             data[name] = payload
         return data
 
     def _validate_api_config(self):
         missing = []
         for name, fields in self.api_fields.items():
-            key = fields["api_key"].text().strip()
-            primary = fields["primary_model"].text().strip()
+            key_w = fields.get("api_key")
+            primary_w = fields.get("primary_model")
+            key = key_w.text().strip() if isinstance(key_w, QLineEdit) else ""
+            primary = primary_w.text().strip() if isinstance(primary_w, QLineEdit) else ""
             # 对剧情必须有claude或kimi，其余非空即认为配置完成
             if name in ["claude", "kimi"]:
-                if not key and not any(self.api_fields[n]["api_key"].text().strip() for n in ["claude", "kimi"]):
+                def _get_key(n: str) -> str:
+                    w = (self.api_fields.get(n) or {}).get("api_key")
+                    return w.text().strip() if isinstance(w, QLineEdit) else ""
+
+                if not key and not any(_get_key(n) for n in ["claude", "kimi"]):
                     missing.append("需要配置 Claude 或 Kimi 的 Key")
             requires_primary = name not in ["gptsovits"]
             if key and requires_primary and not primary:
                 missing.append(f"{name} 缺少主模型")
             if name in ["midjourney", "flux"] and key:
-                if not fields.get("app_id", None) or not fields["app_id"].text().strip():
+                w = fields.get("app_id", None)
+                if not isinstance(w, QLineEdit) or not w.text().strip():
                     missing.append(f"{name} 需要 App ID")
             if name == "gptsovits" and key:
-                if not fields.get("sign", None) or not fields["sign"].text().strip():
+                w = fields.get("sign", None)
+                if not isinstance(w, QLineEdit) or not w.text().strip():
                     missing.append("gptsovits 需要 sign")
             if name == "suno" and key:
-                if not fields.get("token", None) or not fields["token"].text().strip():
+                w = fields.get("token", None)
+                if not isinstance(w, QLineEdit) or not w.text().strip():
                     missing.append("suno 需要 token (x-token)")
-                if not fields.get("user_id", None) or not fields["user_id"].text().strip():
+                w = fields.get("user_id", None)
+                if not isinstance(w, QLineEdit) or not w.text().strip():
                     missing.append("suno 需要 user_id (x-userId)")
         if missing:
             QMessageBox.warning(self, "验证未通过", "\n".join(missing))

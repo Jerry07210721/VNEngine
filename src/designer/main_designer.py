@@ -31,6 +31,7 @@ from src.designer.graph_canvas import GraphView
 from src.designer.resource_panel import ResourceDock
 from src.designer.properties_panel import PropertiesDock
 from src.designer.ui_designer import UILayoutDesigner
+from src.designer.function_menu_designer import FunctionMenuDesigner
 from src.designer.menu_designer import MainMenuDesigner
 from src.designer.global_vars_dialog import GlobalVarsDialog
 from src.designer.ai_assist_dialog import AIAssistDialog, APIConfigDialog
@@ -222,7 +223,7 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.4")
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.5")
         self.setObjectName("VNDesignerMainWindow")
         # 设计模式默认窗口大小：1280x720
         self.setGeometry(100, 100, 1280, 720)
@@ -320,6 +321,10 @@ class VNDesignerMainWindow(QMainWindow):
         menu_design_action = QAction("主菜单设计", self)
         menu_design_action.triggered.connect(self.open_menu_designer)
         ui_menu.addAction(menu_design_action)
+
+        func_menu_action = QAction("功能菜单设计", self)
+        func_menu_action.triggered.connect(self.open_function_menu_designer)
+        ui_menu.addAction(func_menu_action)
         self.menuBar().addMenu(ui_menu)
 
         ai_menu = QMenu("AI 辅助(&A)", self)
@@ -705,6 +710,13 @@ class VNDesignerMainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先新建或加载工程后再设计主菜单。")
             return
         dlg = MainMenuDesigner(self.project_dir, self.project_manager, self._current_resolution(), self)
+        dlg.exec()
+
+    def open_function_menu_designer(self):
+        if not self.project_dir:
+            QMessageBox.warning(self, "提示", "请先新建或加载工程后再设计功能菜单。")
+            return
+        dlg = FunctionMenuDesigner(Path(self.project_dir), self.project_manager, self._current_resolution(), self)
         dlg.exec()
 
     def open_global_vars(self):

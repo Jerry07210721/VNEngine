@@ -608,7 +608,7 @@ class AIProjectWindow(QMainWindow):
             self,
             "关于",
             "VNEngine AI辅助工程\n\n"
-            "版本: V2.4\n"
+            "版本: V2.5\n"
             "多智能体协作GalGame制作引擎\n\n"
             "© 2026 VNEngine Team"
         )
