@@ -45,6 +45,18 @@ class AsyncElapsedRunner(QObject):
         self._elapsed: Optional[QElapsedTimer] = None
         self._label: Optional[QLabel] = None
         self._base_text: str = ""
+        self._on_finally: Optional[Callable[[], None]] = None
+
+    def _cleanup(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer.deleteLater()
+            self._timer = None
+        self._elapsed = None
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
+        self._on_finally = None
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.isRunning())
@@ -76,6 +88,7 @@ class AsyncElapsedRunner(QObject):
 
         self._label = label
         self._base_text = base_text
+        self._on_finally = on_finally
         self._elapsed = QElapsedTimer()
         self._elapsed.start()
 
@@ -89,16 +102,6 @@ class AsyncElapsedRunner(QObject):
         thread = _FunctionThread(fn)
         self._thread = thread
 
-        def _cleanup() -> None:
-            if self._timer is not None:
-                self._timer.stop()
-                self._timer.deleteLater()
-                self._timer = None
-            self._elapsed = None
-            if self._thread is not None:
-                self._thread.deleteLater()
-                self._thread = None
-
         def _handle_error(err_text: str) -> None:
             try:
                 if on_error is not None:
@@ -106,22 +109,68 @@ class AsyncElapsedRunner(QObject):
                 else:
                     QMessageBox.critical(self._parent_widget, "错误", err_text)
             finally:
-                _cleanup()
-                if on_finally is not None:
-                    on_finally()
+                cb = self._on_finally
+                self._cleanup()
+                if cb is not None:
+                    cb()
 
         def _handle_result(res: Any) -> None:
             try:
                 on_success(res)
             finally:
-                _cleanup()
-                if on_finally is not None:
-                    on_finally()
+                cb = self._on_finally
+                self._cleanup()
+                if cb is not None:
+                    cb()
 
         thread.error.connect(_handle_error)
         thread.result.connect(_handle_result)
         thread.start()
         return True
+
+    def force_stop(self, *, stopped_text: str = "状态：已强制停止") -> bool:
+        """Force-stop current running task.
+
+        Note: this uses QThread.terminate() as a last resort.
+        """
+
+        if not self.is_running():
+            return False
+
+        thread = self._thread
+        try:
+            if thread is not None:
+                try:
+                    thread.blockSignals(True)
+                except Exception:
+                    pass
+                try:
+                    thread.requestInterruption()
+                except Exception:
+                    pass
+                try:
+                    thread.terminate()
+                except Exception:
+                    pass
+                try:
+                    thread.wait(800)
+                except Exception:
+                    pass
+        finally:
+            if self._label is not None:
+                try:
+                    self._label.setText(str(stopped_text or "状态：已强制停止"))
+                except RuntimeError:
+                    pass
+
+            cb = self._on_finally
+            self._cleanup()
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    # Keep stop resilient; UI may already be closing.
+                    pass
 
     def _tick(self) -> None:
         if not self._label or not self._elapsed:

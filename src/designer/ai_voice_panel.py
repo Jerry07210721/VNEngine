@@ -301,12 +301,15 @@ class AIVoicePanel(QWidget):
         self.voice_translate_build_btn.clicked.connect(self._build_voice_translate_instruction)
         self.voice_translate_call_btn = QPushButton("调用LLM翻译")
         self.voice_translate_call_btn.clicked.connect(self._call_llm_translate_voices)
+        self.voice_translate_stop_btn = QPushButton("强制停止")
+        self.voice_translate_stop_btn.clicked.connect(self._force_stop_task)
         self.voice_translate_save_btn = QPushButton("保存结果")
         self.voice_translate_save_btn.clicked.connect(self._save_voice_translate_fields)
         self.voice_translate_apply_btn = QPushButton("应用到第二语言")
         self.voice_translate_apply_btn.clicked.connect(self._apply_voice_translate_result)
         tl_btn_row.addWidget(self.voice_translate_build_btn)
         tl_btn_row.addWidget(self.voice_translate_call_btn)
+        tl_btn_row.addWidget(self.voice_translate_stop_btn)
         tl_btn_row.addWidget(self.voice_translate_save_btn)
         tl_btn_row.addWidget(self.voice_translate_apply_btn)
         tl_btn_row.addStretch(1)
@@ -326,11 +329,14 @@ class AIVoicePanel(QWidget):
         action_row = QHBoxLayout()
         self.generate_btn = QPushButton("生成当前语音")
         self.generate_btn.clicked.connect(self._generate_single)
+        self.force_stop_btn = QPushButton("强制停止")
+        self.force_stop_btn.clicked.connect(self._force_stop_task)
         self.mark_btn = QPushButton("标记完成")
         self.mark_btn.clicked.connect(self.mark_generated)
         self.reset_btn = QPushButton("重置待生成")
         self.reset_btn.clicked.connect(self.reset_status)
         action_row.addWidget(self.generate_btn)
+        action_row.addWidget(self.force_stop_btn)
         action_row.addWidget(self.mark_btn)
         action_row.addWidget(self.reset_btn)
         action_row.addStretch(1)
@@ -371,6 +377,18 @@ class AIVoicePanel(QWidget):
         self.tts_genre_combo.currentIndexChanged.connect(self._sync_voice_tts_settings_to_project)
         self.use_emotion_ext_check.stateChanged.connect(self._sync_voice_tts_settings_to_project)
         self.emotion_strength_spin.valueChanged.connect(self._sync_voice_tts_settings_to_project)
+
+    def _force_stop_task(self):
+        # 批量模式优先用“停止”逻辑（避免后台循环继续排队）
+        try:
+            if getattr(self, "_auto_running", False):
+                self._stop_auto()
+        except Exception:
+            pass
+
+        if self._runner.force_stop(stopped_text="状态：已强制停止"):
+            return
+        QMessageBox.information(self, "提示", "当前没有正在执行的任务。")
 
     # ==================== 列表与显示 ====================
     def refresh(self):

@@ -196,6 +196,55 @@ class AIMasterControlPanel(QWidget):
         worker.error.connect(_fail)
         worker.start()
 
+    def _force_stop_current_task(self) -> None:
+        """强制终止当前正在执行的后台任务（尽力而为）。"""
+
+        worker = self._active_worker
+        if not worker or not worker.isRunning():
+            QMessageBox.information(self, "提示", "当前没有正在执行的任务。")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "确认强制停止",
+            "将强制终止当前任务线程（可能导致当前请求/任务不完整）。\n确定要停止吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            try:
+                worker.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass
+            try:
+                worker.terminate()
+            except Exception:
+                pass
+            try:
+                worker.wait(1200)
+            except Exception:
+                pass
+        finally:
+            self._elapsed_updater.stop()
+            if self._busy_label is not None:
+                try:
+                    self._busy_label.setText("状态：已强制停止")
+                except Exception:
+                    pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            self._active_worker = None
+            self._busy_label = None
+
     # ==================== UI ====================
 
     def init_ui(self):
@@ -272,9 +321,11 @@ class AIMasterControlPanel(QWidget):
 
         self.step4_prepare_btn = QPushButton("准备指令")
         self.step4_send_btn = QPushButton("发送/生成")
+        self.step4_stop_btn = QPushButton("强制停止")
         self.step4_save_btn = QPushButton("保存结果")
         self.step4_prepare_btn.clicked.connect(self.prepare_chapter_detail)
         self.step4_send_btn.clicked.connect(self.send_chapter_detail)
+        self.step4_stop_btn.clicked.connect(self._force_stop_current_task)
         self.step4_save_btn.clicked.connect(self.save_chapter_detail)
 
         self.step4_max_tokens_label = QLabel("maxTokens：")
@@ -289,6 +340,7 @@ class AIMasterControlPanel(QWidget):
         selector_row.addStretch(1)
         selector_row.addWidget(self.step4_prepare_btn)
         selector_row.addWidget(self.step4_send_btn)
+        selector_row.addWidget(self.step4_stop_btn)
         selector_row.addWidget(self.step4_save_btn)
         selector_row.addSpacing(10)
         selector_row.addWidget(self.step4_max_tokens_label)
@@ -347,10 +399,13 @@ class AIMasterControlPanel(QWidget):
 
         btn_row5 = QHBoxLayout()
         self.step5_generate_btn = QPushButton("生成列表")
+        self.step5_stop_btn = QPushButton("强制停止")
         self.step5_save_btn = QPushButton("保存到工程")
         self.step5_generate_btn.clicked.connect(self.generate_pending_lists)
+        self.step5_stop_btn.clicked.connect(self._force_stop_current_task)
         self.step5_save_btn.clicked.connect(self.save_pending_lists)
         btn_row5.addWidget(self.step5_generate_btn)
+        btn_row5.addWidget(self.step5_stop_btn)
         btn_row5.addWidget(self.step5_save_btn)
         btn_row5.addStretch(1)
         step5_layout.addLayout(btn_row5)
@@ -382,6 +437,9 @@ class AIMasterControlPanel(QWidget):
         self.step6_generate_btn = QPushButton("生成 .vngproj")
         self.step6_generate_btn.clicked.connect(self.generate_project_file)
         btn_row6.addWidget(self.step6_generate_btn)
+        self.step6_stop_btn = QPushButton("强制停止")
+        self.step6_stop_btn.clicked.connect(self._force_stop_current_task)
+        btn_row6.addWidget(self.step6_stop_btn)
         btn_row6.addStretch(1)
         step6_layout.addLayout(btn_row6)
         self.step6_result = QTextEdit()
@@ -416,10 +474,13 @@ class AIMasterControlPanel(QWidget):
 
         prepare_btn = QPushButton("准备指令")
         send_btn = QPushButton("发送/生成")
+        stop_btn = QPushButton("强制停止")
         prepare_btn.clicked.connect(prepare_handler)
         send_btn.clicked.connect(send_handler)
+        stop_btn.clicked.connect(self._force_stop_current_task)
         header.addWidget(prepare_btn)
         header.addWidget(send_btn)
+        header.addWidget(stop_btn)
         if save_handler:
             save_btn = QPushButton("保存结果")
             save_btn.clicked.connect(save_handler)

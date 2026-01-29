@@ -80,8 +80,9 @@ class VNGameRuntime:
         self.portrait_scale = 1.0
         self.portrait2_scale = 1.0
         self._ui_layout_cache: dict[Path, dict] = {}
+        self._ui_frame_cache: dict[tuple[Path, int, int, int], pygame.Surface] = {}
+        self._ui_overlay_bg_cache: dict[tuple[Path, int, int], pygame.Surface] = {}
         self._active_ui_layout: dict | None = None
-        self._apply_window_size(self.window_size)
         self.branch_strategy = "first"
         self.save_dir = (self.project_path.parent / "saves") if self.project_path else Path.cwd() / "saves"
         self.settings_path = (self.project_path.parent / "settings.yaml") if self.project_path else Path.cwd() / "settings.yaml"
@@ -115,6 +116,61 @@ class VNGameRuntime:
         self._menu_title_image_surface: pygame.Surface | None = None
         self._menu_title_image_pos: tuple[int, int] = (400, 80)
         self._menu_title_image_scale: float = 1.0
+
+        # menu items defaults (may be overridden by project config in _load_dialogues/_apply_menu_config)
+        self._menu_items = [
+            {"label": "开始游戏", "action": "start"},
+            {"label": "继续", "action": "continue"},
+            {"label": "读取存档", "action": "load"},
+            {"label": "设置", "action": "settings"},
+            {"label": "退出", "action": "exit"},
+        ]
+        self._menu_option_spacing: int = 10
+        self._menu_option_selected_zoom: float = 1.08
+        self._menu_option_hover_color: tuple[int, int, int] = (255, 255, 255)
+        self._menu_option_indicator: bool = False
+        self._menu_option_indicator_image_path: str = ""
+        self._menu_option_indicator_image_scale: float = 1.0
+        self._menu_option_indicator_image_surface: pygame.Surface | None = None
+        self._menu_option_image_surfaces: dict[str, pygame.Surface] = {}
+        self._menu_selected = 0
+        # runtime-only: menu hit boxes (render-surface coordinates)
+        self._menu_item_hitboxes: list[pygame.Rect | None] = []
+
+        # mouse cursor state (hand over clickable items)
+        self._mouse_cursor_is_hand: bool = False
+
+        # function menu overlays (save/load/settings/history/help)
+        self._function_menus_enabled: bool = False
+        self._function_menus_cfg: dict = {}
+        self._function_menus_from_project: bool = False
+        self._overlay_hover: str | None = None
+        self._overlay_hitboxes: dict[str, pygame.Rect] = {}
+        self._overlay_slot_hitboxes: list[tuple[int, pygame.Rect]] = []
+        self._overlay_dragging_slider: str | None = None
+        self._overlay_settings_snapshot: dict | None = None
+        self._overlay_scroll_offset: int = 0
+
+        # in-game HUD button group (mouse-only)
+        self._hud_buttons_enabled: bool = False
+        self._hud_button_pos: tuple[int, int] = (20, 20)
+        self._hud_button_spacing: int = 10
+        self._hud_button_scale: float = 1.0
+        self._hud_button_selected_zoom: float = 1.08
+        self._hud_button_orientation: str = "vertical"  # 'vertical' | 'horizontal'
+        self._hud_button_color: tuple[int, int, int] = (255, 255, 255)
+        self._hud_button_hover_color: tuple[int, int, int] = (255, 255, 255)
+        self._hud_buttons: list[dict] = []
+        self._hud_selected: int = -1
+        self._hud_button_hitboxes: list[pygame.Rect | None] = []
+        self._hud_button_image_surfaces: dict[str, pygame.Surface] = {}
+
+        # prefer project-level function menu config (game_config.function_menus)
+        self._apply_function_menus_from_game_config(cfg)
+
+        # now apply window/layout (HUD + function menus need to exist first)
+        self._apply_window_size(self.window_size)
+
         self.dialogues = self._load_dialogues()
         self.current_index = 0
         self.current_visible_len = 0
@@ -187,14 +243,7 @@ class VNGameRuntime:
         self._video_time: float = 0.0
         self._video_duration: float | None = None
         self._video_surface: pygame.Surface | None = None
-        self._menu_items = [
-            {"label": "开始游戏", "action": "start"},
-            {"label": "继续", "action": "continue"},
-            {"label": "读取存档", "action": "load"},
-            {"label": "设置", "action": "settings"},
-            {"label": "退出", "action": "exit"},
-        ]
-        self._menu_selected = 0
+        # NOTE: menu defaults are initialized before _load_dialogues; do not overwrite here.
         self._history: list[dict] = []
         self._history_overlay: bool = False
         self._splash_time: float = 2.5
@@ -232,6 +281,7 @@ class VNGameRuntime:
                     self._help_hotkey_name = str(game_cfg.get("help_hotkey", self._help_hotkey_name) or self._help_hotkey_name)
                     self._help_right_click = bool(game_cfg.get("help_right_click", self._help_right_click))
                     self._apply_menu_config(game_cfg)
+                    self._apply_function_menus_from_game_config(game_cfg)
                     self._load_graph_from_flow(data)
                     if self.graph_mode and self.current_node_id is not None:
                         return []
@@ -409,6 +459,54 @@ class VNGameRuntime:
         print("剧情已重新加载")
 
     def _apply_menu_config(self, cfg: dict):
+        def _normalize_buttons(raw) -> list[dict]:
+            defaults = [
+                {"label": "开始游戏", "action": "start"},
+                {"label": "继续", "action": "continue"},
+                {"label": "读取存档", "action": "load"},
+                {"label": "设置", "action": "settings"},
+                {"label": "退出", "action": "exit"},
+            ]
+            by_action: dict[str, dict] = {}
+            if isinstance(raw, list):
+                for it in raw:
+                    if not isinstance(it, dict):
+                        continue
+                    action = str(it.get("action") or "").strip()
+                    if action not in {"start", "continue", "load", "settings", "exit"}:
+                        continue
+                    by_action[action] = dict(it)
+            out: list[dict] = []
+            for base in defaults:
+                action = base["action"]
+                it = by_action.get(action, {})
+                label = str(it.get("label") or base["label"])
+                image = str(it.get("image") or it.get("image_path") or "")
+                style_raw = it.get("style") or it.get("mode")
+                if style_raw is None or str(style_raw).strip() == "":
+                    style = "image" if image else "text"
+                else:
+                    style = str(style_raw).strip().lower()
+                if style not in {"text", "image"}:
+                    style = "image" if image else "text"
+
+                image_scale = it.get("image_scale", None)
+                if image_scale is not None:
+                    try:
+                        image_scale = float(image_scale)
+                    except Exception:
+                        image_scale = None
+                if isinstance(image_scale, (int, float)):
+                    image_scale = max(0.1, min(5.0, float(image_scale)))
+                out.append({
+                    "action": action,
+                    "label": label,
+                    "style": style,
+                    "image": image,
+                    "image_scale": image_scale,
+                })
+            return out
+
         self._menu_title = cfg.get("menu_title") or (self.project_path.stem if self.project_path else "VNEngine")
         self._menu_bg_path = cfg.get("menu_background") or ""
         self._menu_video_path = cfg.get("menu_video") or ""
@@ -423,6 +521,7 @@ class VNGameRuntime:
         self._menu_option_pos = self._pair_from_cfg(cfg.get("menu_option_pos"), (80, 140))
         self._menu_title_color = self._color_from_cfg(cfg.get("menu_title_color"), (240, 240, 255))
         self._menu_option_color = self._color_from_cfg(cfg.get("menu_option_color"), (255, 255, 255))
+        self._menu_option_hover_color = self._color_from_cfg(cfg.get("menu_option_hover_color"), self._menu_option_color)
         try:
             self._menu_title_scale = float(cfg.get("menu_title_scale", 1.0) or 1.0)
         except Exception:
@@ -433,6 +532,27 @@ class VNGameRuntime:
         except Exception:
             self._menu_option_scale = 1.0
         self._menu_option_scale = max(0.5, min(5.0, float(self._menu_option_scale)))
+
+        try:
+            self._menu_option_spacing = int(cfg.get("menu_option_spacing", 10) or 10)
+        except Exception:
+            self._menu_option_spacing = 10
+        self._menu_option_spacing = max(0, min(200, int(self._menu_option_spacing)))
+
+        try:
+            self._menu_option_selected_zoom = float(cfg.get("menu_option_selected_zoom", 1.08) or 1.08)
+        except Exception:
+            self._menu_option_selected_zoom = 1.08
+        self._menu_option_selected_zoom = max(1.0, min(1.5, float(self._menu_option_selected_zoom)))
+
+        self._menu_option_indicator = bool(cfg.get("menu_option_indicator", False))
+
+        self._menu_option_indicator_image_path = str(cfg.get("menu_option_indicator_image") or "")
+        try:
+            self._menu_option_indicator_image_scale = float(cfg.get("menu_option_indicator_image_scale", 1.0) or 1.0)
+        except Exception:
+            self._menu_option_indicator_image_scale = 1.0
+        self._menu_option_indicator_image_scale = max(0.1, min(5.0, float(self._menu_option_indicator_image_scale)))
         self._menu_title_image_path = cfg.get("menu_title_image") or ""
         self._menu_title_image_pos = self._pair_from_cfg(cfg.get("menu_title_image_pos"), (400, 80))
         try:
@@ -440,6 +560,557 @@ class VNGameRuntime:
         except Exception:
             self._menu_title_image_scale = 1.0
         self._menu_title_image_scale = max(0.1, min(5.0, float(self._menu_title_image_scale)))
+
+        # menu buttons (optional override)
+        self._menu_items = _normalize_buttons(cfg.get("menu_buttons"))
+        self._menu_selected = 0
+
+    def _apply_hud_buttons_from_ui_layout(self, layout: dict | None):
+        """Read in-game HUD button group config from UI layout JSON."""
+
+        def _normalize_buttons(raw) -> list[dict]:
+            defaults = [
+                {"label": "存档", "action": "save"},
+                {"label": "读档", "action": "load"},
+                {"label": "设置", "action": "settings"},
+                {"label": "历史记录", "action": "history"},
+                {"label": "返回主菜单", "action": "menu"},
+                {"label": "全屏", "action": "fullscreen"},
+            ]
+            by_action: dict[str, dict] = {}
+            if isinstance(raw, list):
+                for it in raw:
+                    if not isinstance(it, dict):
+                        continue
+                    action = str(it.get("action") or "").strip()
+                    if action not in {"save", "load", "settings", "history", "menu", "fullscreen"}:
+                        continue
+                    by_action[action] = dict(it)
+
+            out: list[dict] = []
+            for base in defaults:
+                action = base["action"]
+                it = by_action.get(action, {})
+                label = str(it.get("label") or base["label"])
+                image = str(it.get("image") or it.get("image_path") or "")
+                style_raw = it.get("style") or it.get("mode")
+                if style_raw is None or str(style_raw).strip() == "":
+                    style = "image" if image else "text"
+                else:
+                    style = str(style_raw).strip().lower()
+                if style not in {"text", "image"}:
+                    style = "image" if image else "text"
+
+                image_scale = it.get("image_scale", None)
+                if image_scale is not None:
+                    try:
+                        image_scale = float(image_scale)
+                    except Exception:
+                        image_scale = None
+                if isinstance(image_scale, (int, float)):
+                    image_scale = max(0.1, min(5.0, float(image_scale)))
+                out.append({
+                    "action": action,
+                    "label": label,
+                    "style": style,
+                    "image": image,
+                    "image_scale": image_scale,
+                })
+            return out
+
+        layout = layout or {}
+        self._hud_buttons_enabled = bool(layout.get("hud_buttons_enabled", False))
+        self._hud_button_pos = self._pair_from_cfg(layout.get("hud_button_pos"), (20, 20))
+        try:
+            self._hud_button_spacing = int(layout.get("hud_button_spacing", 10) or 10)
+        except Exception:
+            self._hud_button_spacing = 10
+        self._hud_button_spacing = max(0, min(200, int(self._hud_button_spacing)))
+
+        try:
+            self._hud_button_scale = float(layout.get("hud_button_scale", 1.0) or 1.0)
+        except Exception:
+            self._hud_button_scale = 1.0
+        self._hud_button_scale = max(0.5, min(5.0, float(self._hud_button_scale)))
+
+        try:
+            self._hud_button_selected_zoom = float(layout.get("hud_button_selected_zoom", 1.08) or 1.08)
+        except Exception:
+            self._hud_button_selected_zoom = 1.08
+        self._hud_button_selected_zoom = max(1.0, min(1.5, float(self._hud_button_selected_zoom)))
+
+        orient = str(layout.get("hud_button_orientation") or "vertical").strip().lower()
+        self._hud_button_orientation = "horizontal" if orient in {"h", "horizontal", "row", "x"} else "vertical"
+
+        self._hud_button_color = self._color_from_cfg(layout.get("hud_button_color"), (255, 255, 255))
+        self._hud_button_hover_color = self._color_from_cfg(layout.get("hud_button_hover_color"), self._hud_button_color)
+        self._hud_buttons = _normalize_buttons(layout.get("hud_buttons"))
+        # hover-only selection (mouse)
+        self._hud_selected = -1
+        # reset cached hitboxes to align with buttons
+        self._hud_button_hitboxes = [None] * len(self._hud_buttons)
+
+        # load images for image-style buttons
+        self._hud_button_image_surfaces = {}
+        for it in self._hud_buttons:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("style") or "text") != "image":
+                continue
+            action = str(it.get("action") or "")
+            img_rel = str(it.get("image") or "")
+            if not action or not img_rel:
+                continue
+            p = self._resolve_path(img_rel)
+            if not p.exists():
+                continue
+            try:
+                img = pygame.image.load(str(p)).convert_alpha()
+                self._hud_button_image_surfaces[action] = img
+            except Exception:
+                continue
+
+    def _apply_function_menus_from_game_config(self, cfg: dict | None) -> None:
+        cfg = cfg or {}
+        fm = cfg.get("function_menus") if isinstance(cfg, dict) else None
+        if not isinstance(fm, dict):
+            self._function_menus_from_project = False
+            # do not force-disable here; allow UI-layout fallback if present
+            return
+        self._function_menus_from_project = True
+        self._function_menus_enabled = bool(fm.get("enabled", False))
+        self._function_menus_cfg = fm
+
+    def _apply_function_menus_from_ui_layout(self, layout: dict | None) -> None:
+        """Read configurable function-menu overlays (save/load/settings/history/help) from UI layout JSON."""
+        layout = layout or {}
+        fm = layout.get("function_menus") if isinstance(layout, dict) else None
+        if not isinstance(fm, dict):
+            self._function_menus_enabled = False
+            self._function_menus_cfg = {}
+            return
+        self._function_menus_enabled = bool(fm.get("enabled", False))
+        self._function_menus_cfg = fm
+
+    def _overlay_type(self) -> str | None:
+        if self._save_overlay:
+            return "save"
+        if self._load_overlay:
+            return "load"
+        if self._settings_overlay:
+            return "settings"
+        if self._history_overlay:
+            return "history"
+        if self._help_overlay:
+            return "help"
+        return None
+
+    def _get_function_menu_cfg(self, name: str) -> dict:
+        fm = self._function_menus_cfg if isinstance(self._function_menus_cfg, dict) else {}
+        common = fm.get("common") if isinstance(fm.get("common"), dict) else {}
+        specific = fm.get(name) if isinstance(fm.get(name), dict) else {}
+
+        merged = dict(common)
+        merged.update(specific)
+
+        # defaults
+        merged.setdefault("overlay_alpha", 160)
+        merged.setdefault("background_image", "")
+        merged.setdefault("background_alpha", 255)
+        merged.setdefault("font_size", 18)
+        merged.setdefault("title_font_size", 22)
+        merged.setdefault("title_color", [255, 255, 255])
+        merged.setdefault("text_color", [230, 230, 230])
+        merged.setdefault("hint_color", [200, 200, 200])
+        merged.setdefault("hover_color", [255, 255, 255])
+        merged.setdefault("title_pos", [40, 40])
+        merged.setdefault("content_pos", [40, 90])
+        merged.setdefault(
+            "close_button",
+            {"pos": [self.render_size[0] - 60, 40], "size": [32, 32], "text": "×"},
+        )
+
+        if name in {"save", "load"}:
+            merged.setdefault("slot_list_pos", [40, 120])
+            merged.setdefault("slot_list_width", self.render_size[0] - 80)
+            merged.setdefault("slot_row_height", 34)
+            merged.setdefault("slot_row_spacing", 8)
+            merged.setdefault("slot_bg_alpha", 90)
+            merged.setdefault("slot_hover_alpha", 140)
+            merged.setdefault("page_prev_pos", [40, self.render_size[1] - 60])
+            merged.setdefault("page_next_pos", [140, self.render_size[1] - 60])
+            merged.setdefault("page_text_pos", [240, self.render_size[1] - 60])
+
+        if name == "settings":
+            merged.setdefault("slider_pos", [80, 140])
+            merged.setdefault("slider_width", self.render_size[0] - 160)
+            merged.setdefault("slider_height", 10)
+            merged.setdefault("slider_gap", 70)
+            merged.setdefault("button_row_pos", [80, self.render_size[1] - 90])
+            merged.setdefault("button_size", [120, 36])
+
+        if name in {"history", "help"}:
+            merged.setdefault("text_area", [40, 100, self.render_size[0] - 80, self.render_size[1] - 160])
+
+        return merged
+
+    def _load_overlay_background(self, rel_path: str) -> pygame.Surface | None:
+        s = (rel_path or "").strip()
+        if not s:
+            return None
+        p = self._resolve_path(s)
+        if not p.exists():
+            return None
+        w, h = self.render_size
+        key = (p, int(w), int(h))
+        if key in self._ui_overlay_bg_cache:
+            return self._ui_overlay_bg_cache[key]
+        try:
+            img = pygame.image.load(str(p)).convert_alpha()
+            if img.get_width() != w or img.get_height() != h:
+                try:
+                    img = pygame.transform.smoothscale(img, (w, h))
+                except Exception:
+                    img = pygame.transform.scale(img, (w, h))
+            self._ui_overlay_bg_cache[key] = img
+            return img
+        except Exception:
+            return None
+
+    def _overlay_close(self) -> None:
+        if self._save_overlay:
+            self._save_overlay = False
+        if self._load_overlay:
+            self._load_overlay = False
+        if self._settings_overlay:
+            self._settings_overlay = False
+        if self._history_overlay:
+            self._history_overlay = False
+        if self._help_overlay:
+            self._help_overlay = False
+        self._overlay_dragging_slider = None
+        self._overlay_hover = None
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
+    def _overlay_update_slider_value(self, key: str, mx: int) -> None:
+        r = (self._overlay_hitboxes or {}).get(f"slider:{key}")
+        if r is None:
+            return
+        t = 0.0
+        if r.w > 0:
+            t = (mx - r.x) / float(r.w)
+        t = max(0.0, min(1.0, t))
+        if key == "typing_speed":
+            self._settings["typing_speed"] = 4.0 + t * (120.0 - 4.0)
+        else:
+            self._settings[key] = t
+        self._apply_settings()
+
+    def _overlay_handle_mouse_motion(self, render_pos) -> bool:
+        if not self._function_menus_enabled:
+            return False
+        ot = self._overlay_type()
+        if not ot:
+            return False
+        if render_pos is None:
+            self._overlay_hover = None
+            return False
+
+        mx, my = render_pos
+        hand = False
+        hovered = None
+
+        if self._overlay_dragging_slider:
+            # drag updates value continuously
+            hovered = self._overlay_dragging_slider
+            hand = True
+            try:
+                self._overlay_update_slider_value(str(self._overlay_dragging_slider), int(mx))
+            except Exception:
+                pass
+        else:
+            for k, rect in (self._overlay_hitboxes or {}).items():
+                if rect.collidepoint(mx, my):
+                    hovered = k
+                    hand = True
+                    break
+            if not hand and self._overlay_slot_hitboxes:
+                for slot_id, rect in self._overlay_slot_hitboxes:
+                    if rect.collidepoint(mx, my):
+                        hovered = f"slot:{slot_id}"
+                        hand = True
+                        break
+
+        self._overlay_hover = hovered
+        return hand
+
+    def _overlay_handle_mouse_down(self, render_pos) -> bool:
+        if not self._function_menus_enabled:
+            return False
+        ot = self._overlay_type()
+        if not ot:
+            return False
+        if render_pos is None:
+            return True
+
+        mx, my = render_pos
+
+        r_close = (self._overlay_hitboxes or {}).get("close")
+        if r_close is not None and r_close.collidepoint(mx, my):
+            if ot == "settings" and isinstance(self._overlay_settings_snapshot, dict):
+                self._settings = dict(self._overlay_settings_snapshot)
+                self._apply_settings()
+            self._overlay_close()
+            self._overlay_settings_snapshot = None
+            return True
+
+        if ot in {"save", "load"}:
+            for slot_id, rect in self._overlay_slot_hitboxes:
+                if rect.collidepoint(mx, my):
+                    if ot == "save":
+                        self.save_game(slot_id)
+                        self._save_overlay = False
+                    else:
+                        self.load_game(slot_id)
+                        self._load_overlay = False
+                    return True
+
+            r_prev = (self._overlay_hitboxes or {}).get("page_prev")
+            r_next = (self._overlay_hitboxes or {}).get("page_next")
+            if r_prev is not None and r_prev.collidepoint(mx, my):
+                self._save_page = max(0, int(self._save_page) - 1)
+                return True
+            if r_next is not None and r_next.collidepoint(mx, my):
+                self._save_page = int(self._save_page) + 1
+                return True
+
+        if ot == "settings":
+            r_save = (self._overlay_hitboxes or {}).get("settings_save")
+            r_cancel = (self._overlay_hitboxes or {}).get("settings_cancel")
+            if r_save is not None and r_save.collidepoint(mx, my):
+                self._apply_settings()
+                self._save_settings()
+                self._settings_overlay = False
+                self._overlay_settings_snapshot = None
+                return True
+            if r_cancel is not None and r_cancel.collidepoint(mx, my):
+                if isinstance(self._overlay_settings_snapshot, dict):
+                    self._settings = dict(self._overlay_settings_snapshot)
+                    self._apply_settings()
+                self._settings_overlay = False
+                self._overlay_settings_snapshot = None
+                return True
+
+            for key in ("typing_speed", "master_volume", "bgm_volume", "voice_volume"):
+                r = (self._overlay_hitboxes or {}).get(f"slider:{key}")
+                if r is not None and r.collidepoint(mx, my):
+                    self._overlay_dragging_slider = key
+                    self._overlay_update_slider_value(key, mx)
+                    return True
+
+        return True
+
+    def _overlay_handle_mouse_up(self) -> None:
+        self._overlay_dragging_slider = None
+
+    def _overlay_handle_wheel(self, y_delta: int) -> None:
+        if not self._function_menus_enabled:
+            return
+        ot = self._overlay_type()
+        if ot not in {"history", "help"}:
+            return
+        step = int(self.font.get_linesize() * 3)
+        self._overlay_scroll_offset = int(self._overlay_scroll_offset) - int(y_delta) * step
+        self._overlay_scroll_offset = max(0, int(self._overlay_scroll_offset))
+
+    def _hit_test_hud_button(self, render_pos):
+        if not self._hud_button_hitboxes:
+            return None
+        x, y = render_pos
+        for idx, rect in enumerate(self._hud_button_hitboxes):
+            if rect is not None and rect.collidepoint(x, y):
+                return idx
+        return None
+
+    def _activate_hud_button(self, idx: int):
+        if not self._hud_buttons or idx < 0 or idx >= len(self._hud_buttons):
+            return
+        action = str((self._hud_buttons[idx] or {}).get("action") or "")
+        if action == "save":
+            self._overlay_return_mode = self.mode
+            self._save_overlay = True
+            self._load_overlay = False
+            self._settings_overlay = False
+            self._history_overlay = False
+            self._help_overlay = False
+            self._exit_confirm_overlay = False
+            self._save_page = 0
+            return
+        if action == "load":
+            self._overlay_return_mode = self.mode
+            self._load_overlay = True
+            self._save_overlay = False
+            self._settings_overlay = False
+            self._history_overlay = False
+            self._help_overlay = False
+            self._exit_confirm_overlay = False
+            self._save_page = 0
+            return
+        if action == "settings":
+            self._overlay_return_mode = self.mode
+            self._settings_overlay = True
+            self._save_overlay = False
+            self._load_overlay = False
+            self._history_overlay = False
+            self._help_overlay = False
+            self._exit_confirm_overlay = False
+            return
+        if action == "history":
+            self._overlay_return_mode = self.mode
+            self._history_overlay = True
+            self._save_overlay = False
+            self._load_overlay = False
+            self._settings_overlay = False
+            self._help_overlay = False
+            self._exit_confirm_overlay = False
+            return
+        if action == "menu":
+            # mouse-only trigger: return to menu immediately (same as confirm-yes path)
+            if self._enable_autosave_on_menu and self.mode == "game":
+                self.save_game(AUTO_SAVE_SLOT)
+            self._enter_menu()
+            return
+        if action == "fullscreen":
+            self.toggle_fullscreen()
+            return
+
+    def _render_hud_buttons(self):
+        if self.mode != "game":
+            return
+        if not self._hud_buttons_enabled:
+            return
+        if not self._hud_buttons:
+            return
+
+        start_x, start_y = self._hud_button_pos
+        spacing = int(self._hud_button_spacing)
+        zoom = float(self._hud_button_selected_zoom)
+        orientation = str(self._hud_button_orientation or "vertical")
+        scale0 = float(self._hud_button_scale or 1.0)
+        base_color = self._hud_button_color
+        hover_color = getattr(self, "_hud_button_hover_color", base_color)
+        font = self._load_font(max(8, int(18 * scale0)))
+
+        # stable layout with unzoomed sizes
+        layout: list[dict] = []
+        cur_x = int(start_x)
+        cur_y = int(start_y)
+        for idx, item in enumerate(self._hud_buttons):
+            if not isinstance(item, dict):
+                continue
+            style = str(item.get("style") or "text")
+            action = str(item.get("action") or "")
+            label = str(item.get("label") or "")
+            raw = None
+            base_w = 0
+            base_h = 0
+            img_scale = None
+            if style == "image":
+                raw = (getattr(self, "_hud_button_image_surfaces", {}) or {}).get(action)
+                if raw is not None:
+                    img_scale = item.get("image_scale", None)
+                    if img_scale is None:
+                        try:
+                            img_scale = 20.0 / max(1.0, float(raw.get_height()))
+                        except Exception:
+                            img_scale = 1.0
+                    else:
+                        try:
+                            img_scale = float(img_scale)
+                        except Exception:
+                            img_scale = 1.0
+                    img_scale = max(0.1, min(5.0, float(img_scale)))
+                    final_scale = float(scale0) * float(img_scale)
+                    base_w = max(1, int(raw.get_width() * final_scale))
+                    base_h = max(1, int(raw.get_height() * final_scale))
+                else:
+                    style = "text"  # fallback
+
+            if style != "image":
+                try:
+                    base_w = max(1, int(font.size(label)[0]))
+                except Exception:
+                    base_w = 1
+                base_h = int(font.get_linesize())
+
+            layout.append({
+                "idx": idx,
+                "style": style,
+                "action": action,
+                "label": label,
+                "x": int(cur_x),
+                "y": int(cur_y),
+                "w": int(base_w),
+                "h": int(base_h),
+                "raw": raw,
+            })
+
+            if orientation == "horizontal":
+                cur_x += int(base_w) + spacing
+            else:
+                cur_y += int(base_h) + spacing
+
+        if not self._hud_button_hitboxes or len(self._hud_button_hitboxes) != len(self._hud_buttons):
+            self._hud_button_hitboxes = [None] * len(self._hud_buttons)
+
+        for it in layout:
+            idx = int(it["idx"])
+            sel = idx == self._hud_selected
+            style = str(it["style"])
+            x = int(it["x"])
+            y = int(it["y"])
+
+            if style == "image" and it.get("raw") is not None:
+                raw = it["raw"]
+                base_w = int(it["w"])
+                base_h = int(it["h"])
+                z = float(zoom if sel else 1.0)
+                w = max(1, int(base_w * z))
+                h = max(1, int(base_h * z))
+                try:
+                    img = pygame.transform.smoothscale(raw, (w, h))
+                except Exception:
+                    img = pygame.transform.scale(raw, (w, h))
+                dx = x - (w - base_w) // 2
+                dy = y - (h - base_h) // 2
+                self.render_surface.blit(img, (dx, dy))
+                if 0 <= idx < len(self._hud_button_hitboxes):
+                    self._hud_button_hitboxes[idx] = pygame.Rect(dx, dy, w, h)
+                continue
+
+            # text style
+            color0 = hover_color if sel else base_color
+            color = color0 if sel else (int(color0[0] * 0.75), int(color0[1] * 0.75), int(color0[2] * 0.75))
+            surf = font.render(str(it.get("label") or ""), True, color)
+            self.render_surface.blit(surf, (x, y))
+            if 0 <= idx < len(self._hud_button_hitboxes):
+                self._hud_button_hitboxes[idx] = pygame.Rect(x, y, surf.get_width(), surf.get_height())
+
+    def _set_mouse_cursor(self, *, hand: bool) -> None:
+        """Switch system cursor between arrow and hand.
+
+        Safe on platforms that don't support system cursors.
+        """
+        desired = bool(hand)
+        if desired == bool(getattr(self, "_mouse_cursor_is_hand", False)):
+            return
+        try:
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND if desired else pygame.SYSTEM_CURSOR_ARROW)
+            self._mouse_cursor_is_hand = desired
+        except Exception:
+            # ignore if system cursor is not supported
+            self._mouse_cursor_is_hand = desired
 
     def _enter_menu(self):
         self.mode = "menu"
@@ -531,6 +1202,8 @@ class VNGameRuntime:
         self._help_overlay = False
         self._exit_confirm_overlay = False
         self._save_page = 0
+        self._overlay_scroll_offset = 0
+        self._overlay_dragging_slider = None
 
     def _open_settings_from_menu(self):
         self._overlay_return_mode = "menu"
@@ -541,6 +1214,10 @@ class VNGameRuntime:
         self._history_overlay = False
         self._help_overlay = False
         self._exit_confirm_overlay = False
+        self._overlay_scroll_offset = 0
+        self._overlay_dragging_slider = None
+        if self._function_menus_enabled:
+            self._overlay_settings_snapshot = dict(self._settings)
 
     def _move_menu(self, delta: int):
         count = len(self._menu_items)
@@ -667,6 +1344,36 @@ class VNGameRuntime:
                 self._menu_title_image_surface = img
             except Exception:
                 self._menu_title_image_surface = None
+
+        # option button images
+        self._menu_option_image_surfaces = {}
+        for it in getattr(self, "_menu_items", []) or []:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get("style") or "text") != "image":
+                continue
+            action = str(it.get("action") or "")
+            img_rel = str(it.get("image") or "")
+            if not action or not img_rel:
+                continue
+            p = self._resolve_path(img_rel)
+            if not p.exists():
+                continue
+            try:
+                img = pygame.image.load(str(p)).convert_alpha()
+                self._menu_option_image_surfaces[action] = img
+            except Exception:
+                continue
+
+        # indicator image (optional)
+        self._menu_option_indicator_image_surface = None
+        if getattr(self, "_menu_option_indicator_image_path", ""):
+            p = self._resolve_path(self._menu_option_indicator_image_path)
+            if p.exists():
+                try:
+                    self._menu_option_indicator_image_surface = pygame.image.load(str(p)).convert_alpha()
+                except Exception:
+                    self._menu_option_indicator_image_surface = None
 
     def _preload_menu_media(self):
         """预加载主菜单媒体，避免进入时黑屏或卡顿。"""
@@ -860,6 +1567,8 @@ class VNGameRuntime:
                         self._help_overlay = False
                         self._exit_confirm_overlay = False
                         self._save_page = 0
+                        self._overlay_scroll_offset = 0
+                        self._overlay_dragging_slider = None
                     elif event.key == pygame.K_F9:
                         self._overlay_return_mode = self.mode
                         self._load_overlay = True
@@ -869,6 +1578,8 @@ class VNGameRuntime:
                         self._help_overlay = False
                         self._exit_confirm_overlay = False
                         self._save_page = 0
+                        self._overlay_scroll_offset = 0
+                        self._overlay_dragging_slider = None
                     elif event.key == pygame.K_F10:
                         self._overlay_return_mode = self.mode
                         self._settings_overlay = True
@@ -877,6 +1588,10 @@ class VNGameRuntime:
                         self._history_overlay = False
                         self._help_overlay = False
                         self._exit_confirm_overlay = False
+                        self._overlay_scroll_offset = 0
+                        self._overlay_dragging_slider = None
+                        if self._function_menus_enabled:
+                            self._overlay_settings_snapshot = dict(self._settings)
                     elif event.key == pygame.K_TAB:
                         if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._help_overlay or self._exit_confirm_overlay):
                             self.fast_skip = not self.fast_skip
@@ -899,6 +1614,8 @@ class VNGameRuntime:
                             self._choice_overlay = False
                             self._help_overlay = False
                             self._exit_confirm_overlay = False
+                            self._overlay_scroll_offset = 0
+                            self._overlay_dragging_slider = None
                         continue
                     elif event.key == pygame.K_F3:
                         self.debug_hud = not self.debug_hud
@@ -925,15 +1642,106 @@ class VNGameRuntime:
                     if self._help_right_click:
                         self._toggle_help_overlay()
                         continue
-                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if self.mode == "menu":
-                        self._activate_menu_item()
+                if event.type == pygame.MOUSEMOTION:
+                    # default: arrow
+                    cursor_hand = False
+
+                    # function-menu overlays (mouse-enabled)
+                    if self._function_menus_enabled and self._overlay_type() is not None:
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        cursor_hand = bool(self._overlay_handle_mouse_motion(rp))
+                        self._set_mouse_cursor(hand=cursor_hand)
                         continue
+
+                    if self.mode == "game" and self._hud_buttons_enabled and not (
+                        self._save_overlay
+                        or self._load_overlay
+                        or self._settings_overlay
+                        or self._choice_overlay
+                        or self._history_overlay
+                        or self._help_overlay
+                        or self._exit_confirm_overlay
+                    ):
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        if rp is not None:
+                            hit = self._hit_test_hud_button(rp)
+                            self._hud_selected = hit if hit is not None else -1
+                            cursor_hand = hit is not None
+                    if self.mode == "menu" and not (
+                        self._save_overlay
+                        or self._load_overlay
+                        or self._settings_overlay
+                        or self._history_overlay
+                        or self._help_overlay
+                        or self._exit_confirm_overlay
+                    ):
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        if rp is not None:
+                            hit = self._hit_test_menu_item(rp)
+                            if hit is not None and hit != self._menu_selected:
+                                self._menu_selected = hit
+                            cursor_hand = hit is not None
+
+                    # apply cursor change (menu/hud clickable areas)
+                    self._set_mouse_cursor(hand=cursor_hand)
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    # function-menu overlays (mouse-enabled)
+                    if self._function_menus_enabled and self._overlay_type() is not None:
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        self._overlay_handle_mouse_down(rp)
+                        continue
+
+                    if self.mode == "menu":
+                        # menu mouse click: prefer hovered item
+                        if not (
+                            self._save_overlay
+                            or self._load_overlay
+                            or self._settings_overlay
+                            or self._history_overlay
+                            or self._help_overlay
+                            or self._exit_confirm_overlay
+                        ):
+                            rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                            if rp is not None:
+                                hit = self._hit_test_menu_item(rp)
+                                if hit is not None:
+                                    self._menu_selected = hit
+                                    self._activate_menu_item()
+                        # overlay open in menu: ignore click (mouse overlay not implemented)
+                        continue
+                    if self.mode == "game" and self._hud_buttons_enabled and not (
+                        self._save_overlay
+                        or self._load_overlay
+                        or self._settings_overlay
+                        or self._choice_overlay
+                        or self._history_overlay
+                        or self._help_overlay
+                        or self._exit_confirm_overlay
+                    ):
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        if rp is not None:
+                            hit = self._hit_test_hud_button(rp)
+                            if hit is not None:
+                                self._hud_selected = hit
+                                self._activate_hud_button(hit)
+                                continue
                     if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay):
                         if self._auto_next_lock_active():
                             self._reveal_current_text()
                         else:
                             self.advance_dialogue()
+                if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    if self._function_menus_enabled and self._overlay_type() is not None:
+                        self._overlay_handle_mouse_up()
+                        continue
+
+                if event.type == pygame.MOUSEWHEEL:
+                    if self._function_menus_enabled and self._overlay_type() is not None:
+                        try:
+                            self._overlay_handle_wheel(int(getattr(event, "y", 0)))
+                        except Exception:
+                            pass
+                        continue
                 if event.type == pygame.KEYUP:
                     if event.key == pygame.K_s:
                         self.fast_skip = False
@@ -967,6 +1775,48 @@ class VNGameRuntime:
             self._blit_to_window()
             pygame.display.flip()
 
+    def _window_pos_to_render_pos(self, window_pos):
+        """Convert window/screen mouse position to render_surface coordinates.
+
+        Accounts for letterboxing behavior implemented in `_blit_to_window`.
+        Returns None if the position is outside the rendered game area.
+        """
+        if window_pos is None:
+            return None
+
+        wx, wy = window_pos
+        screen = getattr(self, "screen", None)
+        if screen is None:
+            return None
+        win_w, win_h = screen.get_size()
+        base_w, base_h = self.render_surface.get_size()
+        if win_w <= 0 or win_h <= 0 or base_w <= 0 or base_h <= 0:
+            return None
+
+        scale = min(win_w / base_w, win_h / base_h)
+        scaled_w = int(base_w * scale)
+        scaled_h = int(base_h * scale)
+        offset_x = (win_w - scaled_w) // 2
+        offset_y = (win_h - scaled_h) // 2
+
+        if wx < offset_x or wy < offset_y or wx >= offset_x + scaled_w or wy >= offset_y + scaled_h:
+            return None
+
+        rx = int((wx - offset_x) / scale)
+        ry = int((wy - offset_y) / scale)
+        rx = max(0, min(base_w - 1, rx))
+        ry = max(0, min(base_h - 1, ry))
+        return rx, ry
+
+    def _hit_test_menu_item(self, render_pos):
+        if not self._menu_item_hitboxes:
+            return None
+        x, y = render_pos
+        for idx, rect in enumerate(self._menu_item_hitboxes):
+            if rect is not None and rect.collidepoint(x, y):
+                return idx
+        return None
+
     def advance_dialogue(self):
         entry = self._current_entry()
         if not entry:
@@ -986,17 +1836,26 @@ class VNGameRuntime:
             node_type = entry.get("node_type", "text")
             if node_type == "text":
                 subs = (self.nodes_map.get(self.current_node_id, {}) or {}).get("sub_dialogues") or []
-                if subs and self._sub_index < len(subs) - 1:
-                    started_1 = self._maybe_start_portrait_fade_out(subs[self._sub_index])
-                    started_2 = self._maybe_start_portrait2_fade_out(subs[self._sub_index])
-                    if started_1 or started_2:
+                if subs and 0 <= self._sub_index < len(subs):
+                    # leaving current sub-dialogue
+                    if self._sub_index < len(subs) - 1:
+                        # advance within the same text node
+                        started_1 = self._maybe_start_portrait_fade_out(subs[self._sub_index])
+                        started_2 = self._maybe_start_portrait2_fade_out(subs[self._sub_index])
+                        if started_1 or started_2:
+                            return
+                        self._sub_index += 1
+                        self._voice_played_index = None
+                        # 同一节点子对话切换，避免重复刷新BGM/UI以防卡顿
+                        self._on_enter_node(skip_media=True)
+                        self._reset_typing_state()
                         return
-                    self._sub_index += 1
-                    self._voice_played_index = None
-                    # 同一节点子对话切换，避免重复刷新BGM/UI以防卡顿
-                    self._on_enter_node(skip_media=True)
-                    self._reset_typing_state()
-                    return
+                    else:
+                        # leaving the LAST sub-dialogue: also respect fade-out before jumping to next node
+                        started_1 = self._maybe_start_portrait_fade_out(subs[self._sub_index])
+                        started_2 = self._maybe_start_portrait2_fade_out(subs[self._sub_index])
+                        if started_1 or started_2:
+                            return
             if node_type == "choice":
                 self._open_choice_overlay(entry)
                 return
@@ -1057,15 +1916,41 @@ class VNGameRuntime:
             self._ensure_bgm(bgm_path, loop=bool(entry.get("bgm_loop", True)))
 
         if not hide_textbox:
-            # draw text box (semi-transparent)
-            box_surface = pygame.Surface((self.text_area.width, self.text_area.height), pygame.SRCALPHA)
-            box_surface.fill(self.box_color)
-            self.render_surface.blit(box_surface, (self.text_area.x, self.text_area.y))
+            layout = self._active_ui_layout or {}
+            text_frame_path = str(layout.get("text_frame_image") or "").strip()
+            name_frame_path = str(layout.get("name_frame_image") or "").strip()
+            try:
+                text_frame_alpha = int(layout.get("text_frame_alpha", 255))
+            except Exception:
+                text_frame_alpha = 255
+            try:
+                name_frame_alpha = int(layout.get("name_frame_alpha", 255))
+            except Exception:
+                name_frame_alpha = 255
+            text_frame_alpha = max(0, min(255, text_frame_alpha))
+            name_frame_alpha = max(0, min(255, name_frame_alpha))
+
+            # draw text box
+            text_frame = None
+            if text_frame_path:
+                text_frame = self._load_ui_frame_surface(text_frame_path, (self.text_area.width, self.text_area.height), text_frame_alpha)
+            if text_frame is not None:
+                self.render_surface.blit(text_frame, (self.text_area.x, self.text_area.y))
+            else:
+                box_surface = pygame.Surface((self.text_area.width, self.text_area.height), pygame.SRCALPHA)
+                box_surface.fill(self.box_color)
+                self.render_surface.blit(box_surface, (self.text_area.x, self.text_area.y))
 
             # draw name box
-            name_surface = pygame.Surface((self.name_area.width, self.name_area.height), pygame.SRCALPHA)
-            name_surface.fill((0, 0, 0, 180))
-            self.render_surface.blit(name_surface, (self.name_area.x, self.name_area.y))
+            name_frame = None
+            if name_frame_path:
+                name_frame = self._load_ui_frame_surface(name_frame_path, (self.name_area.width, self.name_area.height), name_frame_alpha)
+            if name_frame is not None:
+                self.render_surface.blit(name_frame, (self.name_area.x, self.name_area.y))
+            else:
+                name_surface = pygame.Surface((self.name_area.width, self.name_area.height), pygame.SRCALPHA)
+                name_surface.fill((0, 0, 0, 180))
+                self.render_surface.blit(name_surface, (self.name_area.x, self.name_area.y))
             name_text = self.name_font.render(speaker, True, (220, 220, 220))
             left_pad = min(self.text_margin, max(4, self.name_area.width - 10))
             vert_pad = max(4, (self.name_area.height - name_text.get_height()) // 2)
@@ -1081,6 +1966,9 @@ class VNGameRuntime:
 
         if self.debug_hud:
             self._render_debug_hud(entry)
+
+        # in-game HUD button group (mouse-only)
+        self._render_hud_buttons()
 
         if self._history_overlay:
             self._render_history_overlay()
@@ -1149,6 +2037,8 @@ class VNGameRuntime:
             self._choice_overlay = False
             self._history_overlay = False
             self._exit_confirm_overlay = False
+            self._overlay_scroll_offset = 0
+            self._overlay_dragging_slider = None
 
     def _open_exit_confirm(self):
         if self.mode != "game":
@@ -1164,6 +2054,15 @@ class VNGameRuntime:
         self._help_overlay = False
 
     def _render_history_overlay(self):
+        if self._function_menus_enabled:
+            self._render_function_menu_history_overlay()
+            return
+
+        # legacy overlays: ensure mouse hit boxes are cleared
+        self._overlay_hover = None
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
         overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 160))
 
@@ -1240,6 +2139,7 @@ class VNGameRuntime:
         menu_font = self._load_font(max(8, int(20 * (getattr(self, "_menu_option_scale", 1.0) or 1.0))))
         title_color = self._menu_title_color
         option_color = self._menu_option_color
+        hover_color = getattr(self, "_menu_option_hover_color", option_color)
 
         if self._menu_title_image_surface:
             img = self._menu_title_image_surface
@@ -1252,15 +2152,140 @@ class VNGameRuntime:
             self.render_surface.blit(title_surf, (title_pos[0], title_pos[1]))
 
         start_x, start_y = self._menu_option_pos
+        spacing = int(getattr(self, "_menu_option_spacing", 10) or 10)
+        zoom = float(getattr(self, "_menu_option_selected_zoom", 1.08) or 1.08)
+
+        # Precompute stable layout positions using UNZOOMED sizes.
+        layout: list[dict] = []
+        cur_y = int(start_y)
         for idx, item in enumerate(self._menu_items):
-            label = item.get("label", "")
+            if not isinstance(item, dict):
+                continue
+            style = str(item.get("style") or "text")
+            action = str(item.get("action") or "")
+            label = str(item.get("label", ""))
+
+            raw = None
+            base_w = 0
+            base_h = 0
+            img_scale = None
+            if style == "image":
+                raw = (getattr(self, "_menu_option_image_surfaces", {}) or {}).get(action)
+                if raw is not None:
+                    img_scale = item.get("image_scale", None)
+                    if img_scale is None:
+                        try:
+                            img_scale = 20.0 / max(1.0, float(raw.get_height()))
+                        except Exception:
+                            img_scale = 1.0
+                    else:
+                        try:
+                            img_scale = float(img_scale)
+                        except Exception:
+                            img_scale = 1.0
+                    img_scale = max(0.1, min(5.0, float(img_scale)))
+                    final_scale = float(self._menu_option_scale) * float(img_scale)
+                    base_w = max(1, int(raw.get_width() * final_scale))
+                    base_h = max(1, int(raw.get_height() * final_scale))
+                else:
+                    style = "text"  # fallback if missing image
+
+            if style != "image":
+                base_w = 0
+                base_h = int(menu_font.get_linesize())
+
+            layout.append({
+                "idx": idx,
+                "style": style,
+                "action": action,
+                "label": label,
+                "x": int(start_x),
+                "y": int(cur_y),
+                "w": int(base_w),
+                "h": int(base_h),
+                "raw": raw,
+                "img_scale": img_scale,
+            })
+
+            cur_y += int(base_h) + spacing
+
+        # Draw items with stable layout; selected image is scaled around its CENTER.
+        if bool(getattr(self, "_menu_option_indicator", False)) and layout:
+            sel_item = None
+            for it in layout:
+                if int(it.get("idx", -1)) == int(self._menu_selected):
+                    sel_item = it
+                    break
+            if sel_item is not None:
+                x0 = int(sel_item.get("x", start_x))
+                y0 = int(sel_item.get("y", start_y))
+                h0 = int(sel_item.get("h", int(menu_font.get_linesize())))
+                scale0 = float(getattr(self, "_menu_option_scale", 1.0) or 1.0)
+                gap = max(4, int(12 * scale0))
+                cy = y0 + h0 // 2
+
+                ind_raw = getattr(self, "_menu_option_indicator_image_surface", None)
+                ind_scale = float(getattr(self, "_menu_option_indicator_image_scale", 1.0) or 1.0)
+                ind_scale = max(0.1, min(5.0, float(ind_scale)))
+                if ind_raw is not None:
+                    final_scale = max(0.1, float(scale0) * float(ind_scale))
+                    w = max(1, int(ind_raw.get_width() * final_scale))
+                    h = max(1, int(ind_raw.get_height() * final_scale))
+                    try:
+                        img = pygame.transform.smoothscale(ind_raw, (w, h))
+                    except Exception:
+                        img = pygame.transform.scale(ind_raw, (w, h))
+                    dx = x0 - gap - w
+                    dy = cy - h // 2
+                    self.render_surface.blit(img, (dx, dy))
+                else:
+                    aw = max(6, int(14 * scale0))
+                    ah = max(8, int(18 * scale0))
+                    tip_x = x0 - gap
+                    base_x = tip_x - aw
+                    pts = [(tip_x, cy), (base_x, cy - ah // 2), (base_x, cy + ah // 2)]
+                    try:
+                        pygame.draw.polygon(self.render_surface, option_color, pts)
+                    except Exception:
+                        pass
+
+        for it in layout:
+            idx = int(it["idx"])
             sel = idx == self._menu_selected
+            style = str(it["style"])
+            x = int(it["x"])
+            y = int(it["y"])
+
+            # keep hitboxes aligned with original menu item indices
+            if not self._menu_item_hitboxes or len(self._menu_item_hitboxes) != len(self._menu_items):
+                self._menu_item_hitboxes = [None] * len(self._menu_items)
+
+            if style == "image" and it.get("raw") is not None:
+                raw = it["raw"]
+                base_w = int(it["w"])
+                base_h = int(it["h"])
+                z = float(zoom if sel else 1.0)
+                w = max(1, int(base_w * z))
+                h = max(1, int(base_h * z))
+                try:
+                    img = pygame.transform.smoothscale(raw, (w, h))
+                except Exception:
+                    img = pygame.transform.scale(raw, (w, h))
+                dx = x - (w - base_w) // 2
+                dy = y - (h - base_h) // 2
+                self.render_surface.blit(img, (dx, dy))
+                if 0 <= idx < len(self._menu_item_hitboxes):
+                    self._menu_item_hitboxes[idx] = pygame.Rect(dx, dy, w, h)
+                continue
+
+            # text style (existing behavior)
             base = option_color
-            color = base if sel else (int(base[0] * 0.75), int(base[1] * 0.75), int(base[2] * 0.75))
-            surf = menu_font.render(label, True, color)
-            x = start_x
-            y = start_y + idx * (menu_font.get_linesize() + 10)
+            active = hover_color if sel else base
+            color = active if sel else (int(active[0] * 0.75), int(active[1] * 0.75), int(active[2] * 0.75))
+            surf = menu_font.render(str(it.get("label") or ""), True, color)
             self.render_surface.blit(surf, (x, y))
+            if 0 <= idx < len(self._menu_item_hitboxes):
+                self._menu_item_hitboxes[idx] = pygame.Rect(x, y, surf.get_width(), surf.get_height())
 
         hint = "↑↓选择, 回车确认, ESC退出"
         hint_surf = self.font.render(hint, True, (200, 200, 200))
@@ -1990,6 +3015,31 @@ class VNGameRuntime:
         base = self.project_path.parent if self.project_path else Path.cwd()
         return (base / p).resolve()
 
+    def _load_ui_frame_surface(self, path_str: str, size: tuple[int, int], alpha: int) -> pygame.Surface | None:
+        """Load a UI frame image (textbox/namebox), scale to size, apply alpha, and cache."""
+        if not path_str:
+            return None
+        try:
+            abs_path = self._resolve_path(path_str)
+            if not abs_path.exists():
+                return None
+            w, h = int(size[0]), int(size[1])
+            w = max(1, w)
+            h = max(1, h)
+            a = max(0, min(255, int(alpha)))
+            key = (abs_path, w, h, a)
+            if key in self._ui_frame_cache:
+                return self._ui_frame_cache[key]
+
+            surf = pygame.image.load(str(abs_path)).convert_alpha()
+            if surf.get_width() != w or surf.get_height() != h:
+                surf = pygame.transform.smoothscale(surf, (w, h))
+            surf.set_alpha(a)
+            self._ui_frame_cache[key] = surf
+            return surf
+        except Exception:
+            return None
+
     def _pair_from_cfg(self, val, default: tuple[int, int]) -> tuple[int, int]:
         if isinstance(val, (list, tuple)) and len(val) >= 2:
             try:
@@ -2009,6 +3059,16 @@ class VNGameRuntime:
                 )
             except Exception:
                 return default
+        if isinstance(val, str):
+            s = val.strip()
+            if len(s) == 7 and s.startswith("#"):
+                try:
+                    r = int(s[1:3], 16)
+                    g = int(s[3:5], 16)
+                    b = int(s[5:7], 16)
+                    return (r, g, b)
+                except Exception:
+                    return default
         return default
 
     def _current_entry(self) -> dict:
@@ -2364,6 +3424,16 @@ class VNGameRuntime:
         self.render_surface = pygame.Surface(self.render_size)
         layout = self._active_ui_layout or {}
 
+        # apply HUD button group config from UI layout (if any)
+        self._apply_hud_buttons_from_ui_layout(layout)
+
+        # apply function menu overlays config from UI layout (only if project config is absent)
+        if not bool(getattr(self, "_function_menus_from_project", False)):
+            self._apply_function_menus_from_ui_layout(layout)
+        # layout changes can invalidate overlay hit boxes
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
         def _rect_or_default(key: str, fallback: list[int]):
             val = layout.get(key)
             if isinstance(val, (list, tuple)) and len(val) == 4:
@@ -2697,7 +3767,443 @@ class VNGameRuntime:
             y += self.font.get_linesize()
         self.render_surface.blit(surface, (10, 10))
 
+    def _overlay_font(self, size: int, *, bold: bool = False):
+        cache = getattr(self, "_ui_overlay_font_cache", None)
+        if cache is None:
+            cache = {}
+            self._ui_overlay_font_cache = cache
+        key = (int(size), bool(bold))
+        if key not in cache:
+            cache[key] = self._load_font(int(size), bold=bold)
+        return cache[key]
+
+    def _overlay_color(self, val, default: tuple[int, int, int]) -> tuple[int, int, int]:
+        if isinstance(val, str):
+            s = val.strip()
+            if s.startswith("#") and len(s) == 7:
+                try:
+                    return (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
+                except Exception:
+                    return default
+        if isinstance(val, (list, tuple)) and len(val) == 3:
+            try:
+                r = max(0, min(255, int(val[0])))
+                g = max(0, min(255, int(val[1])))
+                b = max(0, min(255, int(val[2])))
+                return (r, g, b)
+            except Exception:
+                return default
+        return default
+
+    def _wrap_text_lines(self, text: str, font, max_width: int) -> list[str]:
+        if not text:
+            return []
+        lines: list[str] = []
+        current = ""
+        for ch in str(text):
+            test = current + ch
+            if current and font.size(test)[0] > max_width:
+                lines.append(current)
+                current = ch
+            else:
+                current = test
+        if current:
+            lines.append(current)
+        return lines
+
+    def _render_function_menu_common(self, name: str, *, title: str):
+        cfg = self._get_function_menu_cfg(name)
+        w, h = self.render_size
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+
+        bg = self._load_overlay_background(str(cfg.get("background_image") or ""))
+        if bg is not None:
+            try:
+                bg_alpha = int(cfg.get("background_alpha", 255))
+            except Exception:
+                bg_alpha = 255
+            bg_alpha = max(0, min(255, bg_alpha))
+            if bg_alpha < 255:
+                bg2 = bg.copy()
+                bg2.set_alpha(bg_alpha)
+                overlay.blit(bg2, (0, 0))
+            else:
+                overlay.blit(bg, (0, 0))
+
+        try:
+            overlay_alpha = int(cfg.get("overlay_alpha", 160))
+        except Exception:
+            overlay_alpha = 160
+        overlay_alpha = max(0, min(255, overlay_alpha))
+        if overlay_alpha > 0:
+            dim = pygame.Surface((w, h), pygame.SRCALPHA)
+            dim.fill((0, 0, 0, overlay_alpha))
+            overlay.blit(dim, (0, 0))
+
+        title_font = self._overlay_font(int(cfg.get("title_font_size", 22)), bold=True)
+        font = self._overlay_font(int(cfg.get("font_size", 18)), bold=False)
+
+        title_pos = cfg.get("title_pos", [40, 40])
+        try:
+            tx, ty = int(title_pos[0]), int(title_pos[1])
+        except Exception:
+            tx, ty = 40, 40
+        title_color = self._overlay_color(cfg.get("title_color"), (255, 255, 255))
+        title_surf = title_font.render(title, True, title_color)
+        overlay.blit(title_surf, (tx, ty))
+
+        hitboxes: dict[str, pygame.Rect] = {}
+        close_cfg = cfg.get("close_button") if isinstance(cfg.get("close_button"), dict) else {}
+        cpos = close_cfg.get("pos", [w - 60, 40])
+        csize = close_cfg.get("size", [32, 32])
+        ctext = str(close_cfg.get("text", "×") or "×")
+        try:
+            cx, cy = int(cpos[0]), int(cpos[1])
+        except Exception:
+            cx, cy = w - 60, 40
+        try:
+            cw, ch = int(csize[0]), int(csize[1])
+        except Exception:
+            cw, ch = 32, 32
+        cw = max(18, cw)
+        ch = max(18, ch)
+        close_rect = pygame.Rect(cx, cy, cw, ch)
+        hitboxes["close"] = close_rect
+        btn_bg = pygame.Surface((cw, ch), pygame.SRCALPHA)
+        btn_bg.fill((255, 255, 255, 70 if self._overlay_hover == "close" else 50))
+        overlay.blit(btn_bg, (cx, cy))
+        t_surf = title_font.render(ctext, True, (255, 255, 255))
+        overlay.blit(t_surf, (cx + (cw - t_surf.get_width()) // 2, cy + (ch - t_surf.get_height()) // 2 - 1))
+
+        return overlay, cfg, font, title_font, hitboxes
+
+    def _render_function_menu_overlay(self):
+        ot = self._overlay_type()
+        if ot is None:
+            return
+
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
+        if ot == "help":
+            overlay, cfg, font, _title_font, hit = self._render_function_menu_common("help", title="帮助")
+            self._overlay_hitboxes.update(hit)
+            text_color = self._overlay_color(cfg.get("text_color"), (230, 230, 230))
+            hint_color = self._overlay_color(cfg.get("hint_color"), (200, 200, 200))
+            area = cfg.get("text_area", [40, 100, self.render_size[0] - 80, self.render_size[1] - 160])
+            try:
+                ax, ay, aw, ah = int(area[0]), int(area[1]), int(area[2]), int(area[3])
+            except Exception:
+                ax, ay, aw, ah = 40, 100, self.render_size[0] - 80, self.render_size[1] - 160
+            aw = max(20, aw)
+            ah = max(20, ah)
+
+            key_name = self._help_hotkey_name or "F1"
+            base_lines = [
+                "基础：左键/Space/Enter 下一句",
+                "ESC 返回主菜单（会二次确认，并自动存档）",
+                "F5 打开保存  |  F9 打开读取  |  F10 设置",
+                "↑/↓ 翻页（每页10个） | 数字 0-9 选择槽位（0=第10个）",
+                "A 读取自动存档（仅读档界面）",
+                "TAB 切换快进 | 按住 S 快进 | H 历史记录 | F11 全屏",
+                f"帮助菜单：右键 或 {key_name}",
+                "",
+                "鼠标交互：右上角 × 关闭；保存/读取可点槽位和翻页；设置可拖动滑块。",
+            ]
+            lines: list[str] = []
+            for ln in base_lines:
+                if not ln:
+                    lines.append("")
+                else:
+                    lines.extend(self._wrap_text_lines(ln, font, aw))
+
+            line_h = font.get_linesize() + 2
+            total_h = len(lines) * line_h
+            max_scroll = max(0, total_h - ah)
+            self._overlay_scroll_offset = max(0, min(int(self._overlay_scroll_offset), int(max_scroll)))
+
+            content = pygame.Surface((aw, ah), pygame.SRCALPHA)
+            y = -int(self._overlay_scroll_offset)
+            for ln in lines:
+                if y > ah:
+                    break
+                if ln:
+                    surf = font.render(ln, True, text_color)
+                    if y + surf.get_height() >= 0:
+                        content.blit(surf, (0, y))
+                y += line_h
+            overlay.blit(content, (ax, ay))
+            hint = font.render("滚轮滚动 | 点击 × 关闭", True, hint_color)
+            overlay.blit(hint, (ax, ay + ah + 14))
+            self.render_surface.blit(overlay, (0, 0))
+            return
+
+        if ot == "settings":
+            overlay, cfg, font, title_font, hit = self._render_function_menu_common("settings", title="设置")
+            self._overlay_hitboxes.update(hit)
+            text_color = self._overlay_color(cfg.get("text_color"), (230, 230, 230))
+            hint_color = self._overlay_color(cfg.get("hint_color"), (200, 200, 200))
+            hover_color = self._overlay_color(cfg.get("hover_color"), (255, 255, 255))
+
+            slider_pos = cfg.get("slider_pos", [80, 140])
+            try:
+                sx, sy = int(slider_pos[0]), int(slider_pos[1])
+            except Exception:
+                sx, sy = 80, 140
+            try:
+                sw = int(cfg.get("slider_width", self.render_size[0] - 160))
+            except Exception:
+                sw = self.render_size[0] - 160
+            try:
+                sh = int(cfg.get("slider_height", 10))
+            except Exception:
+                sh = 10
+            try:
+                gap = int(cfg.get("slider_gap", 70))
+            except Exception:
+                gap = 70
+            sw = max(80, sw)
+            sh = max(6, sh)
+
+            items = [
+                ("typing_speed", "文本速度"),
+                ("master_volume", "主音量"),
+                ("bgm_volume", "BGM音量"),
+                ("voice_volume", "语音音量"),
+            ]
+            for i, (key, label) in enumerate(items):
+                y = sy + i * gap
+                bar = pygame.Rect(sx, y, sw, sh)
+                self._overlay_hitboxes[f"slider:{key}"] = bar
+
+                if key == "typing_speed":
+                    v = float(self.typing_speed)
+                    t = (v - 4.0) / (120.0 - 4.0)
+                    t = max(0.0, min(1.0, t))
+                    value_text = f"{v:.1f}"
+                else:
+                    v = float(self._settings.get(key, 1.0))
+                    v = max(0.0, min(1.0, v))
+                    t = v
+                    value_text = f"{v:.2f}"
+
+                lab_color = hover_color if self._overlay_hover == f"slider:{key}" else text_color
+                lab = font.render(f"{label}: {value_text}", True, lab_color)
+                overlay.blit(lab, (sx, y - lab.get_height() - 8))
+
+                track = pygame.Surface((bar.w, bar.h), pygame.SRCALPHA)
+                track.fill((255, 255, 255, 60))
+                overlay.blit(track, (bar.x, bar.y))
+                fill_w = int(bar.w * t)
+                if fill_w > 0:
+                    fill = pygame.Surface((fill_w, bar.h), pygame.SRCALPHA)
+                    fill.fill((255, 255, 255, 110))
+                    overlay.blit(fill, (bar.x, bar.y))
+                knob_x = bar.x + fill_w
+                pygame.draw.circle(overlay, (255, 255, 255), (knob_x, bar.y + bar.h // 2), max(6, bar.h))
+
+            btn_pos = cfg.get("button_row_pos", [80, self.render_size[1] - 90])
+            try:
+                bx, by = int(btn_pos[0]), int(btn_pos[1])
+            except Exception:
+                bx, by = 80, self.render_size[1] - 90
+            bsize = cfg.get("button_size", [120, 36])
+            try:
+                bw, bh = int(bsize[0]), int(bsize[1])
+            except Exception:
+                bw, bh = 120, 36
+            bw = max(60, bw)
+            bh = max(26, bh)
+
+            save_rect = pygame.Rect(bx, by, bw, bh)
+            cancel_rect = pygame.Rect(bx + bw + 20, by, bw, bh)
+            self._overlay_hitboxes["settings_save"] = save_rect
+            self._overlay_hitboxes["settings_cancel"] = cancel_rect
+
+            for key, rect, text in (
+                ("settings_save", save_rect, "保存"),
+                ("settings_cancel", cancel_rect, "取消"),
+            ):
+                a = 70 if self._overlay_hover == key else 50
+                btn = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+                btn.fill((255, 255, 255, a))
+                overlay.blit(btn, rect.topleft)
+                ts = title_font.render(text, True, (255, 255, 255))
+                overlay.blit(ts, (rect.x + (rect.w - ts.get_width()) // 2, rect.y + (rect.h - ts.get_height()) // 2))
+
+            hint = font.render("拖动滑块调整 | 点击 × 关闭（等同取消）", True, hint_color)
+            overlay.blit(hint, (bx, by + bh + 14))
+            self.render_surface.blit(overlay, (0, 0))
+            return
+
+        if ot in {"save", "load"}:
+            pages = page_count(self._save_slots, self._save_page_size)
+            self._save_page = clamp_page(self._save_page, self._save_slots, self._save_page_size)
+            page_tip = f"第{self._save_page + 1}/{pages}页"
+            title = f"保存 {page_tip}" if ot == "save" else f"读取 {page_tip}"
+
+            overlay, cfg, font, _title_font, hit = self._render_function_menu_common(ot, title=title)
+            self._overlay_hitboxes.update(hit)
+            text_color = self._overlay_color(cfg.get("text_color"), (230, 230, 230))
+            hint_color = self._overlay_color(cfg.get("hint_color"), (200, 200, 200))
+
+            slots = self._read_slots_meta()
+
+            list_pos = cfg.get("slot_list_pos", [40, 120])
+            try:
+                lx, ly = int(list_pos[0]), int(list_pos[1])
+            except Exception:
+                lx, ly = 40, 120
+            try:
+                lw = int(cfg.get("slot_list_width", self.render_size[0] - 80))
+            except Exception:
+                lw = self.render_size[0] - 80
+            try:
+                rh = int(cfg.get("slot_row_height", 34))
+            except Exception:
+                rh = 34
+            try:
+                sp = int(cfg.get("slot_row_spacing", 8))
+            except Exception:
+                sp = 8
+            try:
+                bg_a = int(cfg.get("slot_bg_alpha", 90))
+            except Exception:
+                bg_a = 90
+            try:
+                hov_a = int(cfg.get("slot_hover_alpha", 140))
+            except Exception:
+                hov_a = 140
+            rh = max(20, rh)
+            lw = max(100, lw)
+            bg_a = max(0, min(255, bg_a))
+            hov_a = max(0, min(255, hov_a))
+
+            y = ly
+            if ot == "load":
+                slot_id = AUTO_SAVE_SLOT
+                meta = slots.get(slot_id)
+                line = "自动存档  " + (f"{meta.get('timestamp','')} - {meta.get('summary','')}" if meta else "<空>")
+                rect = pygame.Rect(lx, y, lw, rh)
+                self._overlay_slot_hitboxes.append((slot_id, rect))
+                a = hov_a if self._overlay_hover == f"slot:{slot_id}" else bg_a
+                row = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+                row.fill((255, 255, 255, a))
+                overlay.blit(row, rect.topleft)
+                surf = font.render(line, True, text_color)
+                overlay.blit(surf, (rect.x + 12, rect.y + (rect.h - surf.get_height()) // 2))
+                y += rh + sp
+
+            start = self._save_page * self._save_page_size + 1
+            end = min(self._save_slots, start + self._save_page_size - 1)
+            for slot_id in range(start, end + 1):
+                meta = slots.get(slot_id)
+                line = f"槽位{slot_id}  " + (f"{meta.get('timestamp','')} - {meta.get('summary','')}" if meta else "<空>")
+                rect = pygame.Rect(lx, y, lw, rh)
+                self._overlay_slot_hitboxes.append((slot_id, rect))
+                a = hov_a if self._overlay_hover == f"slot:{slot_id}" else bg_a
+                row = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+                row.fill((255, 255, 255, a))
+                overlay.blit(row, rect.topleft)
+                surf = font.render(line, True, text_color)
+                overlay.blit(surf, (rect.x + 12, rect.y + (rect.h - surf.get_height()) // 2))
+                y += rh + sp
+
+            prev_pos = cfg.get("page_prev_pos", [40, self.render_size[1] - 60])
+            next_pos = cfg.get("page_next_pos", [140, self.render_size[1] - 60])
+            page_text_pos = cfg.get("page_text_pos", [240, self.render_size[1] - 60])
+            try:
+                px, py = int(prev_pos[0]), int(prev_pos[1])
+            except Exception:
+                px, py = 40, self.render_size[1] - 60
+            try:
+                nx, ny = int(next_pos[0]), int(next_pos[1])
+            except Exception:
+                nx, ny = 140, self.render_size[1] - 60
+            try:
+                tx, ty = int(page_text_pos[0]), int(page_text_pos[1])
+            except Exception:
+                tx, ty = 240, self.render_size[1] - 60
+
+            btn_w, btn_h = 80, 34
+            prev_rect = pygame.Rect(px, py, btn_w, btn_h)
+            next_rect = pygame.Rect(nx, ny, btn_w, btn_h)
+            self._overlay_hitboxes["page_prev"] = prev_rect
+            self._overlay_hitboxes["page_next"] = next_rect
+            for key, rect, text in (
+                ("page_prev", prev_rect, "上一页"),
+                ("page_next", next_rect, "下一页"),
+            ):
+                a = 70 if self._overlay_hover == key else 50
+                btn = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+                btn.fill((255, 255, 255, a))
+                overlay.blit(btn, rect.topleft)
+                ts = font.render(text, True, (255, 255, 255))
+                overlay.blit(ts, (rect.x + (rect.w - ts.get_width()) // 2, rect.y + (rect.h - ts.get_height()) // 2))
+
+            tip = font.render(page_tip + " | 点击 × 关闭", True, hint_color)
+            overlay.blit(tip, (tx, ty + 6))
+            self.render_surface.blit(overlay, (0, 0))
+            return
+
+    def _render_function_menu_history_overlay(self):
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
+        overlay, cfg, font, _title_font, hit = self._render_function_menu_common("history", title="历史记录")
+        self._overlay_hitboxes.update(hit)
+        text_color = self._overlay_color(cfg.get("text_color"), (230, 230, 230))
+        hint_color = self._overlay_color(cfg.get("hint_color"), (200, 200, 200))
+
+        area = cfg.get("text_area", [40, 100, self.render_size[0] - 80, self.render_size[1] - 160])
+        try:
+            ax, ay, aw, ah = int(area[0]), int(area[1]), int(area[2]), int(area[3])
+        except Exception:
+            ax, ay, aw, ah = 40, 100, self.render_size[0] - 80, self.render_size[1] - 160
+        aw = max(20, aw)
+        ah = max(20, ah)
+
+        lines: list[str] = []
+        for item in reversed(self._history):
+            speaker = item.get("speaker") or ""
+            content = item.get("content") or ""
+            if not content:
+                continue
+            txt = f"{speaker}: {content}" if speaker else content
+            lines.extend(self._wrap_text_lines(txt, font, aw))
+            lines.append("")
+
+        line_h = font.get_linesize() + 2
+        total_h = len(lines) * line_h
+        max_scroll = max(0, total_h - ah)
+        self._overlay_scroll_offset = max(0, min(int(self._overlay_scroll_offset), int(max_scroll)))
+
+        content = pygame.Surface((aw, ah), pygame.SRCALPHA)
+        y = -int(self._overlay_scroll_offset)
+        for ln in lines:
+            if y > ah:
+                break
+            if ln:
+                surf = font.render(ln, True, text_color)
+                if y + surf.get_height() >= 0:
+                    content.blit(surf, (0, y))
+            y += line_h
+        overlay.blit(content, (ax, ay))
+
+        hint = font.render("滚轮滚动 | 点击 × 关闭", True, hint_color)
+        overlay.blit(hint, (ax, ay + ah + 14))
+        self.render_surface.blit(overlay, (0, 0))
+
     def _render_overlay(self):
+        if self._function_menus_enabled and self._overlay_type() in {"save", "load", "settings", "help"}:
+            self._render_function_menu_overlay()
+            return
+
+        # legacy overlays: ensure mouse hit boxes are cleared
+        self._overlay_hover = None
+        self._overlay_hitboxes = {}
+        self._overlay_slot_hitboxes = []
+
         overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 160))
         if self._help_overlay:

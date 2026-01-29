@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
     QInputDialog,
 )
 
@@ -38,13 +40,14 @@ def get_gptsovits_client(config_manager: ConfigManager, parent=None) -> GPTSoVIT
     gpt_cfg = (cfg.get("api_keys") or {}).get("gptsovits", {})
     sign = gpt_cfg.get("sign", "")
     base_url = gpt_cfg.get("base_url", "https://openapi.lipvoice.cn")
+    timeout = gpt_cfg.get("timeout", 300)
 
     if not sign:
         QMessageBox.warning(parent, "缺少签名", "请先在 API 配置中填写 gptsovits 的 sign")
         return None
 
     try:
-        return GPTSoVITSClient(sign=sign, base_url=base_url)
+        return GPTSoVITSClient(sign=sign, base_url=base_url, timeout=int(timeout) if timeout is not None else 300)
     except Exception as exc:
         QMessageBox.critical(parent, "初始化失败", f"无法创建 gptsovits 客户端：{exc}")
         return None
@@ -88,7 +91,14 @@ class VoiceModelPickerDialog(QDialog):
         self.resize(900, 520)
 
         self._init_ui()
-        self._load_page(reset=True)
+        # 不在打开窗口时自动查询：避免卡顿；用户点击“查询”后再请求。
+        self._set_initial_idle_state()
+
+    def _set_initial_idle_state(self) -> None:
+        self.list_widget.clear()
+        self.page_info.setText("未查询（点击“查询”获取列表）")
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
 
     def selected_audio_id(self) -> Optional[str]:
         item = self.list_widget.currentItem()
@@ -99,18 +109,32 @@ class VoiceModelPickerDialog(QDialog):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        top = QHBoxLayout()
+        # 分页参数区：用网格避免控件过挤导致显示不全
+        top_container = QWidget()
+        top = QGridLayout(top_container)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setHorizontalSpacing(10)
+        top.setVerticalSpacing(6)
+
         self.page_spin = QSpinBox()
         self.page_spin.setRange(1, 10_000)
         self.page_spin.setValue(self.page)
         self.page_spin.valueChanged.connect(self._on_page_changed)
+        self.page_spin.setMinimumWidth(80)
 
         self.page_size_combo = QComboBox()
+        try:
+            # 让下拉框宽度能随内容自适应；并设定最小内容长度，避免被挤到只剩半个数字
+            self.page_size_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+            self.page_size_combo.setMinimumContentsLength(4)
+        except Exception:
+            pass
         for v in (5, 10, 20):
             self.page_size_combo.addItem(str(v), v)
         idx = self.page_size_combo.findData(self.page_size)
         self.page_size_combo.setCurrentIndex(idx if idx >= 0 else self.page_size_combo.count() - 1)
         self.page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
+        self.page_size_combo.setMinimumWidth(120)
 
         self.refresh_btn = QPushButton("查询")
         self.refresh_btn.clicked.connect(lambda: self._load_page(reset=False))
@@ -122,18 +146,20 @@ class VoiceModelPickerDialog(QDialog):
 
         self.page_info = QLabel("-")
 
-        top.addWidget(QLabel("页码"))
-        top.addWidget(self.page_spin)
-        top.addSpacing(10)
-        top.addWidget(QLabel("每页"))
-        top.addWidget(self.page_size_combo)
-        top.addWidget(self.refresh_btn)
-        top.addSpacing(10)
-        top.addWidget(self.prev_btn)
-        top.addWidget(self.next_btn)
-        top.addStretch(1)
-        top.addWidget(self.page_info)
-        layout.addLayout(top)
+        # 第一行：页码 + 翻页 + 查询 + 状态
+        top.addWidget(QLabel("页码"), 0, 0)
+        top.addWidget(self.page_spin, 0, 1)
+        top.addWidget(self.prev_btn, 0, 2)
+        top.addWidget(self.next_btn, 0, 3)
+        top.addWidget(self.refresh_btn, 0, 4)
+        top.addWidget(self.page_info, 0, 5)
+
+        # 第二行：每页条数（单独一行，避免挤压显示）
+        top.addWidget(QLabel("每页"), 1, 0)
+        top.addWidget(self.page_size_combo, 1, 1)
+        top.setColumnStretch(5, 1)
+
+        layout.addWidget(top_container)
 
         self.list_widget = QListWidget()
         self.list_widget.itemDoubleClicked.connect(lambda _: self._accept_selection())
@@ -224,6 +250,8 @@ class VoiceModelPickerDialog(QDialog):
 
         if self.models:
             self.list_widget.setCurrentRow(0)
+
+        # 如果用户已经开始查询，则允许翻页按钮按结果状态启用
 
     def _accept_selection(self):
         if self.selected_audio_id() is None:

@@ -309,11 +309,14 @@ class AIBackgroundPanel(QWidget):
         action_row = QHBoxLayout()
         self.generate_btn = QPushButton("生成背景")
         self.generate_btn.clicked.connect(self._generate_bg)
+        self.force_stop_btn = QPushButton("强制停止")
+        self.force_stop_btn.clicked.connect(self._force_stop_task)
         self.mark_btn = QPushButton("标记完成")
         self.mark_btn.clicked.connect(self.mark_generated)
         self.reset_btn = QPushButton("重置待生成")
         self.reset_btn.clicked.connect(self.reset_status)
         action_row.addWidget(self.generate_btn)
+        action_row.addWidget(self.force_stop_btn)
         action_row.addWidget(self.mark_btn)
         action_row.addWidget(self.reset_btn)
         action_row.addStretch(1)
@@ -340,6 +343,11 @@ class AIBackgroundPanel(QWidget):
         self.model_combo.currentIndexChanged.connect(self._toggle_mj_group)
         self._toggle_mj_group()
         self._on_flux_model_changed()
+
+    def _force_stop_task(self):
+        if self._runner.force_stop(stopped_text="状态：已强制停止"):
+            return
+        QMessageBox.information(self, "提示", "当前没有正在执行的任务。")
 
     # ==================== 列表刷新 ====================
     def refresh(self):
