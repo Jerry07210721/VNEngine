@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -22,7 +23,26 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtGui import QCursor, QGuiApplication, QIcon, QPixmap
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer
+
+
+def _debug_load_enabled() -> bool:
+    return str(os.environ.get("VNENGINE_DEBUG_LOAD", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_load_log(msg: str) -> None:
+    if not _debug_load_enabled():
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        root = Path(__file__).resolve().parents[2]
+        log_dir = root / "logs" / "debug"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        p = log_dir / "project_load_debug.log"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        return
 
 
 class ResourceDock(QDockWidget):
@@ -85,6 +105,7 @@ class ResourceDock(QDockWidget):
         self._mixer_ready = False
         self._audio_channel = None
         self._path_role = Qt.ItemDataRole.UserRole
+        self._load_decor_timer: QTimer | None = None
 
     def _make_tab(self, list_widget: QListWidget, res_key: str, is_media: bool) -> QWidget:
         tab = QWidget()
@@ -119,7 +140,7 @@ class ResourceDock(QDockWidget):
             except Exception as exc:
                 QMessageBox.critical(self, "导入失败", f"文件 {file_path} 导入失败: {exc}")
 
-    def _add_item_if_absent(self, list_widget: QListWidget, file_path: str):
+    def _add_item_if_absent(self, list_widget: QListWidget, file_path: str, *, decorate: bool = True):
         # Avoid duplicates by comparing normalized paths
         norm = self._normalize_path(file_path)
         for idx in range(list_widget.count()):
@@ -127,12 +148,19 @@ class ResourceDock(QDockWidget):
                 return
         item = QListWidgetItem(Path(norm).name)
         item.setData(self._path_role, norm)
-        if list_widget in (self._image_list, self._portrait_list):
-            self._decorate_image_item(item)
-        elif list_widget in (self._audio_list, self._voice_list):
-            self._decorate_audio_item(item)
-        elif list_widget is self._video_list:
-            item.setToolTip(str(Path(norm)))
+        if decorate:
+            if list_widget in (self._image_list, self._portrait_list):
+                self._decorate_image_item(item)
+            elif list_widget in (self._audio_list, self._voice_list):
+                self._decorate_audio_item(item)
+            elif list_widget is self._video_list:
+                item.setToolTip(str(Path(norm)))
+        else:
+            # Always set tooltip quickly; heavy metadata can be deferred.
+            try:
+                item.setToolTip(str(self._to_absolute(Path(norm))))
+            except Exception:
+                pass
         list_widget.addItem(item)
 
     def _remove_selected(self, list_widget: QListWidget):
@@ -140,6 +168,13 @@ class ResourceDock(QDockWidget):
             list_widget.takeItem(list_widget.row(item))
 
     def clear_all(self):
+        try:
+            if self._load_decor_timer is not None:
+                self._load_decor_timer.stop()
+                self._load_decor_timer.deleteLater()
+        except Exception:
+            pass
+        self._load_decor_timer = None
         self._image_list.clear()
         self._audio_list.clear()
         self._portrait_list.clear()
@@ -159,6 +194,100 @@ class ResourceDock(QDockWidget):
         ]:
             for path in data.get(key, []) or []:
                 self._add_item_if_absent(lw, path)
+
+    def load_from_data_async(self, data: Dict, *, on_done=None, batch_ms: int = 0, decor_batch: int = 6) -> None:
+        """Load resource lists without freezing UI.
+
+        1) Populate list items quickly without heavy decoration.
+        2) Decorate icons/durations in small batches via QTimer.
+        """
+
+        self.clear_all()
+        if not isinstance(data, dict):
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+            return
+
+        _debug_load_log("resources: populate start")
+        mapping = [
+            ("images", self._image_list),
+            ("audios", self._audio_list),
+            ("portraits", self._portrait_list),
+            ("voices", self._voice_list),
+            ("videos", self._video_list),
+        ]
+        total = 0
+        for key, lw in mapping:
+            items = data.get(key, []) or []
+            if not isinstance(items, list):
+                continue
+            total += len(items)
+            for path in items:
+                self._add_item_if_absent(lw, path, decorate=False)
+        _debug_load_log(f"resources: populate done total={total}")
+
+        # Build a decoration queue (list_widget, item)
+        queue: list[QListWidgetItem] = []
+        lw_for_item: list[QListWidget] = []
+        for _, lw in mapping:
+            for i in range(lw.count()):
+                queue.append(lw.item(i))
+                lw_for_item.append(lw)
+
+        if not queue:
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+            return
+
+        idx = 0
+
+        def _tick():
+            nonlocal idx
+            end = min(idx + max(1, int(decor_batch)), len(queue))
+            while idx < end:
+                item = queue[idx]
+                lw = lw_for_item[idx]
+                idx += 1
+                try:
+                    if lw in (self._image_list, self._portrait_list):
+                        self._decorate_image_item(item)
+                    elif lw in (self._audio_list, self._voice_list):
+                        # This can be slow for large audio files; keep batch small.
+                        self._decorate_audio_item(item)
+                    else:
+                        # videos: tooltip already set
+                        pass
+                except Exception:
+                    continue
+
+            if idx >= len(queue):
+                _debug_load_log("resources: decorate done")
+                if self._load_decor_timer is not None:
+                    try:
+                        self._load_decor_timer.stop()
+                        self._load_decor_timer.deleteLater()
+                    except Exception:
+                        pass
+                    self._load_decor_timer = None
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:
+                        pass
+
+        timer = QTimer(self)
+        timer.setInterval(int(batch_ms))
+        timer.timeout.connect(_tick)
+        self._load_decor_timer = timer
+        _debug_load_log(f"resources: decorate start items={len(queue)} decor_batch={decor_batch}")
+        timer.start()
+        _tick()
 
     def export_data(self) -> Dict[str, List[str]]:
         def collect(lw: QListWidget) -> List[str]:
@@ -216,7 +345,7 @@ class ResourceDock(QDockWidget):
         delete_action = menu.addAction("删除并移除")
         play_action = None
         stop_action = None
-        if list_widget is self._audio_list:
+        if list_widget in (self._audio_list, self._voice_list):
             play_action = menu.addAction("试听/播放")
             stop_action = menu.addAction("停止播放")
 

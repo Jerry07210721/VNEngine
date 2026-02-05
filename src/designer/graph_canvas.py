@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """Flow graph canvas with grid, zoom, and simple text nodes."""
+import os
+from datetime import datetime
+from pathlib import Path
 from math import hypot
 
 from PyQt6.QtWidgets import (
@@ -11,8 +14,27 @@ from PyQt6.QtWidgets import (
     QMenu,
     QInputDialog,
 )
-from PyQt6.QtGui import QColor, QPen, QPainter, QAction, QPainterPath
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt6.QtGui import QColor, QPen, QPainter, QAction, QPainterPath, QBrush
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QTimer
+
+
+def _debug_load_enabled() -> bool:
+    return str(os.environ.get("VNENGINE_DEBUG_LOAD", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_load_log(msg: str) -> None:
+    if not _debug_load_enabled():
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        root = Path(__file__).resolve().parents[2]
+        log_dir = root / "logs" / "debug"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        p = log_dir / "project_load_debug.log"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        return
 
 
 class GraphScene(QGraphicsScene):
@@ -55,7 +77,36 @@ class GraphScene(QGraphicsScene):
 class FlowTextNode(QGraphicsRectItem):
     """Draggable text/choice/condition node with inline title editing."""
 
-    def __init__(self, title: str = "文本节点", speaker: str = "", content: str = "", background: str = "", portrait: str = "", portrait2: str = "", voice: str = "", bgm: str = "", stop_bgm: bool = False, bgm_loop: bool = True, bg_fade_in: bool = False, node_type: str = "text", options: list[str] | None = None, condition_var: str = "", condition_value: str = "", condition_op: str = "==", condition_const: bool = False, sub_dialogues: list[dict] | None = None, ui_file: str = "", video: str = "", video_loop: bool = False, var_ops: list[dict] | None = None, size=(200, 70), node_id: int | None = None, on_position_changed=None):
+    def __init__(
+        self,
+        title: str = "文本节点",
+        speaker: str = "",
+        content: str = "",
+        background: str = "",
+        portrait: str = "",
+        portrait2: str = "",
+        voice: str = "",
+        sfx: str = "",
+        text_style_enabled: bool = False,
+        text_styles: dict | None = None,
+        bgm: str = "",
+        stop_bgm: bool = False,
+        bgm_loop: bool = True,
+        bg_fade_in: bool = False,
+        node_type: str = "text",
+        options: list[str] | None = None,
+        choice_timeout_seconds: float = 0.0,
+        choice_default_index: int = -1,
+        condition_rules: list[dict] | None = None,
+        sub_dialogues: list[dict] | None = None,
+        ui_file: str = "",
+        video: str = "",
+        video_loop: bool = False,
+        var_ops: list[dict] | None = None,
+        size=(200, 70),
+        node_id: int | None = None,
+        on_position_changed=None,
+    ):
         super().__init__(0, 0, size[0], size[1])
         self.node_id = node_id
         self._size = size
@@ -66,6 +117,9 @@ class FlowTextNode(QGraphicsRectItem):
         self.portrait = portrait
         self.portrait2 = portrait2
         self.voice = voice
+        self.sfx = sfx or ""
+        self.text_style_enabled = bool(text_style_enabled)
+        self.text_styles = text_styles if isinstance(text_styles, dict) else {}
         self.bgm = bgm
         self.stop_bgm = stop_bgm
         self.bgm_loop = bgm_loop
@@ -73,10 +127,19 @@ class FlowTextNode(QGraphicsRectItem):
         self.bg_fade_duration = 0.45
         self.node_type = node_type or "text"
         self.options = options or []
-        self.condition_var = condition_var or ""
-        self.condition_value = condition_value or ""
-        self.condition_op = condition_op or "=="
-        self.condition_const = bool(condition_const)
+
+        try:
+            ct = float(choice_timeout_seconds)
+        except Exception:
+            ct = 0.0
+        self.choice_timeout_seconds = max(0.0, min(600.0, ct))
+        try:
+            di = int(choice_default_index)
+        except Exception:
+            di = -1
+        self.choice_default_index = di
+        # 新条件节点：规则列表（顺序匹配）。规则 i 对应第 i 条出边；最后一条出边为“否则”。
+        self.condition_rules = self._normalize_condition_rules(condition_rules)
         self.sub_dialogues = self._normalize_sub_dialogues(sub_dialogues or [])
         self.ui_file = ui_file or ""
         self.video = video or ""
@@ -147,6 +210,15 @@ class FlowTextNode(QGraphicsRectItem):
     def set_voice(self, voice: str):
         self.voice = voice
 
+    def set_sfx(self, sfx: str):
+        self.sfx = sfx or ""
+
+    def set_text_style_enabled(self, enabled: bool):
+        self.text_style_enabled = bool(enabled)
+
+    def set_text_styles(self, styles: dict):
+        self.text_styles = styles if isinstance(styles, dict) else {}
+
     def set_bgm(self, bgm: str):
         self.bgm = bgm
 
@@ -173,17 +245,18 @@ class FlowTextNode(QGraphicsRectItem):
     def set_options(self, options: list[str]):
         self.options = options or []
 
-    def set_condition_var(self, var: str):
-        self.condition_var = var
+    def set_choice_timeout_seconds(self, seconds: float):
+        try:
+            ct = float(seconds)
+        except Exception:
+            ct = 0.0
+        self.choice_timeout_seconds = max(0.0, min(600.0, ct))
 
-    def set_condition_value(self, val: str):
-        self.condition_value = val
-
-    def set_condition_op(self, op: str):
-        self.condition_op = op or "=="
-
-    def set_condition_const(self, const: bool):
-        self.condition_const = bool(const)
+    def set_choice_default_index(self, idx: int):
+        try:
+            self.choice_default_index = int(idx)
+        except Exception:
+            self.choice_default_index = -1
 
     def set_var_ops(self, ops: list[dict]):
         self.var_ops = self._normalize_var_ops(ops or [])
@@ -233,15 +306,21 @@ class FlowTextNode(QGraphicsRectItem):
                 auto_next = float(item.get("auto_next_seconds", 0.0))
             except Exception:
                 auto_next = 0.0
+            text_styles = item.get("text_styles") if isinstance(item.get("text_styles"), dict) else {}
             normalized.append(
                 {
                     "speaker": item.get("speaker", ""),
                     "text": item.get("text", ""),
                     "voice": item.get("voice", ""),
+                    "sfx": item.get("sfx", ""),
+                    "text_style_enabled": bool(item.get("text_style_enabled", False)),
+                    "text_styles": text_styles,
                     "portrait": item.get("portrait", ""),
                     "portrait2": item.get("portrait2", ""),
                     "ui_file": item.get("ui_file", ""),
                     "hide_textbox": bool(item.get("hide_textbox", False)),
+                    # 每条子对话可独立配置变量处理（进入该子对话时执行）
+                    "var_ops": self._normalize_var_ops(item.get("var_ops", []) if isinstance(item.get("var_ops"), list) else []),
                     "portrait_fade": bool(item.get("portrait_fade", False)),
                     "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
                     "portrait2_fade": bool(item.get("portrait2_fade", False)),
@@ -283,15 +362,20 @@ class FlowTextNode(QGraphicsRectItem):
                     auto_next = float(item.get("auto_next_seconds", 0.0))
                 except Exception:
                     auto_next = 0.0
+                text_styles = item.get("text_styles") if isinstance(item.get("text_styles"), dict) else {}
                 normalized.append(
                     {
                         "speaker": item.get("speaker", ""),
                         "text": item.get("text", ""),
                         "voice": item.get("voice", ""),
+                        "sfx": item.get("sfx", ""),
+                        "text_style_enabled": bool(item.get("text_style_enabled", False)),
+                        "text_styles": text_styles,
                         "portrait": item.get("portrait", ""),
                         "portrait2": item.get("portrait2", ""),
                         "ui_file": item.get("ui_file", ""),
                         "hide_textbox": bool(item.get("hide_textbox", False)),
+                        "var_ops": self._normalize_var_ops(item.get("var_ops", []) if isinstance(item.get("var_ops"), list) else []),
                         "portrait_fade": bool(item.get("portrait_fade", False)),
                         "portrait_fade_out": bool(item.get("portrait_fade_out", False)),
                         "portrait2_fade": bool(item.get("portrait2_fade", False)),
@@ -323,6 +407,39 @@ class FlowTextNode(QGraphicsRectItem):
                         "right_const": bool(item.get("right_const", False)),
                     }
                 )
+        return normalized
+
+    def _normalize_condition_rules(self, rules: list[dict] | None):
+        """Normalize condition rules.
+
+        Schema:
+        - name: str
+        - logic: 'and' | 'or'
+        - exprs: list[str]  (each line is a var_expr boolean expression)
+
+        Empty/invalid rules are dropped.
+        """
+
+        if not isinstance(rules, list):
+            return []
+        normalized: list[dict] = []
+        for r in rules[:20]:
+            if not isinstance(r, dict):
+                continue
+            name = str(r.get("name") or "").strip()
+            logic = str(r.get("logic") or "and").strip().lower()
+            if logic not in {"and", "or"}:
+                logic = "and"
+            exprs_in = r.get("exprs")
+            if isinstance(exprs_in, str):
+                exprs = [line.strip() for line in exprs_in.splitlines() if line.strip()]
+            elif isinstance(exprs_in, list):
+                exprs = [str(x).strip() for x in exprs_in[:20] if str(x).strip()]
+            else:
+                exprs = []
+            if not exprs:
+                continue
+            normalized.append({"name": name, "logic": logic, "exprs": exprs})
         return normalized
 
     def set_ui_file(self, ui_file: str):
@@ -477,16 +594,151 @@ class ConnectionPath(QGraphicsPathItem):
         super().paint(painter, option, widget)
 
 
+class FlowFunctionNode(QGraphicsRectItem):
+    """A function node that binds to a host FlowTextNode.
+
+    - No input/output ports
+    - No edges
+    - Takes effect only when bound_to is set
+    """
+
+    def __init__(
+        self,
+        title: str = "功能节点",
+        *,
+        rules: list[dict] | None = None,
+        bound_to: int | None = None,
+        size=(170, 56),
+        node_id: int | None = None,
+        on_position_changed=None,
+    ):
+        super().__init__(0, 0, size[0], size[1])
+        self.node_id = node_id
+        self._size = size
+        self._title = title
+        self.node_type = "function"
+        self.rules = rules if isinstance(rules, list) else []
+        self.bound_to = bound_to
+        self.bound_offset = (0.0, 0.0)
+        self._on_position_changed = on_position_changed
+
+        self._hovered = False
+        self._header_h = 22.0
+        self._normal_pen = QPen(QColor("#D1D5DB"))
+        self._selected_pen = QPen(QColor("#F59E0B"), 2)
+
+        self.setBrush(QColor("#FFFFFF"))
+        self.setPen(self._normal_pen)
+        self.setFlags(
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setAcceptHoverEvents(True)
+
+        try:
+            # Keep function nodes above regular nodes after creation/paste.
+            self.setZValue(1)
+        except Exception:
+            pass
+
+        try:
+            # Keep function nodes above regular nodes.
+            self.setZValue(1)
+        except Exception:
+            pass
+
+        self.label = QGraphicsSimpleTextItem(self._title, self)
+        self.label.setBrush(QColor("#111827"))
+        self._recenter_label()
+
+    def _recenter_label(self):
+        label_rect = self.label.boundingRect()
+        pad_x = 12.0
+        y = max(0.0, (float(self._header_h) - label_rect.height()) / 2.0)
+        self.label.setPos(pad_x, y)
+
+    def set_title(self, title: str):
+        self._title = title
+        self.label.setText(self._title)
+        self._recenter_label()
+
+    def set_rules(self, rules: list[dict]):
+        self.rules = rules if isinstance(rules, list) else []
+
+    def set_bound_to(self, node_id: int | None):
+        self.bound_to = node_id
+
+    def hoverEnterEvent(self, event):  # noqa: N802
+        self._hovered = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):  # noqa: N802
+        self._hovered = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def itemChange(self, change, value):  # noqa: N802
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
+            if self._on_position_changed:
+                self._on_position_changed(self)
+        return super().itemChange(change, value)
+
+    def paint(self, painter: QPainter, option, widget=None):  # noqa: N802
+        painter.save()
+        rect = QRectF(0, 0, float(self._size[0]), float(self._size[1]))
+        radius = 8.0
+
+        pen = self._selected_pen if self.isSelected() else self._normal_pen
+        painter.setPen(pen)
+        painter.setBrush(self.brush())
+        painter.drawRoundedRect(rect, radius, radius)
+
+        header_h = float(getattr(self, "_header_h", 22.0))
+        header_rect = QRectF(rect.x(), rect.y(), rect.width(), min(header_h, rect.height()))
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(rect, radius, radius)
+        painter.save()
+        painter.setClipPath(clip_path)
+        painter.fillRect(header_rect, QColor("#FFFBEB"))
+
+        strip_rect = QRectF(rect.x() + 8.0, rect.y() + 6.0, 3.0, max(0.0, header_rect.height() - 12.0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#F59E0B"))
+        painter.drawRoundedRect(strip_rect, 1.5, 1.5)
+
+        painter.setPen(QPen(QColor("#E5E7EB"), 1))
+        painter.drawLine(QPointF(rect.x() + 1.0, rect.y() + header_rect.height()), QPointF(rect.right() - 1.0, rect.y() + header_rect.height()))
+        painter.restore()
+
+        try:
+            bid = self.bound_to
+            badge = f"绑定: {bid}" if bid is not None else "未绑定"
+            painter.setPen(QColor("#92400E" if bid is not None else "#6B7280"))
+            painter.drawText(
+                QRectF(12.0, header_h + 6.0, rect.width() - 24.0, rect.height() - header_h - 10.0),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                badge,
+            )
+        except Exception:
+            pass
+
+        painter.restore()
+
+
 class GraphView(QGraphicsView):
     """Graphics view with zoom, pan, and context menu."""
 
     previewFromNodeRequested = pyqtSignal(int)
+    functionNodeBindingChanged = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.scene = GraphScene(parent=self)
         self.setScene(self.scene)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -500,6 +752,56 @@ class GraphView(QGraphicsView):
         self._temp_path_item = None
         self._copy_buffer = []
         self._connections: list[ConnectionPath] = []
+        self._is_loading_scene = False
+
+    def _begin_scene_load(self):
+        self._is_loading_scene = True
+
+    def _end_scene_load(self):
+        try:
+            self._normalize_function_nodes_after_load()
+        finally:
+            self._is_loading_scene = False
+
+    def _normalize_function_nodes_after_load(self):
+        hosts = [
+            i
+            for i in self.scene.items()
+            if isinstance(i, FlowTextNode) and getattr(i, "node_id", None) is not None
+        ]
+        host_map = {int(n.node_id): n for n in hosts}
+        for fn in [i for i in self.scene.items() if isinstance(i, FlowFunctionNode)]:
+            try:
+                fn.setZValue(1)
+            except Exception:
+                pass
+
+            bid = getattr(fn, "bound_to", None)
+            if bid is None:
+                continue
+
+            try:
+                bid_int = int(bid)
+            except Exception:
+                fn.bound_to = None
+                fn.update()
+                self.functionNodeBindingChanged.emit(fn)
+                continue
+
+            host = host_map.get(bid_int)
+            if host is None:
+                fn.bound_to = None
+                fn.update()
+                self.functionNodeBindingChanged.emit(fn)
+                continue
+
+            try:
+                ox, oy = getattr(fn, "bound_offset", (0.0, 0.0))
+                hp = host.pos()
+                fn.setPos(QPointF(hp.x() + float(ox), hp.y() + float(oy)))
+            except Exception:
+                pass
+            fn.update()
 
     def wheelEvent(self, event):  # noqa: N802
         zoom_in_factor = 1.15
@@ -530,7 +832,7 @@ class GraphView(QGraphicsView):
         self.scene.setSceneRect(scene_rect.united(rect))
 
     def fit_canvas_to_content(self, margin: float = 300.0):
-        items = [i for i in self.scene.items() if isinstance(i, (FlowTextNode, ConnectionPath))]
+        items = [i for i in self.scene.items() if isinstance(i, (FlowTextNode, FlowFunctionNode, ConnectionPath))]
         if not items:
             return
         rect = items[0].sceneBoundingRect()
@@ -554,6 +856,10 @@ class GraphView(QGraphicsView):
         self.scene.setSceneRect(QRectF(-w / 2.0, -h / 2.0, w, h))
 
     def mousePressEvent(self, event):  # noqa: N802
+        try:
+            self.setFocus()
+        except Exception:
+            pass
         if event.button() == Qt.MouseButton.MiddleButton:
             self._is_panning = True
             self._last_mouse_pos = event.pos()
@@ -610,15 +916,26 @@ class GraphView(QGraphicsView):
         add_text_action.triggered.connect(lambda: self.add_text_node(scene_pos))
         menu.addAction(add_text_action)
 
+        add_func_action = QAction("添加功能节点", self)
+        add_func_action.triggered.connect(lambda: self.add_function_node(scene_pos))
+        menu.addAction(add_func_action)
+
         # 节点级右键菜单：从该节点开始预览
         clicked = self.scene.itemAt(scene_pos, self.transform())
-        while clicked is not None and not isinstance(clicked, FlowTextNode):
+        while clicked is not None and not isinstance(clicked, (FlowTextNode, FlowFunctionNode)):
             clicked = clicked.parentItem()
+
         if isinstance(clicked, FlowTextNode) and getattr(clicked, "node_id", None) is not None:
             menu.addSeparator()
             preview_from_here = QAction("从该节点开始预览", self)
             preview_from_here.triggered.connect(lambda _=False, nid=int(clicked.node_id): self.previewFromNodeRequested.emit(nid))
             menu.addAction(preview_from_here)
+
+        if isinstance(clicked, FlowFunctionNode):
+            menu.addSeparator()
+            unbind_action = QAction("解绑功能节点", self)
+            unbind_action.triggered.connect(lambda _=False, n=clicked: self.unbind_function_node(n))
+            menu.addAction(unbind_action)
 
         if self.scene.selectedItems():
             delete_action = QAction("删除选中节点", self)
@@ -664,13 +981,23 @@ class GraphView(QGraphicsView):
         self._ensure_scene_contains_rect(node.sceneBoundingRect())
         return node
 
+    def add_function_node(self, pos: QPointF):
+        node_id = self._node_counter
+        title = f"功能节点 {node_id}"
+        self._node_counter += 1
+        node = FlowFunctionNode(title=title, node_id=node_id, on_position_changed=self.on_node_moved)
+        node.setPos(pos)
+        self.scene.addItem(node)
+        self._ensure_scene_contains_rect(node.sceneBoundingRect())
+        return node
+
     def delete_selected_nodes(self):
         for item in list(self.scene.selectedItems()):
             self._safe_remove_item(item)
 
     def clear_scene(self):
         for item in list(self.scene.items()):
-            if isinstance(item, (FlowTextNode, ConnectionPath)):
+            if isinstance(item, (FlowTextNode, FlowFunctionNode, ConnectionPath)):
                 self.scene.removeItem(item)
         self._node_counter = 1
         self._copy_buffer = []
@@ -725,7 +1052,8 @@ class GraphView(QGraphicsView):
         for item in self.scene.items():
             if isinstance(item, FlowTextNode):
                 pos = item.pos()
-                nodes.append({
+                node_type = getattr(item, "node_type", "text")
+                nd = {
                     "id": item.node_id,
                     "title": item._title,
                     "speaker": getattr(item, "speaker", ""),
@@ -734,6 +1062,9 @@ class GraphView(QGraphicsView):
                     "portrait": getattr(item, "portrait", ""),
                     "portrait2": getattr(item, "portrait2", ""),
                     "voice": getattr(item, "voice", ""),
+                    "sfx": getattr(item, "sfx", ""),
+                    "text_style_enabled": bool(getattr(item, "text_style_enabled", False)),
+                    "text_styles": getattr(item, "text_styles", {}) if isinstance(getattr(item, "text_styles", {}), dict) else {},
                     "video": getattr(item, "video", ""),
                     "video_loop": getattr(item, "video_loop", False),
                     "bgm": getattr(item, "bgm", ""),
@@ -748,15 +1079,34 @@ class GraphView(QGraphicsView):
                     "portrait2_fade_out": getattr(item, "portrait2_fade_out", False),
                     "portrait_bounce": getattr(item, "portrait_bounce", False),
                     "portrait2_bounce": getattr(item, "portrait2_bounce", False),
-                    "node_type": getattr(item, "node_type", "text"),
+                    "node_type": node_type,
                     "options": getattr(item, "options", []),
-                    "condition_var": getattr(item, "condition_var", ""),
-                    "condition_value": getattr(item, "condition_value", ""),
-                    "condition_op": getattr(item, "condition_op", "=="),
-                    "condition_const": getattr(item, "condition_const", False),
+                    "condition_rules": getattr(item, "condition_rules", []) if isinstance(getattr(item, "condition_rules", []), list) else [],
                     "sub_dialogues": getattr(item, "sub_dialogues", []),
                     "ui_file": getattr(item, "ui_file", ""),
                     "var_ops": getattr(item, "var_ops", []),
+                    "x": pos.x(),
+                    "y": pos.y(),
+                }
+
+                if str(node_type or "").lower() == "choice":
+                    nd["choice_timeout_seconds"] = float(getattr(item, "choice_timeout_seconds", 0.0) or 0.0)
+                    try:
+                        nd["choice_default_index"] = int(getattr(item, "choice_default_index", -1))
+                    except Exception:
+                        nd["choice_default_index"] = -1
+
+                nodes.append(nd)
+
+            if isinstance(item, FlowFunctionNode):
+                pos = item.pos()
+                nodes.append({
+                    "id": item.node_id,
+                    "node_type": "function",
+                    "title": getattr(item, "_title", "功能节点"),
+                    "bound_to": getattr(item, "bound_to", None),
+                    "bound_offset": list(getattr(item, "bound_offset", (0.0, 0.0))),
+                    "rules": getattr(item, "rules", []) if isinstance(getattr(item, "rules", []), list) else [],
                     "x": pos.x(),
                     "y": pos.y(),
                 })
@@ -771,11 +1121,36 @@ class GraphView(QGraphicsView):
         return {"nodes": nodes, "connections": connections}
 
     def load_scene(self, data: dict):
+        self._begin_scene_load()
         self.clear_scene()
         id_to_node = {}
         max_id = 0
 
         for node_data in data.get("nodes", []):
+            if not isinstance(node_data, dict):
+                continue
+
+            ntype = str(node_data.get("node_type", "text") or "text").lower()
+            if ntype == "function":
+                node = FlowFunctionNode(
+                    title=node_data.get("title", "功能节点"),
+                    rules=node_data.get("rules", []) if isinstance(node_data.get("rules"), list) else [],
+                    bound_to=node_data.get("bound_to", None),
+                    node_id=node_data.get("id"),
+                    on_position_changed=self.on_node_moved,
+                )
+                try:
+                    bo = node_data.get("bound_offset")
+                    if isinstance(bo, (list, tuple)) and len(bo) >= 2:
+                        node.bound_offset = (float(bo[0]), float(bo[1]))
+                except Exception:
+                    pass
+                node.setPos(QPointF(node_data.get("x", 0), node_data.get("y", 0)))
+                self.scene.addItem(node)
+                if node.node_id and node.node_id > max_id:
+                    max_id = node.node_id
+                continue
+
             node = FlowTextNode(
                 title=node_data.get("title", "文本节点"),
                 speaker=node_data.get("speaker", ""),
@@ -784,6 +1159,9 @@ class GraphView(QGraphicsView):
                 portrait=node_data.get("portrait", ""),
                 portrait2=node_data.get("portrait2", ""),
                 voice=node_data.get("voice", ""),
+                sfx=node_data.get("sfx", ""),
+                text_style_enabled=bool(node_data.get("text_style_enabled", False)),
+                text_styles=node_data.get("text_styles") if isinstance(node_data.get("text_styles"), dict) else {},
                 video=node_data.get("video", ""),
                 video_loop=bool(node_data.get("video_loop", False)),
                 bgm=node_data.get("bgm", ""),
@@ -792,10 +1170,9 @@ class GraphView(QGraphicsView):
                 bg_fade_in=node_data.get("bg_fade_in", False),
                 node_type=node_data.get("node_type", "text"),
                 options=node_data.get("options", []),
-                condition_var=node_data.get("condition_var", ""),
-                condition_value=node_data.get("condition_value", ""),
-                condition_op=node_data.get("condition_op", "=="),
-                condition_const=bool(node_data.get("condition_const", False)),
+                choice_timeout_seconds=node_data.get("choice_timeout_seconds", 0.0),
+                choice_default_index=node_data.get("choice_default_index", -1),
+                condition_rules=node_data.get("condition_rules", None) if isinstance(node_data.get("condition_rules", None), list) else None,
                 sub_dialogues=node_data.get("sub_dialogues", []),
                 ui_file=node_data.get("ui_file", ""),
                 var_ops=node_data.get("var_ops", []),
@@ -828,48 +1205,277 @@ class GraphView(QGraphicsView):
         self._node_counter = max_id + 1 if max_id else 1
         self._copy_buffer = []
         self.update_start_marks()
+        self._end_scene_load()
+
+    def load_scene_async(
+        self,
+        data: dict,
+        *,
+        batch_size: int = 80,
+        on_done=None,
+        on_error=None,
+    ) -> None:
+        """Load a scene in small batches to keep UI responsive.
+
+        This runs on the UI thread (QGraphics items must be created there),
+        but yields back to the event loop between batches via QTimer.
+        """
+
+        # Cancel any previous async load
+        try:
+            t = getattr(self, "_load_scene_timer", None)
+            if t is not None:
+                t.stop()
+                t.deleteLater()
+        except Exception:
+            pass
+        self._load_scene_timer = None
+
+        self._begin_scene_load()
+        self.clear_scene()
+        _debug_load_log("load_scene_async: start")
+        id_to_node: dict[int, FlowTextNode] = {}
+        max_id = 0
+
+        nodes = data.get("nodes", []) if isinstance(data, dict) else []
+        conns = data.get("connections", []) if isinstance(data, dict) else []
+        total_nodes = len(nodes) if isinstance(nodes, list) else 0
+        total_conns = len(conns) if isinstance(conns, list) else 0
+
+        _debug_load_log(f"load_scene_async: totals nodes={total_nodes} conns={total_conns} batch_size={batch_size}")
+
+        idx = 0
+        cidx = 0
+
+        def _finish_ok() -> None:
+            self._node_counter = max_id + 1 if max_id else 1
+            self._copy_buffer = []
+            self.update_start_marks()
+            try:
+                self._end_scene_load()
+            except Exception:
+                pass
+            _debug_load_log("load_scene_async: finish_ok")
+            cb = on_done
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+        def _fail(err: Exception) -> None:
+            cb = on_error
+            if cb is not None:
+                try:
+                    cb(err)
+                    return
+                except Exception:
+                    pass
+            # fallback: re-raise later in UI logs
+            raise err
+
+        def _add_nodes_batch() -> None:
+            nonlocal idx, max_id
+            try:
+                end = min(idx + max(1, int(batch_size)), total_nodes)
+                while idx < end:
+                    node_data = nodes[idx]
+                    idx += 1
+                    if not isinstance(node_data, dict):
+                        continue
+                    ntype = str(node_data.get("node_type", "text") or "text").lower()
+                    if ntype == "function":
+                        node = FlowFunctionNode(
+                            title=node_data.get("title", "功能节点"),
+                            rules=node_data.get("rules", []) if isinstance(node_data.get("rules"), list) else [],
+                            bound_to=node_data.get("bound_to", None),
+                            node_id=node_data.get("id"),
+                            on_position_changed=self.on_node_moved,
+                        )
+                        try:
+                            bo = node_data.get("bound_offset")
+                            if isinstance(bo, (list, tuple)) and len(bo) >= 2:
+                                node.bound_offset = (float(bo[0]), float(bo[1]))
+                        except Exception:
+                            pass
+                        node.setPos(QPointF(node_data.get("x", 0), node_data.get("y", 0)))
+                        self.scene.addItem(node)
+                        if node.node_id and node.node_id > max_id:
+                            max_id = node.node_id
+                        continue
+                    node = FlowTextNode(
+                        title=node_data.get("title", "文本节点"),
+                        speaker=node_data.get("speaker", ""),
+                        content=node_data.get("content", ""),
+                        background=node_data.get("background", ""),
+                        portrait=node_data.get("portrait", ""),
+                        portrait2=node_data.get("portrait2", ""),
+                        voice=node_data.get("voice", ""),
+                        sfx=node_data.get("sfx", ""),
+                        text_style_enabled=bool(node_data.get("text_style_enabled", False)),
+                        text_styles=node_data.get("text_styles") if isinstance(node_data.get("text_styles"), dict) else {},
+                        video=node_data.get("video", ""),
+                        video_loop=bool(node_data.get("video_loop", False)),
+                        bgm=node_data.get("bgm", ""),
+                        stop_bgm=node_data.get("stop_bgm", False),
+                        bgm_loop=node_data.get("bgm_loop", True),
+                        bg_fade_in=node_data.get("bg_fade_in", False),
+                        node_type=node_data.get("node_type", "text"),
+                        options=node_data.get("options", []),
+                        choice_timeout_seconds=node_data.get("choice_timeout_seconds", 0.0),
+                        choice_default_index=node_data.get("choice_default_index", -1),
+                        condition_rules=node_data.get("condition_rules", None) if isinstance(node_data.get("condition_rules", None), list) else None,
+                        sub_dialogues=node_data.get("sub_dialogues", []),
+                        ui_file=node_data.get("ui_file", ""),
+                        var_ops=node_data.get("var_ops", []),
+                        node_id=node_data.get("id"),
+                        on_position_changed=self.on_node_moved,
+                    )
+                    node.hide_textbox = bool(node_data.get("hide_textbox", False))
+                    node.portrait_fade = bool(node_data.get("portrait_fade", False))
+                    node.portrait_fade_out = bool(node_data.get("portrait_fade_out", False))
+                    node.portrait2_fade = bool(node_data.get("portrait2_fade", False))
+                    node.portrait2_fade_out = bool(node_data.get("portrait2_fade_out", False))
+                    node.portrait_bounce = bool(node_data.get("portrait_bounce", False))
+                    node.portrait2_bounce = bool(node_data.get("portrait2_bounce", False))
+                    try:
+                        node.set_bg_fade_duration(float(node_data.get("bg_fade_duration", getattr(node, "bg_fade_duration", 0.45))))
+                    except Exception:
+                        pass
+                    node.setPos(QPointF(node_data.get("x", 0), node_data.get("y", 0)))
+                    self.scene.addItem(node)
+                    if node.node_id is not None:
+                        id_to_node[int(node.node_id)] = node
+                        if int(node.node_id) > max_id:
+                            max_id = int(node.node_id)
+
+                if idx and (idx % max(200, int(batch_size) * 5) == 0 or idx >= total_nodes):
+                    _debug_load_log(f"load_scene_async: nodes progress {idx}/{total_nodes}")
+
+                if idx >= total_nodes:
+                    # switch to connections phase
+                    self._load_scene_phase = "connections"
+                    _debug_load_log("load_scene_async: switch to connections")
+            except Exception as exc:
+                try:
+                    t = getattr(self, "_load_scene_timer", None)
+                    if t is not None:
+                        t.stop()
+                        t.deleteLater()
+                finally:
+                    self._load_scene_timer = None
+                try:
+                    _fail(exc)
+                except Exception:
+                    pass
+
+        def _add_conns_batch() -> None:
+            nonlocal cidx
+            try:
+                end = min(cidx + max(1, int(batch_size) * 2), total_conns)
+                while cidx < end:
+                    conn = conns[cidx]
+                    cidx += 1
+                    if not isinstance(conn, dict):
+                        continue
+                    source = id_to_node.get(conn.get("source"))
+                    target = id_to_node.get(conn.get("target"))
+                    if source and target and source is not target:
+                        self._create_connection(source, target)
+
+                if cidx and (cidx % max(400, int(batch_size) * 10) == 0 or cidx >= total_conns):
+                    _debug_load_log(f"load_scene_async: conns progress {cidx}/{total_conns}")
+
+                if cidx >= total_conns:
+                    t = getattr(self, "_load_scene_timer", None)
+                    if t is not None:
+                        t.stop()
+                        t.deleteLater()
+                    self._load_scene_timer = None
+                    _finish_ok()
+            except Exception as exc:
+                try:
+                    t = getattr(self, "_load_scene_timer", None)
+                    if t is not None:
+                        t.stop()
+                        t.deleteLater()
+                finally:
+                    self._load_scene_timer = None
+                try:
+                    _fail(exc)
+                except Exception:
+                    pass
+
+        self._load_scene_phase = "nodes"
+
+        def _tick() -> None:
+            if getattr(self, "_load_scene_phase", "nodes") == "nodes":
+                _add_nodes_batch()
+            else:
+                _add_conns_batch()
+
+        timer = QTimer(self)
+        timer.setInterval(0)
+        timer.timeout.connect(_tick)
+        self._load_scene_timer = timer
+        timer.start()
+        # run first chunk immediately
+        _tick()
 
     # Clipboard-like operations
     def copy_selected_nodes(self):
-        nodes = [item for item in self.scene.selectedItems() if isinstance(item, FlowTextNode)]
+        nodes = [item for item in self.scene.selectedItems() if isinstance(item, (FlowTextNode, FlowFunctionNode))]
         if not nodes:
             return
         data = []
         for n in nodes:
-            data.append({
-                "title": n._title,
-                "speaker": getattr(n, "speaker", ""),
-                "content": getattr(n, "content", ""),
-                "background": getattr(n, "background", ""),
-                "portrait": getattr(n, "portrait", ""),
-                "portrait2": getattr(n, "portrait2", ""),
-                "voice": getattr(n, "voice", ""),
-                "video": getattr(n, "video", ""),
-                "video_loop": getattr(n, "video_loop", False),
-                "bgm": getattr(n, "bgm", ""),
-                "stop_bgm": getattr(n, "stop_bgm", False),
-                "bgm_loop": getattr(n, "bgm_loop", True),
-                "bg_fade_in": getattr(n, "bg_fade_in", False),
-                "bg_fade_duration": getattr(n, "bg_fade_duration", 0.45),
-                "hide_textbox": getattr(n, "hide_textbox", False),
-                "portrait_fade": getattr(n, "portrait_fade", False),
-                "portrait_fade_out": getattr(n, "portrait_fade_out", False),
-                "portrait2_fade": getattr(n, "portrait2_fade", False),
-                "portrait2_fade_out": getattr(n, "portrait2_fade_out", False),
-                "portrait_bounce": getattr(n, "portrait_bounce", False),
-                "portrait2_bounce": getattr(n, "portrait2_bounce", False),
-                "node_type": getattr(n, "node_type", "text"),
-                "options": getattr(n, "options", []),
-                "condition_var": getattr(n, "condition_var", ""),
-                "condition_value": getattr(n, "condition_value", ""),
-                "condition_op": getattr(n, "condition_op", "=="),
-                "condition_const": getattr(n, "condition_const", False),
-                "sub_dialogues": getattr(n, "sub_dialogues", []),
-                "ui_file": getattr(n, "ui_file", ""),
-                "var_ops": getattr(n, "var_ops", []),
-                "x": n.pos().x(),
-                "y": n.pos().y(),
-            })
+            if isinstance(n, FlowFunctionNode):
+                data.append({
+                    "node_type": "function",
+                    "title": getattr(n, "_title", "功能节点"),
+                    "bound_to": getattr(n, "bound_to", None),
+                    "bound_offset": list(getattr(n, "bound_offset", (0.0, 0.0))),
+                    "rules": getattr(n, "rules", []) if isinstance(getattr(n, "rules", []), list) else [],
+                    "x": n.pos().x(),
+                    "y": n.pos().y(),
+                })
+            else:
+                data.append({
+                    "title": n._title,
+                    "speaker": getattr(n, "speaker", ""),
+                    "content": getattr(n, "content", ""),
+                    "background": getattr(n, "background", ""),
+                    "portrait": getattr(n, "portrait", ""),
+                    "portrait2": getattr(n, "portrait2", ""),
+                    "voice": getattr(n, "voice", ""),
+                    "sfx": getattr(n, "sfx", ""),
+                    "text_style_enabled": bool(getattr(n, "text_style_enabled", False)),
+                    "text_styles": getattr(n, "text_styles", {}) if isinstance(getattr(n, "text_styles", {}), dict) else {},
+                    "video": getattr(n, "video", ""),
+                    "video_loop": getattr(n, "video_loop", False),
+                    "bgm": getattr(n, "bgm", ""),
+                    "stop_bgm": getattr(n, "stop_bgm", False),
+                    "bgm_loop": getattr(n, "bgm_loop", True),
+                    "bg_fade_in": getattr(n, "bg_fade_in", False),
+                    "bg_fade_duration": getattr(n, "bg_fade_duration", 0.45),
+                    "hide_textbox": getattr(n, "hide_textbox", False),
+                    "portrait_fade": getattr(n, "portrait_fade", False),
+                    "portrait_fade_out": getattr(n, "portrait_fade_out", False),
+                    "portrait2_fade": getattr(n, "portrait2_fade", False),
+                    "portrait2_fade_out": getattr(n, "portrait2_fade_out", False),
+                    "portrait_bounce": getattr(n, "portrait_bounce", False),
+                    "portrait2_bounce": getattr(n, "portrait2_bounce", False),
+                    "node_type": getattr(n, "node_type", "text"),
+                    "options": getattr(n, "options", []),
+                    "choice_timeout_seconds": float(getattr(n, "choice_timeout_seconds", 0.0) or 0.0),
+                    "choice_default_index": int(getattr(n, "choice_default_index", -1) if getattr(n, "choice_default_index", None) is not None else -1),
+                    "condition_rules": getattr(n, "condition_rules", []) if isinstance(getattr(n, "condition_rules", []), list) else [],
+                    "sub_dialogues": getattr(n, "sub_dialogues", []),
+                    "ui_file": getattr(n, "ui_file", ""),
+                    "var_ops": getattr(n, "var_ops", []),
+                    "x": n.pos().x(),
+                    "y": n.pos().y(),
+                })
         self._copy_buffer = data
 
     def paste_nodes(self, offset: QPointF = QPointF(30, 30)):
@@ -879,6 +1485,25 @@ class GraphView(QGraphicsView):
         for item in self._copy_buffer:
             node_id = self._node_counter
             self._node_counter += 1
+            if str(item.get("node_type", "text") or "text").lower() == "function":
+                node = FlowFunctionNode(
+                    title=item.get("title", f"功能节点 {node_id}"),
+                    rules=item.get("rules", []) if isinstance(item.get("rules"), list) else [],
+                    bound_to=item.get("bound_to", None),
+                    node_id=node_id,
+                    on_position_changed=self.on_node_moved,
+                )
+                try:
+                    bo = item.get("bound_offset")
+                    if isinstance(bo, (list, tuple)) and len(bo) >= 2:
+                        node.bound_offset = (float(bo[0]), float(bo[1]))
+                except Exception:
+                    pass
+                node.setPos(QPointF(item.get("x", 0), item.get("y", 0)) + offset)
+                self.scene.addItem(node)
+                new_nodes.append(node)
+                continue
+
             node = FlowTextNode(
                 title=item.get("title", f"文本节点 {node_id}"),
                 speaker=item.get("speaker", ""),
@@ -887,6 +1512,9 @@ class GraphView(QGraphicsView):
                 portrait=item.get("portrait", ""),
                 portrait2=item.get("portrait2", ""),
                 voice=item.get("voice", ""),
+                sfx=item.get("sfx", ""),
+                text_style_enabled=bool(item.get("text_style_enabled", False)),
+                text_styles=item.get("text_styles") if isinstance(item.get("text_styles"), dict) else {},
                 video=item.get("video", ""),
                 video_loop=bool(item.get("video_loop", False)),
                 bgm=item.get("bgm", ""),
@@ -895,10 +1523,9 @@ class GraphView(QGraphicsView):
                 bg_fade_in=item.get("bg_fade_in", False),
                 node_type=item.get("node_type", "text"),
                 options=item.get("options", []),
-                condition_var=item.get("condition_var", ""),
-                condition_value=item.get("condition_value", ""),
-                condition_op=item.get("condition_op", "=="),
-                condition_const=bool(item.get("condition_const", False)),
+                choice_timeout_seconds=item.get("choice_timeout_seconds", 0.0),
+                choice_default_index=item.get("choice_default_index", -1),
+                condition_rules=item.get("condition_rules", None) if isinstance(item.get("condition_rules", None), list) else None,
                 sub_dialogues=item.get("sub_dialogues", []),
                 ui_file=item.get("ui_file", ""),
                 var_ops=item.get("var_ops", []),
@@ -930,9 +1557,15 @@ class GraphView(QGraphicsView):
                     self._connections.remove(edge)
                 self.scene.removeItem(edge)
             self.scene.removeItem(item)
+            # orphan any bound function nodes
+            for fn in [i for i in self.scene.items() if isinstance(i, FlowFunctionNode) and getattr(i, "bound_to", None) == getattr(item, "node_id", None)]:
+                fn.bound_to = None
+                fn.update()
         elif isinstance(item, ConnectionPath):
             if item in self._connections:
                 self._connections.remove(item)
+            self.scene.removeItem(item)
+        elif isinstance(item, FlowFunctionNode):
             self.scene.removeItem(item)
         self.update_start_marks()
 
@@ -941,10 +1574,76 @@ class GraphView(QGraphicsView):
             if item.source_node is node or item.target_node is node:
                 yield item
 
-    def on_node_moved(self, node: FlowTextNode):
-        for edge in self._edges_for_node(node):
-            edge.update_path()
-        self._ensure_scene_contains_rect(node.sceneBoundingRect())
+    def on_node_moved(self, node):
+        if getattr(self, "_is_loading_scene", False):
+            return
+        if isinstance(node, FlowTextNode):
+            for edge in self._edges_for_node(node):
+                edge.update_path()
+            self._update_bound_function_nodes_for_host(node)
+            self._ensure_scene_contains_rect(node.sceneBoundingRect())
+            return
+        if isinstance(node, FlowFunctionNode):
+            self._maybe_bind_function_node(node)
+            self._ensure_scene_contains_rect(node.sceneBoundingRect())
+            return
+
+    def _update_bound_function_nodes_for_host(self, host: FlowTextNode):
+        hid = getattr(host, "node_id", None)
+        if hid is None:
+            return
+        host_pos = host.pos()
+        for fn in [i for i in self.scene.items() if isinstance(i, FlowFunctionNode) and getattr(i, "bound_to", None) == hid]:
+            try:
+                ox, oy = getattr(fn, "bound_offset", (0.0, 0.0))
+                fn.setPos(QPointF(host_pos.x() + float(ox), host_pos.y() + float(oy)))
+            except Exception:
+                pass
+
+    def _maybe_bind_function_node(self, fn: FlowFunctionNode):
+        prev = getattr(fn, "bound_to", None)
+        coll = [i for i in fn.collidingItems() if isinstance(i, FlowTextNode)]
+        if coll:
+            fcenter = fn.sceneBoundingRect().center()
+            best = None
+            best_d = None
+            for h in coll:
+                try:
+                    hc = h.sceneBoundingRect().center()
+                    d = hypot(float(fcenter.x() - hc.x()), float(fcenter.y() - hc.y()))
+                except Exception:
+                    continue
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = h
+            if best is not None and getattr(best, "node_id", None) is not None:
+                hid = int(best.node_id)
+                fn.bound_to = hid
+                try:
+                    hp = best.pos()
+                    fp = fn.pos()
+                    fn.bound_offset = (float(fp.x() - hp.x()), float(fp.y() - hp.y()))
+                except Exception:
+                    fn.bound_offset = (0.0, 0.0)
+                fn.update()
+                if prev != hid:
+                    self.functionNodeBindingChanged.emit(fn)
+                return
+
+        if getattr(fn, "bound_to", None) is not None:
+            fn.bound_to = None
+            fn.update()
+            if prev is not None:
+                self.functionNodeBindingChanged.emit(fn)
+
+    def unbind_function_node(self, fn: FlowFunctionNode):
+        if not isinstance(fn, FlowFunctionNode):
+            return
+        prev = getattr(fn, "bound_to", None)
+        fn.bound_to = None
+        fn.update()
+        if prev is not None:
+            self.functionNodeBindingChanged.emit(fn)
 
     def update_start_marks(self):
         nodes = [i for i in self.scene.items() if isinstance(i, FlowTextNode)]
@@ -1009,8 +1708,11 @@ class GraphView(QGraphicsView):
                     choice_mismatch.append((nid, opt_cnt, out_cnt))
             if getattr(node, "node_type", "text") == "condition":
                 out_cnt = len(targets)
-                if out_cnt != 2:
-                    condition_mismatch.append((nid, out_cnt))
+                rules = getattr(node, "condition_rules", [])
+                rule_cnt = len(rules) if isinstance(rules, list) else 0
+                expected = (rule_cnt + 1) if rule_cnt > 0 else 2
+                if out_cnt != expected:
+                    condition_mismatch.append((nid, out_cnt, expected))
 
         return {
             "start_nodes": start_nodes,
@@ -1030,13 +1732,25 @@ class GraphView(QGraphicsView):
         return targets
 
     def swap_condition_targets(self, node: FlowTextNode):
+        self.swap_outgoing_targets(node, 0, 1)
+
+    def swap_outgoing_targets(self, node: FlowTextNode, idx_a: int, idx_b: int):
+        """Swap the export order of two outgoing edges for a node.
+
+        The runtime uses exported edge order for choice/condition nodes.
+        """
         if not node:
             return
-        matches = [idx for idx, c in enumerate(self._connections) if c.source_node is node]
-        if len(matches) < 2:
+        try:
+            ia = int(idx_a)
+            ib = int(idx_b)
+        except Exception:
             return
-        first_idx, second_idx = matches[0], matches[1]
-        self._connections[first_idx], self._connections[second_idx] = self._connections[second_idx], self._connections[first_idx]
+        matches = [idx for idx, c in enumerate(self._connections) if c.source_node is node]
+        if ia < 0 or ib < 0 or ia >= len(matches) or ib >= len(matches) or ia == ib:
+            return
+        a_i, b_i = matches[ia], matches[ib]
+        self._connections[a_i], self._connections[b_i] = self._connections[b_i], self._connections[a_i]
         self.update()
 
     def keyPressEvent(self, event):  # noqa: N802

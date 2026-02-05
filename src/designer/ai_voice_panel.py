@@ -29,11 +29,14 @@ from PyQt6.QtWidgets import (
     QDialog,
     QScrollArea,
     QSplitter,
+    QInputDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
 import json
 import yaml
+
+import pygame
 
 from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
@@ -42,6 +45,7 @@ from src.ai.api.api_manager import APIManager
 from src.ai.agents.voice_agent import VoiceAgent
 from src.designer.async_elapsed_runner import AsyncElapsedRunner
 from src.ai.utils.voice_emotion import emotion_to_ext, normalize_ext, EXT_KEYS
+from src.ai.utils.voice_bulk_import import bulk_import_voices_from_vng_project, sanitize_id
 from src.designer.voice_model_dialog import VoiceModelPickerDialog, get_gptsovits_client
 
 
@@ -61,6 +65,11 @@ class AIVoicePanel(QWidget):
         self.voice_agent: Optional[VoiceAgent] = None
         self._is_busy = False
         self._auto_running = False
+
+        # 音频试听（参考资源管理面板逻辑）
+        self._mixer_ready = False
+        self._audio_channel = None
+
         self._runner = AsyncElapsedRunner(self)
         self.batch_item_progress.connect(self._on_batch_item_progress)
         self.init_ui()
@@ -104,6 +113,21 @@ class AIVoicePanel(QWidget):
         self.reload_btn = QPushButton("刷新待生成列表")
         self.reload_btn.clicked.connect(self.refresh)
         header.addWidget(self.reload_btn)
+
+        self.add_manual_btn = QPushButton("手动新增")
+        self.add_manual_btn.clicked.connect(self._add_manual_item)
+        header.addWidget(self.add_manual_btn)
+
+        self.delete_manual_btn = QPushButton("删除(手动)")
+        self.delete_manual_btn.clicked.connect(self._delete_current_item)
+        self.delete_manual_btn.setEnabled(False)
+        header.addWidget(self.delete_manual_btn)
+
+        self.import_from_vng_btn = QPushButton("导入工程对白")
+        self.import_from_vng_btn.setToolTip("从关联的 .vngproj 批量导入所有对白到待生成列表，并回填 voice 路径（默认不覆盖已有 voice）")
+        self.import_from_vng_btn.clicked.connect(self._bulk_import_from_vng_project)
+        header.addWidget(self.import_from_vng_btn)
+
         header.addStretch(1)
         layout.addLayout(header)
 
@@ -326,6 +350,16 @@ class AIVoicePanel(QWidget):
         path_row.addWidget(self.path_btn)
         right.addLayout(path_row)
 
+        preview_audio_row = QHBoxLayout()
+        self.preview_voice_btn = QPushButton("试听")
+        self.preview_voice_btn.clicked.connect(self._preview_current_voice)
+        self.stop_voice_btn = QPushButton("停止试听")
+        self.stop_voice_btn.clicked.connect(self._stop_voice_preview)
+        preview_audio_row.addWidget(self.preview_voice_btn)
+        preview_audio_row.addWidget(self.stop_voice_btn)
+        preview_audio_row.addStretch(1)
+        right.addLayout(preview_audio_row)
+
         action_row = QHBoxLayout()
         self.generate_btn = QPushButton("生成当前语音")
         self.generate_btn.clicked.connect(self._generate_single)
@@ -378,6 +412,57 @@ class AIVoicePanel(QWidget):
         self.use_emotion_ext_check.stateChanged.connect(self._sync_voice_tts_settings_to_project)
         self.emotion_strength_spin.valueChanged.connect(self._sync_voice_tts_settings_to_project)
 
+    def closeEvent(self, event):
+        try:
+            self._stop_voice_preview()
+        except Exception:
+            pass
+        return super().closeEvent(event)
+
+    # ==================== 试听/停止（播放生成的语音文件） ====================
+    def _ensure_mixer(self) -> bool:
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            self._mixer_ready = pygame.mixer.get_init() is not None
+        except Exception:
+            self._mixer_ready = False
+        return bool(self._mixer_ready)
+
+    def _preview_current_voice(self):
+        if not self.current_item:
+            QMessageBox.information(self, "提示", "请先选择一条语音条目。")
+            return
+
+        rel = (self.current_item.file_path or "").strip()
+        if not rel:
+            QMessageBox.information(self, "提示", "该条目尚未生成语音文件。")
+            return
+
+        abs_path = self._resource_path(rel)
+        if not abs_path.exists():
+            QMessageBox.warning(self, "提示", f"文件不存在：{abs_path}")
+            return
+
+        if not self._ensure_mixer():
+            QMessageBox.warning(self, "提示", "音频试听初始化失败")
+            return
+
+        try:
+            sound = pygame.mixer.Sound(str(abs_path))
+            if self._audio_channel and getattr(self._audio_channel, "get_busy", lambda: False)():
+                self._audio_channel.stop()
+            self._audio_channel = sound.play()
+        except Exception as exc:
+            QMessageBox.warning(self, "预览失败", f"播放音频失败：{exc}")
+
+    def _stop_voice_preview(self):
+        try:
+            if self._audio_channel and getattr(self._audio_channel, "get_busy", lambda: False)():
+                self._audio_channel.stop()
+        except Exception:
+            pass
+
     def _force_stop_task(self):
         # 批量模式优先用“停止”逻辑（避免后台循环继续排队）
         try:
@@ -398,6 +483,7 @@ class AIVoicePanel(QWidget):
             self.pending_items = []
             self.list_widget.clear()
             self._clear_detail()
+            self._update_delete_btn_state()
             return
 
         # 从工程 story_config 恢复语音TTS设置
@@ -460,13 +546,16 @@ class AIVoicePanel(QWidget):
             self._clear_detail()
             self.progress_label.setText("状态：无待生成语音")
 
+        self._update_delete_btn_state()
+
     def _populate_list(self):
         self.list_widget.clear()
         for item in self.pending_items:
+            src = "手动" if self._is_manual_item(item) else "自动"
             eff_style, eff_genre = self._effective_tts_style_genre(item)
             style_part = f"style={eff_style}" if eff_style else "style=?"
             genre_part = f"genre={eff_genre}" if eff_genre is not None else "genre=?"
-            text = f"{item.node_id} | {item.speaker} | {item.emotion} | {item.status} | {style_part} {genre_part}"
+            text = f"[{src}] {item.node_id} | {item.speaker} | {item.emotion} | {item.status} | {style_part} {genre_part}"
             lw = QListWidgetItem(text)
             lw.setData(Qt.ItemDataRole.UserRole, item.item_id)
             tip = f"原对白：{item.text}"
@@ -486,6 +575,172 @@ class AIVoicePanel(QWidget):
         self.current_item = item
         if item:
             self._show_item(item)
+        self._update_delete_btn_state()
+
+    def _is_manual_item(self, item: VoicePendingItem | None) -> bool:
+        if not item:
+            return False
+        return str(getattr(item, "source", "auto") or "auto").strip().lower() == "manual"
+
+    def _update_delete_btn_state(self):
+        try:
+            self.delete_manual_btn.setEnabled(bool(self.current_item and self._is_manual_item(self.current_item)))
+        except Exception:
+            return
+
+    def _add_manual_item(self):
+        if not self._ensure_project():
+            return
+
+        speaker, ok = QInputDialog.getText(self, "手动新增语音", "角色名（旁白可留空/填旁白）：")
+        if not ok:
+            return
+        speaker = (speaker or "").strip() or "旁白"
+
+        text, ok = QInputDialog.getMultiLineText(self, "手动新增语音", "对白文本：")
+        if not ok:
+            return
+        text = (text or "").strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "对白文本不能为空。")
+            return
+
+        default_char_id = "narrator" if speaker.strip() in {"旁白", "叙述"} else sanitize_id(speaker)
+        char_id, ok = QInputDialog.getText(self, "手动新增语音", "角色ID（用于路径/分组）：", text=default_char_id)
+        if not ok:
+            return
+        char_id = (char_id or "").strip() or default_char_id
+
+        node_id, ok = QInputDialog.getText(self, "手动新增语音", "节点ID（可选，默认 manual）：", text="manual")
+        if not ok:
+            return
+        node_id = (node_id or "").strip() or "manual"
+
+        emotion, ok = QInputDialog.getText(self, "手动新增语音", "情绪（可选，默认 平静）：", text="平静")
+        if not ok:
+            return
+        emotion = (emotion or "").strip() or "平静"
+
+        # 生成一个相对稳定的 voice_id：按 char_id 递增
+        existing_count = 0
+        try:
+            existing_count = sum(1 for it in self.pending_items if (getattr(it, "char_id", "") or "") == char_id)
+        except Exception:
+            existing_count = len(self.pending_items)
+        voice_id = f"{char_id}_{existing_count + 1:04d}"
+
+        # item_id 避免与自动项冲突
+        item_index = len(self.pending_items) + 1
+        item_id = f"manual_voice_item_{item_index:05d}"
+        existing_ids = {getattr(it, "item_id", "") for it in self.pending_items}
+        while item_id in existing_ids:
+            item_index += 1
+            item_id = f"manual_voice_item_{item_index:05d}"
+
+        file_path = f"resources/voices/{char_id}/{voice_id}.mp3"
+
+        self.pending_items.append(
+            VoicePendingItem(
+                source="manual",
+                item_id=item_id,
+                voice_id=voice_id,
+                node_id=node_id,
+                sub_id=None,
+                speaker=speaker,
+                char_id=char_id,
+                text=text,
+                emotion=emotion,
+                status="pending",
+                file_path=file_path,
+            )
+        )
+        self._persist_pending_lists()
+        self._populate_list()
+        self._select_item(self.pending_items[-1])
+        self._update_delete_btn_state()
+
+    def _delete_current_item(self):
+        if not self.current_item:
+            return
+        if not self._is_manual_item(self.current_item):
+            QMessageBox.information(self, "提示", "该条目为自动生成，不能删除；如需处理请用“重置/标记完成/刷新”。")
+            return
+
+        item_id = self.current_item.item_id
+        self.pending_items = [it for it in self.pending_items if it.item_id != item_id]
+        self.current_item = None
+        self._persist_pending_lists()
+        self._populate_list()
+        if self.pending_items:
+            self.list_widget.setCurrentRow(0)
+        else:
+            self._clear_detail()
+        self._update_delete_btn_state()
+
+    def _bulk_import_from_vng_project(self):
+        if not self._ensure_project():
+            return
+
+        project = self.project_manager.current_project
+        if not project:
+            return
+
+        vng_path = (getattr(project.ai_project_info, "vng_project_path", None) or "").strip()
+        if not vng_path:
+            picked, _ = QFileDialog.getOpenFileName(self, "选择 VNEngine 工程文件", "", "VNEngine工程文件 (*.vngproj)")
+            if not picked:
+                return
+            vng_path = picked
+            try:
+                self.project_manager.set_vng_project_path(vng_path)
+            except Exception:
+                pass
+
+        try:
+            with open(vng_path, "r", encoding="utf-8") as f:
+                vng_data = yaml.safe_load(f) or {}
+            if not isinstance(vng_data, dict):
+                raise ValueError("工程文件格式无效")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", f"读取工程文件失败：{exc}")
+            return
+
+        new_pending, updated_data, stats = bulk_import_voices_from_vng_project(
+            project=project,
+            vng_project_data=vng_data,
+            existing_pending=self.pending_items,
+            only_fill_empty_voice_fields=True,
+            source="manual",
+            voice_ext="mp3",
+        )
+
+        self.pending_items = list(new_pending)
+        self._persist_pending_lists()
+        self._populate_list()
+        if self.pending_items:
+            self.list_widget.setCurrentRow(0)
+
+        try:
+            with open(vng_path, "w", encoding="utf-8") as f:
+                yaml.dump(updated_data, f, allow_unicode=True, indent=4, sort_keys=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"已导入待生成列表，但回写工程文件失败：{exc}")
+            return
+
+        QMessageBox.information(
+            self,
+            "导入完成",
+            "\n".join(
+                [
+                    f"扫描对白：{stats.scanned}",
+                    f"新增待生成：{stats.added}",
+                    f"去重跳过：{stats.deduped_existing_pending}",
+                    f"跳过第一人称：{stats.skipped_first_person}",
+                    f"空文本跳过：{stats.skipped_empty_text}",
+                    f"已回填 voice：{stats.updated_voice_fields}",
+                ]
+            ),
+        )
 
     def _get_item_by_id(self, item_id: str) -> Optional[VoicePendingItem]:
         for it in self.pending_items:

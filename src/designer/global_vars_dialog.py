@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QDoubleSpinBox,
+    QCheckBox,
     QMessageBox,
 )
 from PyQt6.QtCore import Qt
@@ -69,7 +70,9 @@ class GlobalVarsDialog(QDialog):
         for item in self._vars:
             name = item.get("name", "")
             init_val = item.get("initial", 0.0)
-            display = f"{name or '<未命名>'} = {init_val} (float)"
+            protected = bool(item.get("protected", False))
+            tag = " [保护]" if protected else ""
+            display = f"{name or '<未命名>'} = {init_val} (float){tag}"
             lw_item = QListWidgetItem(display)
             lw_item.setData(Qt.ItemDataRole.UserRole, item)
             self._list.addItem(lw_item)
@@ -111,9 +114,12 @@ class GlobalVarsDialog(QDialog):
         value_spin.setRange(-1e12, 1e12)
         value_spin.setDecimals(6)
         value_spin.setValue(float(data.get("initial", 0.0)) if data else 0.0)
+        protected_chk = QCheckBox("启用")
+        protected_chk.setChecked(bool(data.get("protected", False)) if data else False)
 
         form.addRow("变量名", name_edit)
         form.addRow("初始值 (float)", value_spin)
+        form.addRow("保护（读档/开始游戏不回溯）", protected_chk)
 
         btn_row = QHBoxLayout()
         btn_ok = QPushButton("确定")
@@ -139,7 +145,7 @@ class GlobalVarsDialog(QDialog):
             if existing.get("name") == name:
                 QMessageBox.warning(self, "提示", "变量名已存在")
                 return None
-        return {"name": name, "type": "float", "initial": value_spin.value()}
+        return {"name": name, "type": "float", "initial": value_spin.value(), "protected": bool(protected_chk.isChecked())}
 
     def _accept(self):
         if self.project_manager:

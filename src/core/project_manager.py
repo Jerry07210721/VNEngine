@@ -13,8 +13,8 @@ class VNProjectManager:
         self.project_data = {
             "project_info": {
                 "name": "未命名工程",
-                "version": "2.5",
-                "engine_version": "VNEngine V2.5",
+                "version": "2.6",
+                "engine_version": "VNEngine V2.6",
                 "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_modify_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             },
@@ -23,6 +23,26 @@ class VNProjectManager:
                 "window_height": 600,
                 "game_title": "我的视觉小说",
                 "branch_strategy": "first",  # first | random | longest (预留)
+                "text_styles": {
+                    "dialogue": {
+                        "font_family": "SimHei",
+                        "font_path": "",
+                        "size": 22,
+                        "color": [235, 235, 240],
+                        "bold": False,
+                        "outline_color": [0, 0, 0],
+                        "outline_width": 0,
+                    },
+                    "name": {
+                        "font_family": "SimHei",
+                        "font_path": "",
+                        "size": 24,
+                        "color": [220, 220, 220],
+                        "bold": True,
+                        "outline_color": [0, 0, 0],
+                        "outline_width": 0,
+                    },
+                },
                 "menu_title": "",
                 "menu_background": "",
                 "menu_bgm": "",

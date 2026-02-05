@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QScrollArea,
     QSplitter,
+    QInputDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -70,6 +71,16 @@ class AIPortraitPanel(QWidget):
         self.reload_btn = QPushButton("刷新待生成列表")
         self.reload_btn.clicked.connect(self.refresh)
         header.addWidget(self.reload_btn)
+
+        self.add_manual_btn = QPushButton("手动新增")
+        self.add_manual_btn.clicked.connect(self._add_manual_item)
+        header.addWidget(self.add_manual_btn)
+
+        self.delete_manual_btn = QPushButton("删除(手动)")
+        self.delete_manual_btn.clicked.connect(self._delete_current_item)
+        self.delete_manual_btn.setEnabled(False)
+        header.addWidget(self.delete_manual_btn)
+
         header.addStretch(1)
         layout.addLayout(header)
 
@@ -493,6 +504,7 @@ class AIPortraitPanel(QWidget):
             self.pending_items = []
             self.list_widget.clear()
             self._clear_detail()
+            self._update_delete_btn_state()
             return
 
         self.project_label.setText(f"工程：{project.ai_project_info.name}")
@@ -505,11 +517,14 @@ class AIPortraitPanel(QWidget):
             self._clear_detail()
             self.progress_label.setText("状态：无待生成立绘")
 
+        self._update_delete_btn_state()
+
     def _populate_list(self):
         self.list_widget.clear()
         for item in self.pending_items:
             expr_count = len(item.expressions or [])
-            text = f"{item.char_name} ({item.status}) | {expr_count}表情"
+            src = "手动" if self._is_manual_item(item) else "自动"
+            text = f"[{src}] {item.char_name} ({item.status}) | {expr_count}表情"
             lw = QListWidgetItem(text)
             lw.setData(Qt.ItemDataRole.UserRole, item.item_id)
             self.list_widget.addItem(lw)
@@ -518,6 +533,7 @@ class AIPortraitPanel(QWidget):
         current = self.list_widget.currentItem()
         if not current:
             self._clear_detail()
+            self._update_delete_btn_state()
             return
 
         item_id = current.data(Qt.ItemDataRole.UserRole)
@@ -525,6 +541,101 @@ class AIPortraitPanel(QWidget):
         self.current_item = item
         if item:
             self._show_item(item)
+        self._update_delete_btn_state()
+
+    def _is_manual_item(self, item: Optional[PortraitPendingItem]) -> bool:
+        if not item:
+            return False
+        return str(getattr(item, "source", "auto") or "auto").strip().lower() == "manual"
+
+    def _update_delete_btn_state(self):
+        try:
+            self.delete_manual_btn.setEnabled(bool(self.current_item and self._is_manual_item(self.current_item)))
+        except Exception:
+            return
+
+    def _add_manual_item(self):
+        project = self.project_manager.current_project
+        if project is None:
+            QMessageBox.information(self, "提示", "请先加载 AI 工程。")
+            return
+
+        char_id, ok = QInputDialog.getText(self, "手动新增立绘", "角色ID（如 alice）：")
+        if not ok:
+            return
+        char_id = (char_id or "").strip()
+        if not char_id:
+            QMessageBox.warning(self, "提示", "角色ID 不能为空。")
+            return
+
+        char_name, ok = QInputDialog.getText(self, "手动新增立绘", "角色名称（如 爱丽丝）：")
+        if not ok:
+            return
+        char_name = (char_name or "").strip() or char_id
+
+        description, ok = QInputDialog.getMultiLineText(self, "手动新增立绘", "立绘描述（可空）：")
+        if not ok:
+            return
+        description = (description or "").strip()
+
+        expr_text, ok = QInputDialog.getText(self, "手动新增立绘", "表情列表（逗号分隔，可空）：")
+        if not ok:
+            return
+        expressions = [x.strip() for x in (expr_text or "").split(",") if x.strip()]
+
+        prompt, ok = QInputDialog.getMultiLineText(self, "手动新增立绘", "提示词（可空）：")
+        if not ok:
+            return
+        prompt = (prompt or "").strip() or None
+
+        item_index = len(self.pending_items) + 1
+        item_id = f"manual_portrait_item_{item_index:05d}"
+        existing_ids = {getattr(it, "item_id", "") for it in self.pending_items}
+        while item_id in existing_ids:
+            item_index += 1
+            item_id = f"manual_portrait_item_{item_index:05d}"
+
+        self.pending_items.append(
+            PortraitPendingItem(
+                source="manual",
+                item_id=item_id,
+                char_id=char_id,
+                char_name=char_name,
+                description=description,
+                expressions=expressions,
+                poses=[],
+                status="pending",
+                prompt=prompt,
+                model=None,
+                file_paths=[],
+                base_image_path=None,
+                mj_state={},
+                flux_state={},
+            )
+        )
+
+        self._persist_pending_lists()
+        self._populate_list()
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self._update_delete_btn_state()
+
+    def _delete_current_item(self):
+        if not self.current_item:
+            return
+        if not self._is_manual_item(self.current_item):
+            QMessageBox.information(self, "提示", "该条目为自动生成，不能删除；如需处理请用“重置/标记完成/刷新”。")
+            return
+
+        item_id = self.current_item.item_id
+        self.pending_items = [it for it in self.pending_items if it.item_id != item_id]
+        self.current_item = None
+        self._persist_pending_lists()
+        self._populate_list()
+        if self.pending_items:
+            self.list_widget.setCurrentRow(0)
+        else:
+            self._clear_detail()
+        self._update_delete_btn_state()
 
     def _get_item_by_id(self, item_id: str) -> Optional[PortraitPendingItem]:
         for it in self.pending_items:
@@ -605,6 +716,7 @@ class AIPortraitPanel(QWidget):
         self.base_path_label.setText("基准图：未生成")
         self.filepaths_label.setText("")
         self.progress_label.setText("状态：等待选择")
+        self._update_delete_btn_state()
 
     def _toggle_design_mj_group(self):
         is_mj = (self.design_model_combo.currentData() == "midjourney")
@@ -1760,4 +1872,5 @@ class AIPortraitPanel(QWidget):
             if not item_data:
                 continue
             expr_count = len(item_data.expressions or [])
-            item_widget.setText(f"{item_data.char_name} ({item_data.status}) | {expr_count}表情")
+            src = "手动" if self._is_manual_item(item_data) else "自动"
+            item_widget.setText(f"[{src}] {item_data.char_name} ({item_data.status}) | {expr_count}表情")

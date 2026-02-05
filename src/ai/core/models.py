@@ -31,6 +31,7 @@ class StoryConfig(BaseModel):
     enable_choice_node: bool = Field(False, description="是否开启选择节点（仅在开启多分支时可用）")
     enable_condition_node: bool = Field(False, description="是否开启条件节点（仅在开启多分支时可用）")
     enable_multi_branch: bool = Field(False, description="是否开启多分支章节规划（允许并行路线/多结局）")
+    allow_loop_story: bool = Field(False, description="允许出现循环剧情（仅多分支；需 choice/condition 提供跳出循环的出口）")
     enable_single_route: bool = Field(False, description="是否启用单线叙事（禁止章节级分支/并行路线）")
     condition_type: str = Field("favorability", description="条件类型（如：好感度）")
     character_hint_weight: float = Field(0.7, ge=0.0, le=1.0, description="角色设定遵循用户配置的权重(0-1)")
@@ -42,12 +43,21 @@ class StoryConfig(BaseModel):
     first_person_cg_notes: str = Field("", description="第一人称在CG中的表现说明")
     cg_count: int = Field(0, description="每章目标CG数量（用于章节详稿标注）", ge=0, le=20)
 
+    # Step4（逐章详稿）文本量控制：经验上 LLM 常低估字数/字符数，允许通过倍率放大写作目标
+    step4_word_boost_factor: float = Field(
+        1.5,
+        ge=1.0,
+        le=3.0,
+        description="Step4 逐章详稿写作目标字数放大倍率（用于抵消模型计数偏差；1.0 表示不放大）",
+    )
+
     @model_validator(mode="after")
     def _enforce_story_mode_constraints(self):
         """强制配置互斥/依赖规则：
 
         - 单线叙事与多分支互斥：如果同时为 True，优先保留单线叙事并关闭多分支。
         - 只有开启多分支，才能启用选择/条件节点；否则强制关闭。
+        - 只有开启多分支，才允许循环剧情；并且循环剧情必须至少启用 choice/condition 之一用于跳出循环。
         """
         if bool(self.enable_single_route) and bool(self.enable_multi_branch):
             self.enable_multi_branch = False
@@ -55,6 +65,13 @@ class StoryConfig(BaseModel):
         if not bool(self.enable_multi_branch):
             self.enable_choice_node = False
             self.enable_condition_node = False
+            self.allow_loop_story = False
+
+        # 循环剧情依赖 choice/condition 作为“跳出循环”的出口
+        if bool(self.enable_multi_branch) and bool(self.allow_loop_story):
+            if not (bool(self.enable_choice_node) or bool(self.enable_condition_node)):
+                # 默认启用条件节点来保证可跳出循环
+                self.enable_condition_node = True
 
         return self
 
@@ -186,11 +203,22 @@ class AgentResponse(BaseModel):
 
 
 # ==================== 工程整合相关模型 ====================
+class ConditionRule(BaseModel):
+    """条件节点规则（顺序匹配）。
+
+    - exprs: 每行一个 var_expr 表达式
+    - logic: 多表达式的连接方式
+    """
+
+    name: str = Field("", description="规则名称（可选）")
+    logic: Literal["and", "or"] = Field("and", description="多表达式连接方式")
+    exprs: List[str] = Field(default_factory=list, description="表达式列表（每行一个）")
+
 
 class FlowNodeData(BaseModel):
     """流程节点数据（对齐VNEngine格式）"""
     id: int = Field(..., description="节点ID")
-    node_type: Literal["text", "choice", "condition"] = Field(..., description="节点类型")
+    node_type: Literal["text", "choice", "condition", "function"] = Field(..., description="节点类型")
     title: str = Field(..., description="节点标题")
     content: str = Field("", description="节点内容")
     speaker: str = Field("", description="发言者")
@@ -198,6 +226,9 @@ class FlowNodeData(BaseModel):
     portrait2: str = Field("", description="第二立绘路径")
     background: str = Field("", description="背景路径")
     voice: str = Field("", description="语音路径")
+    sfx: str = Field("", description="音效路径")
+    text_style_enabled: bool = Field(False, description="是否启用该节点的文字样式覆盖")
+    text_styles: Dict[str, Any] = Field(default_factory=dict, description="该节点的文字样式覆盖配置")
     bgm: str = Field("", description="BGM路径")
     bgm_loop: bool = Field(True, description="BGM是否循环")
     stop_bgm: bool = Field(False, description="是否停止BGM")
@@ -214,12 +245,21 @@ class FlowNodeData(BaseModel):
     video: str = Field("", description="视频路径")
     video_loop: bool = Field(False, description="视频是否循环")
     options: List[str] = Field(default_factory=list, description="选项列表（选择节点）")
-    condition_var: str = Field("", description="条件变量名（条件节点）")
-    condition_op: str = Field("==", description="条件运算符")
-    condition_value: str = Field("", description="条件值")
-    condition_const: bool = Field(False, description="条件值是否为常量")
+
+    # 条件节点（新规则列表）
+    condition_rules: List[ConditionRule] = Field(
+        default_factory=list,
+        description="条件规则列表（顺序匹配；规则 i 对应第 i 条出边；最后一条出边为否则分支）",
+    )
+
     sub_dialogues: List[Dict[str, Any]] = Field(default_factory=list, description="子对话列表")
     var_ops: List[Dict[str, Any]] = Field(default_factory=list, description="变量运算列表")
+
+    # 功能节点（function）专用字段：绑定到宿主节点并按规则执行脚本
+    bound_to: Optional[int] = Field(None, description="功能节点绑定的宿主节点ID")
+    bound_offset: List[float] = Field(default_factory=lambda: [0.0, 0.0], description="功能节点相对宿主节点偏移")
+    rules: List[Dict[str, Any]] = Field(default_factory=list, description="功能节点规则列表（condition/action 等）")
+
     x: float = Field(0.0, description="节点X坐标")
     y: float = Field(0.0, description="节点Y坐标")
 
@@ -265,6 +305,18 @@ class GenerationHistory(BaseModel):
     step2_outline: Optional[Dict[str, Any]] = Field(None, description="步骤2：故事大纲")
     # 章节列表使用结构化字典（包含 raw_response/structured/parameters 等），而非纯列表，便于保存上下文
     step3_chapters: Optional[Dict[str, Any]] = Field(None, description="步骤3：章节列表")
+
+    # 主控面板：每步“已保存指令”（用户可编辑后点按钮持久化保存；发送时强制使用已保存版本）
+    # - saved_step_instructions：step1/step2/step3
+    # - step4_saved_instructions：按章节索引保存（key 为字符串："0"/"1"...），避免 YAML/JSON 的 int key 兼容问题
+    saved_step_instructions: Dict[str, str] = Field(
+        default_factory=dict,
+        description="主控面板：step1/step2/step3 已保存指令文本（用于发送前校验/持久化）",
+    )
+    step4_saved_instructions: Dict[str, str] = Field(
+        default_factory=dict,
+        description="主控面板：step4 按章节索引保存的指令文本（key=章节索引字符串）",
+    )
     # 主控面板每步可独立配置的 max_tokens（用于长文本生成）；UI 侧限制最大 64000
     step_max_tokens: Dict[str, int] = Field(
         default_factory=lambda: {
@@ -284,6 +336,10 @@ class GenerationHistory(BaseModel):
 
 class PortraitPendingItem(BaseModel):
     """待生成立绘项"""
+    source: Literal["auto", "manual"] = Field(
+        default="auto",
+        description="来源：auto=系统生成，manual=手动添加",
+    )
     item_id: str = Field(..., description="项目ID")
     char_id: str = Field(..., description="角色ID")
     char_name: str = Field(..., description="角色名称")
@@ -301,6 +357,10 @@ class PortraitPendingItem(BaseModel):
 
 class BackgroundPendingItem(BaseModel):
     """待生成背景项"""
+    source: Literal["auto", "manual"] = Field(
+        default="auto",
+        description="来源：auto=系统生成，manual=手动添加",
+    )
     item_id: str = Field(..., description="项目ID")
     bg_id: str = Field(..., description="背景ID")
     description: str = Field(..., description="背景描述")
@@ -316,6 +376,10 @@ class BackgroundPendingItem(BaseModel):
 
 class CGPendingItem(BaseModel):
     """待生成CG项"""
+    source: Literal["auto", "manual"] = Field(
+        default="auto",
+        description="来源：auto=系统生成，manual=手动添加",
+    )
     item_id: str = Field(..., description="项目ID")
     cg_id: str = Field(..., description="CG ID")
     node_id: str = Field(..., description="关联的流程节点ID")
@@ -332,6 +396,10 @@ class CGPendingItem(BaseModel):
 
 class VoicePendingItem(BaseModel):
     """待生成语音项"""
+    source: Literal["auto", "manual"] = Field(
+        default="auto",
+        description="来源：auto=系统生成，manual=手动添加",
+    )
     item_id: str = Field(..., description="项目ID")
     voice_id: str = Field(..., description="语音ID")
     node_id: str = Field(..., description="关联的节点ID")
@@ -362,6 +430,10 @@ class VoicePendingItem(BaseModel):
 
 class BGMPendingItem(BaseModel):
     """待生成BGM项"""
+    source: Literal["auto", "manual"] = Field(
+        default="auto",
+        description="来源：auto=系统生成，manual=手动添加",
+    )
     item_id: str = Field(..., description="项目ID")
     bgm_id: str = Field(..., description="BGM ID")
     description: str = Field(..., description="BGM描述")

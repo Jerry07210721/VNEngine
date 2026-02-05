@@ -44,6 +44,7 @@ class AsyncElapsedRunner(QObject):
         self._timer: Optional[QTimer] = None
         self._elapsed: Optional[QElapsedTimer] = None
         self._label: Optional[QLabel] = None
+        self._text_setter: Optional[Callable[[str], None]] = None
         self._base_text: str = ""
         self._on_finally: Optional[Callable[[], None]] = None
 
@@ -56,6 +57,8 @@ class AsyncElapsedRunner(QObject):
         if self._thread is not None:
             self._thread.deleteLater()
             self._thread = None
+        self._label = None
+        self._text_setter = None
         self._on_finally = None
 
     def is_running(self) -> bool:
@@ -67,10 +70,10 @@ class AsyncElapsedRunner(QObject):
         self._base_text = str(base_text or "")
         self._tick()
 
-    def run(
+    def run_with_setter(
         self,
         *,
-        label: QLabel,
+        set_text: Callable[[str], None],
         base_text: str,
         fn: Callable[[], Any],
         on_success: Callable[[Any], None],
@@ -78,7 +81,10 @@ class AsyncElapsedRunner(QObject):
         on_finally: Optional[Callable[[], None]] = None,
         tick_ms: int = 500,
     ) -> bool:
-        """Start running `fn` in background.
+        """Start running `fn` in background, updating via `set_text`.
+
+        This is useful for widgets like QProgressDialog, which exposes a
+        `setLabelText(...)` API rather than a public QLabel.
 
         Returns False if a task is already running.
         """
@@ -86,13 +92,13 @@ class AsyncElapsedRunner(QObject):
         if self.is_running():
             return False
 
-        self._label = label
-        self._base_text = base_text
+        self._label = None
+        self._text_setter = set_text
+        self._base_text = str(base_text or "")
         self._on_finally = on_finally
         self._elapsed = QElapsedTimer()
         self._elapsed.start()
 
-        # Start elapsed ticker
         self._timer = QTimer(self._parent_widget)
         self._timer.setInterval(int(tick_ms))
         self._timer.timeout.connect(self._tick)
@@ -127,6 +133,42 @@ class AsyncElapsedRunner(QObject):
         thread.result.connect(_handle_result)
         thread.start()
         return True
+
+    def run(
+        self,
+        *,
+        label: QLabel,
+        base_text: str,
+        fn: Callable[[], Any],
+        on_success: Callable[[Any], None],
+        on_error: Optional[Callable[[str], None]] = None,
+        on_finally: Optional[Callable[[], None]] = None,
+        tick_ms: int = 500,
+    ) -> bool:
+        """Start running `fn` in background.
+
+        Returns False if a task is already running.
+        """
+
+        # Keep old API, but implement via setter so both paths share logic.
+        self._label = label
+        self._text_setter = None
+
+        def _setter(text: str) -> None:
+            try:
+                label.setText(text)
+            except RuntimeError:
+                pass
+
+        return self.run_with_setter(
+            set_text=_setter,
+            base_text=base_text,
+            fn=fn,
+            on_success=on_success,
+            on_error=on_error,
+            on_finally=on_finally,
+            tick_ms=tick_ms,
+        )
 
     def force_stop(self, *, stopped_text: str = "状态：已强制停止") -> bool:
         """Force-stop current running task.
@@ -173,11 +215,16 @@ class AsyncElapsedRunner(QObject):
                     pass
 
     def _tick(self) -> None:
-        if not self._label or not self._elapsed:
+        if not self._elapsed:
             return
         try:
             secs = int(self._elapsed.elapsed() / 1000)
-            self._label.setText(f"{self._base_text} (已耗时 {secs}s)")
+            text = f"{self._base_text} (已耗时 {secs}s)"
+            if self._text_setter is not None:
+                self._text_setter(text)
+                return
+            if self._label is not None:
+                self._label.setText(text)
         except RuntimeError:
             # Label might be deleted when widget is closing.
             if self._timer is not None:

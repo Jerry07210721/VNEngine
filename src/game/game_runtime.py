@@ -1,14 +1,24 @@
 # -*- coding: utf-8 -*-
 """Game runtime window using Pygame."""
 import sys
+import os
+import subprocess
 import random
+import threading
+import builtins
 from datetime import datetime
 from pathlib import Path
+import shutil
+import glob
 import pygame
 import yaml
 import json
 import math
 import numpy as np
+
+from src.game.var_expr import eval_var_expr
+
+from src.game.choice_utils import normalize_choice_timeout_config
 
 from src.game.save_slot_utils import (
     AUTO_SAVE_SLOT,
@@ -17,6 +27,7 @@ from src.game.save_slot_utils import (
     digit_to_slot,
     page_count,
     slot_file_path,
+    slot_thumbnail_path,
 )
 
 
@@ -25,6 +36,16 @@ class VNGameRuntime:
 
     def __init__(self, game_title: str = "我的视觉小说", window_size=(800, 600), project_path: str | None = None):
         self.project_path = Path(project_path).resolve() if project_path else None
+
+        # 工程目录：用于资源解析/脚本沙盒/默认存档目录等。
+        # 必须在 _load_dialogues() 之前初始化，因为读取工程配置时会用到。
+        try:
+            self._project_dir = self.project_path.parent if self.project_path else Path.cwd().resolve()
+        except Exception:
+            self._project_dir = Path.cwd()
+        self._function_fs_root: Path = self._project_dir
+        self._allow_unsafe_function_scripts: bool = False
+
         cfg = self._probe_game_config(self.project_path) if self.project_path else {}
         init_w = int(cfg.get("window_width", window_size[0])) if isinstance(cfg, dict) else window_size[0]
         init_h = int(cfg.get("window_height", window_size[1])) if isinstance(cfg, dict) else window_size[1]
@@ -35,15 +56,44 @@ class VNGameRuntime:
 
         pygame.init()
         pygame.display.set_caption(resolved_title or game_title)
+        self._set_default_window_icon()
         self.base_window_size = init_size
         self.window_size = init_size
         self.render_size = self.project_resolution
         self.render_surface = pygame.Surface(self.render_size)
         self.is_fullscreen = False
         self.screen = pygame.display.set_mode(self.window_size)
+
+        # Loading progress UI (blocking): staged 0-100% updates.
+        self._loading_active: bool = False
+        self._loading_stack: list[tuple[float, float]] = []  # (base, span)
+        self._loading_message: str = ""
+        self._loading_subtitle: str | None = None
+
+        # Loading overlay style/config (designer driven)
+        self._loading_overlay_cfg: dict = {}
+        try:
+            self._loading_overlay_cfg = self._normalize_loading_overlay_cfg((cfg or {}).get("loading_overlay"))
+        except Exception:
+            self._loading_overlay_cfg = self._normalize_loading_overlay_cfg({})
+
+        # Persistent variables for protected globals
+        self._persistent_vars_path = (self._project_dir / "persistent_vars.yaml")
+        self._persistent_vars: dict[str, float] = {}
+        self._persistent_vars_dirty: bool = False
+        self._protected_vars: set[str] = set()
+        self._load_persistent_vars()
+
+        # Staged boot progress so large projects don't look frozen.
+        if self._loading_overlay_enabled_for("load_game"):
+            self._loading_begin("加载工程中...", subtitle=(self.project_path.name if self.project_path else None))
+            self._loading_progress(0.10, "初始化运行环境...", subtitle=(self.project_path.name if self.project_path else None))
         self.mode = "menu"  # menu or game
         self.clock = pygame.time.Clock()
         self.running = False
+
+        # 存档缩略图缓存：key=(path, w, h, mtime)
+        self._slot_thumbnail_cache: dict[tuple[str, int, int, float], pygame.Surface] = {}
 
         # 存档/菜单配置（来自 game_config，可被项目覆盖）
         try:
@@ -61,9 +111,25 @@ class VNGameRuntime:
         self._exit_confirm_overlay = False
         self._exit_confirm_choice = 1  # 1=确认, 0=取消
 
-        self.font = self._load_font(22)
-        self.name_font = self._load_font(24, bold=True)
-        self.text_color = (235, 235, 240)
+        # 一键隐藏UI（用于截图）：隐藏对话框/姓名框/功能菜单按钮组
+        self._screenshot_hide_ui: bool = False
+
+        # 主菜单多套样式：缓存 game_config + 当前选中的主菜单索引
+        self._game_cfg_cache: dict | None = cfg if isinstance(cfg, dict) else None
+        self._active_menu_index: int = 0
+
+        # 从主菜单“开始游戏”是否重置全局变量（可在主菜单设计器配置）
+        self._reset_globals_on_start: bool = bool((cfg or {}).get("reset_globals_on_start", True))
+
+        # global text styles (dialogue/name)
+        self._dialogue_style: dict = {}
+        self._name_style: dict = {}
+        # per-entry optional text style overrides cache
+        self._entry_text_style_cache: dict[str, tuple[dict, dict, object, object]] = {}
+        self._apply_text_style_config(cfg if isinstance(cfg, dict) else {})
+
+        self._loading_progress(0.20, "加载字体与界面配置...", subtitle=(self.project_path.name if self.project_path else None))
+
         self.box_color = (0, 0, 0, 190)
         self.bg_color = (28, 32, 40)
         self.text_margin = 24
@@ -98,6 +164,27 @@ class VNGameRuntime:
         self._choice_overlay = False
         self._choice_options: list[str] = []
         self._choice_targets: list[int | str] = []
+        self._choice_timeout_remaining: float | None = None
+        self._choice_default_index: int = -1
+
+        # choice button group (optional, from UI layout json; mouse-enabled)
+        self._choice_buttons_enabled: bool = False
+        self._choice_button_pos: tuple[int, int] = (120, 140)
+        self._choice_button_spacing: int = 12
+        self._choice_button_scale: float = 1.0
+        self._choice_button_hover_zoom: float = 1.08
+        self._choice_button_orientation: str = "vertical"  # 'vertical' | 'horizontal'
+        self._choice_button_font_size: int = 20
+        self._choice_button_text_color: tuple[int, int, int] = (230, 230, 230)
+        self._choice_button_text_hover_color: tuple[int, int, int] = (255, 255, 255)
+        self._choice_overlay_alpha: int = 180
+        self._choice_button_bg_image: str = ""
+        self._choice_button_bg_alpha: int = 255
+        self._choice_button_padding: tuple[int, int] = (18, 10)
+        self._choice_button_min_size: tuple[int, int] = (0, 0)
+        self._choice_selected: int = -1
+        self._choice_button_hitboxes: list[pygame.Rect | None] = []
+        self._choice_button_bg_surface_cache: dict[str, pygame.Surface] = {}
         self._menu_bg: pygame.Surface | None = None
         self._menu_bg_path: str = ""
         self._menu_video_path: str = ""
@@ -140,6 +227,32 @@ class VNGameRuntime:
         # mouse cursor state (hand over clickable items)
         self._mouse_cursor_is_hand: bool = False
 
+        # function script runtime UI/FX + timers
+        self._script_time_now: float = 0.0
+        self._script_timer_lock = threading.Lock()
+        self._script_timer_next_id: int = 1
+        self._script_timers: dict[int, dict] = {}
+
+        self._script_toasts: list[dict] = []
+        self._script_modal_message: dict | None = None
+
+        self._script_flash: dict | None = None
+        self._script_shake: dict | None = None
+        self._script_shake_offset: tuple[float, float] = (0.0, 0.0)
+
+        # script-driven top-most image overlays
+        self._script_images: dict[str, dict] = {}
+        self._script_image_cache: dict[tuple[str, int, int, int], pygame.Surface] = {}
+        self._script_image_next_id: int = 1
+
+        # script-driven input lock (game mode): time-based and/or until-expression
+        self._script_input_lock_remaining: float | None = None
+        self._script_input_lock_until_expr: str | None = None
+        self._script_input_lock_until_timeout: float | None = None
+
+        # when set, auto cursor changes are overridden
+        self._script_cursor_lock_style: str | None = None
+
         # function menu overlays (save/load/settings/history/help)
         self._function_menus_enabled: bool = False
         self._function_menus_cfg: dict = {}
@@ -171,7 +284,12 @@ class VNGameRuntime:
         # now apply window/layout (HUD + function menus need to exist first)
         self._apply_window_size(self.window_size)
 
+        # Project parsing / graph building can be slow on large projects.
+        self._loading_push(0.22, 0.90)
         self.dialogues = self._load_dialogues()
+        self._loading_pop()
+        self._loading_progress(0.98, "准备启动...", subtitle=(self.project_path.name if self.project_path else None))
+        self._loading_end()
         self.current_index = 0
         self.current_visible_len = 0
         self.typing_speed = 24.0  # chars per second
@@ -214,12 +332,21 @@ class VNGameRuntime:
         self._auto_next_remaining: float | None = None
         self._voice_cache: dict[Path, pygame.mixer.Sound] = {}
         self._voice_channel = None
+        self._sfx_cache: dict[Path, pygame.mixer.Sound] = {}
+        self._sfx_channel = None
         self._bgm_current = None
         self._bgm_current_loop = True
         self._voice_played_index = None
+        self._sfx_played_index = None
+        self._function_played_key = None
+        self._function_nodes_by_host: dict[int | str, list[dict]] = {}
+        self._script_queue_lock = threading.Lock()
+        self._script_main_queue: list[callable] = []
         self._voice_cache: dict[Path, pygame.mixer.Sound] = {}
         self._pending_voice_path: Path | None = None
         self._pending_voice_delay = 0.0
+        self._pending_sfx_path: Path | None = None
+        self._pending_sfx_delay = 0.0
         self._last_dt = 0.0
         self._save_overlay = False
         self._load_overlay = False
@@ -249,6 +376,517 @@ class VNGameRuntime:
         self._splash_time: float = 2.5
         self._splash_elapsed: float = 0.0
 
+    def _set_default_window_icon(self) -> None:
+        """Set a small window icon to avoid blank/default icon during loading."""
+
+        try:
+            icon = pygame.Surface((32, 32), pygame.SRCALPHA)
+            icon.fill((22, 24, 34, 255))
+            try:
+                font = pygame.font.SysFont(None, 18, bold=True)
+                text = font.render("VN", True, (235, 235, 245))
+                icon.blit(text, ((32 - text.get_width()) // 2, (32 - text.get_height()) // 2))
+            except Exception:
+                pass
+            pygame.display.set_icon(icon)
+        except Exception:
+            pass
+
+    def _normalize_loading_overlay_cfg(self, raw: object) -> dict:
+        cfg = raw if isinstance(raw, dict) else {}
+        out: dict = {
+            "enabled": bool(cfg.get("enabled", True)),
+            # per-operation toggles
+            "use_on_load_game": bool(cfg.get("use_on_load_game", True)),
+            "use_on_enter_menu": bool(cfg.get("use_on_enter_menu", True)),
+            "use_on_start_game": bool(cfg.get("use_on_start_game", True)),
+            "use_on_load_save": bool(cfg.get("use_on_load_save", True)),
+
+            # per-component visibility
+            "show_logo": bool(cfg.get("show_logo", True)),
+            "show_title": bool(cfg.get("show_title", True)),
+            "show_message": bool(cfg.get("show_message", True)),
+            "show_subtitle": bool(cfg.get("show_subtitle", True)),
+            "show_bar": bool(cfg.get("show_bar", True)),
+
+            # visuals
+            "background_color": cfg.get("background_color", [16, 18, 26]),
+            "background_alpha": int(cfg.get("background_alpha", 255) or 255),
+            "background_image": str(cfg.get("background_image", "") or ""),
+
+            "logo_image": str(cfg.get("logo_image", "") or ""),
+            "logo_rect": cfg.get("logo_rect"),  # [x,y,w,h]
+
+            "title_text": str(cfg.get("title_text", "VNEngine") or "VNEngine"),
+            "title_rect": cfg.get("title_rect"),
+            "title_style": cfg.get("title_style", {}),
+
+            "message_template": str(cfg.get("message_template", "{message}") or "{message}"),
+            "message_rect": cfg.get("message_rect"),
+            "message_style": cfg.get("message_style", {}),
+
+            "subtitle_template": str(cfg.get("subtitle_template", "{subtitle}") or "{subtitle}"),
+            "subtitle_rect": cfg.get("subtitle_rect"),
+            "subtitle_style": cfg.get("subtitle_style", {}),
+
+            "bar_rect": cfg.get("bar_rect"),
+            "bar_bg_color": cfg.get("bar_bg_color", [60, 60, 70]),
+            "bar_fg_color": cfg.get("bar_fg_color", [110, 160, 255]),
+            "bar_radius": int(cfg.get("bar_radius", 6) or 6),
+
+            "show_percent": bool(cfg.get("show_percent", True)),
+            "percent_template": str(cfg.get("percent_template", "{percent}%") or "{percent}%"),
+            "percent_rect": cfg.get("percent_rect"),
+            "percent_style": cfg.get("percent_style", {}),
+        }
+        # clamp alpha/radius lightly
+        try:
+            out["background_alpha"] = max(0, min(255, int(out.get("background_alpha", 255))))
+        except Exception:
+            out["background_alpha"] = 255
+        try:
+            out["bar_radius"] = max(0, min(30, int(out.get("bar_radius", 6))))
+        except Exception:
+            out["bar_radius"] = 6
+        return out
+
+    def _loading_overlay_enabled_for(self, context: str) -> bool:
+        cfg = getattr(self, "_loading_overlay_cfg", None)
+        if not isinstance(cfg, dict):
+            return True
+        if not bool(cfg.get("enabled", True)):
+            return False
+        key = None
+        c = str(context or "").strip().lower()
+        if c in {"load_game", "boot", "startup"}:
+            key = "use_on_load_game"
+        elif c in {"enter_menu", "return_to_title", "to_title", "back_to_title"}:
+            key = "use_on_enter_menu"
+        elif c in {"start_game", "new_game"}:
+            key = "use_on_start_game"
+        elif c in {"load_save", "load", "load_slot"}:
+            key = "use_on_load_save"
+        if key is None:
+            return True
+        return bool(cfg.get(key, True))
+
+    def _render_blocking_loading_screen(self, message: str, subtitle: str | None = None) -> None:
+        """Render a single loading frame and pump events.
+
+        For staged progress, use _loading_begin/_loading_progress/_loading_end.
+        """
+
+        self._render_blocking_loading_screen_with_progress(message, subtitle=subtitle, progress=None)
+
+    def _render_blocking_loading_screen_with_progress(self, message: str, subtitle: str | None = None, progress: float | None = None) -> None:
+        try:
+            screen = getattr(self, "screen", None)
+            if screen is None:
+                return
+            w, h = screen.get_size()
+            cfg = getattr(self, "_loading_overlay_cfg", None)
+            cfg = cfg if isinstance(cfg, dict) else {}
+
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+
+            def _color(val, default: tuple[int, int, int]) -> tuple[int, int, int]:
+                try:
+                    return self._overlay_color(val, default)
+                except Exception:
+                    return default
+
+            def _rect(val, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+                if isinstance(val, (list, tuple)) and len(val) == 4:
+                    try:
+                        return (int(val[0]), int(val[1]), int(val[2]), int(val[3]))
+                    except Exception:
+                        return default
+                return default
+
+            def _load_img(rel_path: str, size: tuple[int, int]) -> pygame.Surface | None:
+                s = (rel_path or "").strip()
+                if not s:
+                    return None
+                try:
+                    p = self._resolve_path(s)
+                    if not p.exists():
+                        return None
+                except Exception:
+                    return None
+
+                tw, th = max(1, int(size[0])), max(1, int(size[1]))
+                cache = getattr(self, "_loading_overlay_img_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._loading_overlay_img_cache = cache
+                key = (str(p), tw, th)
+                if key in cache:
+                    return cache[key]
+                try:
+                    img = pygame.image.load(str(p)).convert_alpha()
+                    if img.get_width() != tw or img.get_height() != th:
+                        try:
+                            img = pygame.transform.smoothscale(img, (tw, th))
+                        except Exception:
+                            img = pygame.transform.scale(img, (tw, th))
+                    cache[key] = img
+                    return img
+                except Exception:
+                    return None
+
+            def _font_from_style(style: object, default_size: int, *, bold_default: bool) -> object:
+                st = style if isinstance(style, dict) else {}
+                try:
+                    size = int(st.get("size", default_size) or default_size)
+                except Exception:
+                    size = int(default_size)
+                size = max(8, min(96, int(size)))
+                try:
+                    bold = bool(st.get("bold", bold_default))
+                except Exception:
+                    bold = bool(bold_default)
+                family = str(st.get("family", "Microsoft YaHei") or "Microsoft YaHei")
+                try:
+                    return self._load_font(size, bold=bold, family=family)
+                except Exception:
+                    return pygame.font.Font(None, size)
+
+            def _draw_text(text: str, *, rect: tuple[int, int, int, int], style: object, default_color: tuple[int, int, int]) -> None:
+                st = style if isinstance(style, dict) else {}
+                if st.get("visible", True) is False:
+                    return
+                font = _font_from_style(st, int(st.get("size", 24) or 24), bold_default=bool(st.get("bold", False)))
+                color = _color(st.get("color"), default_color)
+                align = str(st.get("align", "center") or "center").lower()
+
+                x, y, rw, rh = rect
+                max_w = max(1, int(rw))
+                try:
+                    lines = self._wrap_text_lines(str(text or ""), font, max_w)
+                except Exception:
+                    lines = [str(text or "")] if str(text or "") else []
+                if not lines:
+                    return
+
+                line_h = int(getattr(font, "get_linesize", lambda: 0)() or 0)
+                if line_h <= 0:
+                    line_h = 18
+                total_h = len(lines) * line_h
+                cy = y + (rh - total_h) // 2
+                for i, line in enumerate(lines):
+                    surf_line = font.render(line, True, color)
+                    if align == "left":
+                        tx = x
+                    elif align == "right":
+                        tx = x + rw - surf_line.get_width()
+                    else:
+                        tx = x + (rw - surf_line.get_width()) // 2
+                    surf.blit(surf_line, (int(tx), int(cy + i * line_h)))
+
+            # background
+            bg_color = _color(cfg.get("background_color"), (16, 18, 26))
+            try:
+                bg_alpha = int(cfg.get("background_alpha", 255) or 255)
+            except Exception:
+                bg_alpha = 255
+            bg_alpha = max(0, min(255, int(bg_alpha)))
+
+            bg_img = _load_img(str(cfg.get("background_image") or ""), (w, h))
+            if bg_img is not None:
+                if bg_alpha < 255:
+                    try:
+                        img2 = bg_img.copy()
+                        img2.set_alpha(bg_alpha)
+                        surf.blit(img2, (0, 0))
+                    except Exception:
+                        surf.blit(bg_img, (0, 0))
+                else:
+                    surf.blit(bg_img, (0, 0))
+            else:
+                surf.fill((bg_color[0], bg_color[1], bg_color[2], bg_alpha))
+
+            # progress
+            try:
+                p = 0.55 if progress is None else float(progress)
+            except Exception:
+                p = 0.55
+            p = max(0.0, min(1.0, p))
+            percent = int(round(p * 100.0))
+
+            # logo
+            logo_rect = _rect(cfg.get("logo_rect"), (w // 2 - 60, h // 2 - 180, 120, 120))
+            if bool(cfg.get("show_logo", True)):
+                logo_img = _load_img(str(cfg.get("logo_image") or ""), (logo_rect[2], logo_rect[3]))
+                if logo_img is not None:
+                    surf.blit(logo_img, (logo_rect[0], logo_rect[1]))
+
+            # title/message/subtitle
+            title_text = str(cfg.get("title_text", "VNEngine") or "VNEngine")
+            title_rect = _rect(cfg.get("title_rect"), (0, h // 2 - 90, w, 60))
+            if bool(cfg.get("show_title", True)):
+                _draw_text(title_text, rect=title_rect, style=cfg.get("title_style"), default_color=(220, 230, 255))
+
+            class _SafeDict(dict):
+                def __missing__(self, key):
+                    return ""
+
+            fmt = _SafeDict(
+                message=str(message or ""),
+                subtitle=str(subtitle or ""),
+                percent=str(percent),
+                pct=str(percent),
+            )
+
+            msg_tpl = str(cfg.get("message_template", "{message}") or "{message}")
+            try:
+                msg_text = msg_tpl.format_map(fmt)
+            except Exception:
+                msg_text = str(message or "")
+            msg_rect = _rect(cfg.get("message_rect"), (0, h // 2 - 30, w, 40))
+            if bool(cfg.get("show_message", True)):
+                _draw_text(msg_text, rect=msg_rect, style=cfg.get("message_style"), default_color=(210, 210, 210))
+
+            sub_text = ""
+            if subtitle:
+                sub_tpl = str(cfg.get("subtitle_template", "{subtitle}") or "{subtitle}")
+                try:
+                    sub_text = sub_tpl.format_map(fmt)
+                except Exception:
+                    sub_text = str(subtitle)
+            sub_rect = _rect(cfg.get("subtitle_rect"), (0, h // 2 + 4, w, 40))
+            if bool(cfg.get("show_subtitle", True)):
+                _draw_text(sub_text, rect=sub_rect, style=cfg.get("subtitle_style"), default_color=(170, 170, 170))
+
+            # bar
+            bar_w = min(420, w - 120)
+            bar_rect = _rect(cfg.get("bar_rect"), (w // 2 - bar_w // 2, h // 2 + 44, bar_w, 10))
+            bar_bg = _color(cfg.get("bar_bg_color"), (60, 60, 70))
+            bar_fg = _color(cfg.get("bar_fg_color"), (110, 160, 255))
+            try:
+                radius = int(cfg.get("bar_radius", 6) or 6)
+            except Exception:
+                radius = 6
+            radius = max(0, min(30, int(radius)))
+            if bool(cfg.get("show_bar", True)):
+                pygame.draw.rect(surf, bar_bg, pygame.Rect(*bar_rect), border_radius=radius)
+                fill_w = int(max(0, min(bar_rect[2], int(round(bar_rect[2] * p)))))
+                if fill_w > 0:
+                    pygame.draw.rect(surf, bar_fg, pygame.Rect(bar_rect[0], bar_rect[1], fill_w, bar_rect[3]), border_radius=radius)
+
+            # percent
+            if bool(cfg.get("show_percent", True)):
+                pct_tpl = str(cfg.get("percent_template", "{percent}%") or "{percent}%")
+                try:
+                    pct_text = pct_tpl.format_map(fmt)
+                except Exception:
+                    pct_text = f"{percent}%"
+                pct_rect = _rect(cfg.get("percent_rect"), (0, bar_rect[1] + bar_rect[3] + 8, w, 28))
+                _draw_text(pct_text, rect=pct_rect, style=cfg.get("percent_style"), default_color=(170, 180, 200))
+
+            # Clear display first to avoid alpha blending trails/ghosting when using SRCALPHA.
+            try:
+                screen.fill(bg_color)
+            except Exception:
+                pass
+            screen.blit(surf, (0, 0))
+            pygame.display.flip()
+            pygame.event.pump()
+        except Exception:
+            pass
+
+    def _project_changed_since_last_dialogue_load(self) -> bool:
+        p = getattr(self, "project_path", None)
+        if not p or not isinstance(p, Path) or not p.exists():
+            return True
+        try:
+            cur = int(p.stat().st_mtime_ns)
+        except Exception:
+            return True
+        last = getattr(self, "_project_loaded_mtime_ns", None)
+        if last is None:
+            return True
+        try:
+            return int(last) != cur
+        except Exception:
+            return True
+
+    def _select_graph_start_node_id(self):
+        if not getattr(self, "nodes_map", None):
+            self.current_node_id = None
+            return
+        try:
+            indegree = {nid: 0 for nid in self.nodes_map}
+            for s, targets in (self.adjacency or {}).items():
+                if s not in self.nodes_map:
+                    continue
+                for t in (targets or []):
+                    if t in indegree:
+                        indegree[t] = indegree.get(t, 0) + 1
+            start_candidates = [nid for nid, deg in indegree.items() if deg == 0]
+            if start_candidates:
+                chosen = sorted(start_candidates, key=lambda x: str(x))[0]
+            else:
+                chosen = sorted(self.nodes_map.keys(), key=lambda x: str(x))[0]
+        except Exception:
+            try:
+                chosen = sorted(self.nodes_map.keys(), key=lambda x: str(x))[0]
+            except Exception:
+                chosen = None
+
+        # preview override
+        requested = getattr(self, "_preview_start_node_id", None)
+        if requested is not None and getattr(self, "nodes_map", None):
+            if requested in self.nodes_map:
+                chosen = requested
+            else:
+                try:
+                    req_int = int(requested)
+                    if req_int in self.nodes_map:
+                        chosen = req_int
+                except Exception:
+                    pass
+                if chosen is None:
+                    req_str = str(requested)
+                    if req_str in self.nodes_map:
+                        chosen = req_str
+        self.current_node_id = chosen
+
+    def _loading_begin(self, message: str, subtitle: str | None = None) -> None:
+        self._loading_active = True
+        self._loading_stack = [(0.0, 1.0)]
+        self._loading_message = str(message or "")
+        self._loading_subtitle = subtitle
+        self._render_blocking_loading_screen_with_progress(self._loading_message, subtitle=self._loading_subtitle, progress=0.0)
+
+    def _loading_push(self, start: float, end: float) -> None:
+        if not getattr(self, "_loading_active", False) or not getattr(self, "_loading_stack", None):
+            return
+        base, span = self._loading_stack[-1]
+        try:
+            s = float(start)
+            e = float(end)
+        except Exception:
+            s, e = 0.0, 1.0
+        s = max(0.0, min(1.0, s))
+        e = max(0.0, min(1.0, e))
+        if e < s:
+            s, e = e, s
+        self._loading_stack.append((base + span * s, span * (e - s)))
+
+    def _loading_pop(self) -> None:
+        if not getattr(self, "_loading_active", False):
+            return
+        if isinstance(self._loading_stack, list) and len(self._loading_stack) > 1:
+            self._loading_stack.pop()
+
+    def _loading_progress(self, progress: float, message: str | None = None, subtitle: str | None = None) -> None:
+        if not getattr(self, "_loading_active", False) or not getattr(self, "_loading_stack", None):
+            return
+        base, span = self._loading_stack[-1]
+        try:
+            p = float(progress)
+        except Exception:
+            p = 0.0
+        p = max(0.0, min(1.0, p))
+        overall = base + span * p
+        if message is not None:
+            self._loading_message = str(message or "")
+        if subtitle is not None:
+            self._loading_subtitle = subtitle
+        self._render_blocking_loading_screen_with_progress(self._loading_message, subtitle=self._loading_subtitle, progress=overall)
+
+    def _loading_end(self) -> None:
+        if not getattr(self, "_loading_active", False):
+            return
+        try:
+            self._render_blocking_loading_screen_with_progress(self._loading_message or "", subtitle=self._loading_subtitle, progress=1.0)
+        except Exception:
+            pass
+        self._loading_active = False
+        self._loading_stack = []
+        self._loading_message = ""
+        self._loading_subtitle = None
+
+    def _protected_var_names_from_defs(self) -> set[str]:
+        out: set[str] = set()
+        for item in (self._global_var_defs or []):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not name:
+                continue
+            if bool(item.get("protected", False)):
+                out.add(str(name))
+        return out
+
+    def _refresh_protected_vars(self) -> None:
+        try:
+            self._protected_vars = self._protected_var_names_from_defs()
+        except Exception:
+            self._protected_vars = set()
+
+    def _load_persistent_vars(self) -> None:
+        try:
+            p = getattr(self, "_persistent_vars_path", None)
+            if not p or not isinstance(p, Path) or not p.exists():
+                self._persistent_vars = {}
+                self._persistent_vars_dirty = False
+                return
+            with open(p, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if isinstance(data, dict) and isinstance(data.get("variables"), dict):
+                raw = data.get("variables") or {}
+            elif isinstance(data, dict):
+                raw = data
+            else:
+                raw = {}
+            out: dict[str, float] = {}
+            for k, v in (raw or {}).items():
+                if not k:
+                    continue
+                try:
+                    out[str(k)] = float(v)
+                except Exception:
+                    continue
+            self._persistent_vars = out
+            self._persistent_vars_dirty = False
+        except Exception:
+            self._persistent_vars = {}
+            self._persistent_vars_dirty = False
+
+    def _save_persistent_vars(self) -> None:
+        if not getattr(self, "_persistent_vars_dirty", False):
+            return
+        try:
+            p: Path = getattr(self, "_persistent_vars_path")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {"version": 1, "variables": dict(self._persistent_vars or {})}
+            with open(p, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True)
+            self._persistent_vars_dirty = False
+        except Exception:
+            pass
+
+    def _update_persistent_from_runtime(self) -> None:
+        protected = getattr(self, "_protected_vars", set()) or set()
+        if not protected:
+            return
+        if not isinstance(self.variables, dict):
+            return
+        changed = False
+        for name in protected:
+            if name not in self.variables:
+                continue
+            try:
+                v = float(self.variables.get(name))
+            except Exception:
+                continue
+            if self._persistent_vars.get(name) != v:
+                self._persistent_vars[name] = v
+                changed = True
+        if changed:
+            self._persistent_vars_dirty = True
+
     def _probe_game_config(self, path: Path | None) -> dict:
         if not path or not path.exists():
             return {}
@@ -264,13 +902,40 @@ class VNGameRuntime:
         """Load dialogues from project flow_nodes (YAML), else fallback samples."""
         if self.project_path and self.project_path.exists():
             try:
+                try:
+                    self._project_loaded_mtime_ns = int(self.project_path.stat().st_mtime_ns)
+                except Exception:
+                    self._project_loaded_mtime_ns = None
+                self._loading_progress(0.05, "读取工程文件...")
                 with open(self.project_path, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f)
                 self.project_data = data if isinstance(data, dict) else None
                 if isinstance(data, dict):
+                    self._loading_progress(0.25, "解析工程配置...")
                     game_cfg = (data.get("game_config", {}) or {})
+                    self._game_cfg_cache = game_cfg if isinstance(game_cfg, dict) else None
+                    try:
+                        self._loading_overlay_cfg = self._normalize_loading_overlay_cfg((game_cfg or {}).get("loading_overlay"))
+                    except Exception:
+                        self._loading_overlay_cfg = self._normalize_loading_overlay_cfg({})
                     self._global_var_defs = data.get("global_variables", []) or []
+                    self._refresh_protected_vars()
                     self.branch_strategy = game_cfg.get("branch_strategy") or "first"
+                    self._allow_unsafe_function_scripts = bool(game_cfg.get("allow_unsafe_function_scripts", False))
+
+                    # 功能节点脚本：安全模式文件系统根目录（可选覆盖）
+                    try:
+                        fs_root = game_cfg.get("function_script_fs_root")
+                        if isinstance(fs_root, str) and fs_root.strip():
+                            p = Path(fs_root)
+                            if not p.is_absolute():
+                                p = (self._project_dir / p).resolve()
+                            self._function_fs_root = p
+                        else:
+                            self._function_fs_root = self._project_dir
+                    except Exception:
+                        self._function_fs_root = self._project_dir
+                    self._apply_text_style_config(game_cfg if isinstance(game_cfg, dict) else {})
                     # 覆盖运行时存档/帮助配置
                     try:
                         self._save_slots = int(game_cfg.get("save_slots", self._save_slots))
@@ -282,12 +947,16 @@ class VNGameRuntime:
                     self._help_right_click = bool(game_cfg.get("help_right_click", self._help_right_click))
                     self._apply_menu_config(game_cfg)
                     self._apply_function_menus_from_game_config(game_cfg)
+                    self._loading_progress(0.55, "构建流程图...")
                     self._load_graph_from_flow(data)
                     if self.graph_mode and self.current_node_id is not None:
                         return []
+                    self._loading_progress(0.75, "生成对白数据...")
                     dialogues = self._build_dialogues_from_flow(data)
                     if dialogues:
+                        self._loading_progress(0.90, "预加载首批资源...")
                         self._preload_initial_assets(dialogues)
+                        self._loading_progress(0.98, "完成")
                         return dialogues
             except Exception as exc:
                 print(f"加载工程对白失败，使用示例对白: {exc}")
@@ -459,6 +1128,72 @@ class VNGameRuntime:
         print("剧情已重新加载")
 
     def _apply_menu_config(self, cfg: dict):
+        cfg = cfg or {}
+
+        def _menu_var_context() -> dict:
+            # Prefer current runtime variables when returning to menu.
+            if isinstance(self.variables, dict) and self.variables:
+                return dict(self.variables)
+            # Otherwise, use initial values from global variable definitions.
+            out: dict[str, float] = {}
+            for item in (self._global_var_defs or []):
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not name:
+                    continue
+                try:
+                    out[str(name)] = float(item.get("initial", 0.0))
+                except Exception:
+                    out[str(name)] = 0.0
+            return out
+
+        def _select_main_menu_cfg(game_cfg: dict) -> tuple[int, dict]:
+            raw = game_cfg.get("main_menus")
+            if not isinstance(raw, list) or not raw:
+                return 0, {}
+            menus: list[dict] = []
+            for it in raw[:3]:
+                menus.append(it if isinstance(it, dict) else {})
+            while len(menus) < 3:
+                menus.append({})
+
+            ctx = _menu_var_context()
+            default_idx: int | None = None
+            for idx, m in enumerate(menus):
+                cond = str(m.get("trigger_condition") or "").strip()
+                if not cond:
+                    if default_idx is None:
+                        default_idx = idx
+                    continue
+                if eval_var_expr(cond, ctx):
+                    return idx, m
+
+            if default_idx is not None:
+                return int(default_idx), menus[int(default_idx)]
+            return 0, menus[0]
+
+        # multi-menu: choose by trigger condition (1->2->3 priority)
+        chosen_idx, chosen = _select_main_menu_cfg(cfg)
+        self._active_menu_index = int(chosen_idx)
+        if isinstance(chosen, dict) and chosen:
+            merged = dict(cfg)
+            merged.update({k: v for k, v in chosen.items() if k not in {"trigger_condition"}})
+            cfg = merged
+
+        # menu-start behavior
+        self._reset_globals_on_start = bool(cfg.get("reset_globals_on_start", True))
+
+        # allow menu config to override save/help settings
+        try:
+            self._save_slots = int(cfg.get("save_slots", self._save_slots))
+        except Exception:
+            pass
+        self._save_slots = max(1, min(200, int(self._save_slots)))
+        self._enable_autosave_on_menu = bool(cfg.get("enable_autosave_on_menu", self._enable_autosave_on_menu))
+        self._help_hotkey_name = str(cfg.get("help_hotkey", self._help_hotkey_name) or self._help_hotkey_name)
+        self._help_right_click = bool(cfg.get("help_right_click", self._help_right_click))
+
         def _normalize_buttons(raw) -> list[dict]:
             defaults = [
                 {"label": "开始游戏", "action": "start"},
@@ -565,6 +1300,15 @@ class VNGameRuntime:
         self._menu_items = _normalize_buttons(cfg.get("menu_buttons"))
         self._menu_selected = 0
 
+    def _ui_hidden_for_current_node(self) -> bool:
+        if self._screenshot_hide_ui:
+            return True
+        try:
+            entry = self._current_entry() or {}
+        except Exception:
+            entry = {}
+        return bool(entry.get("hide_textbox", False))
+
     def _apply_hud_buttons_from_ui_layout(self, layout: dict | None):
         """Read in-game HUD button group config from UI layout JSON."""
 
@@ -670,6 +1414,85 @@ class VNGameRuntime:
             except Exception:
                 continue
 
+    def _apply_choice_buttons_from_ui_layout(self, layout: dict | None) -> None:
+        """Read choice button group config from UI layout JSON.
+
+        This is only used when a *choice node* is active and opens the choice overlay.
+        """
+
+        layout = layout or {}
+        self._choice_buttons_enabled = bool(layout.get("choice_buttons_enabled", False))
+        self._choice_button_pos = self._pair_from_cfg(layout.get("choice_button_pos"), (120, 140))
+
+        try:
+            self._choice_button_spacing = int(layout.get("choice_button_spacing", 12) or 12)
+        except Exception:
+            self._choice_button_spacing = 12
+        self._choice_button_spacing = max(0, min(300, int(self._choice_button_spacing)))
+
+        try:
+            self._choice_button_scale = float(layout.get("choice_button_scale", 1.0) or 1.0)
+        except Exception:
+            self._choice_button_scale = 1.0
+        self._choice_button_scale = max(0.5, min(5.0, float(self._choice_button_scale)))
+
+        try:
+            self._choice_button_hover_zoom = float(layout.get("choice_button_hover_zoom", 1.08) or 1.08)
+        except Exception:
+            self._choice_button_hover_zoom = 1.08
+        self._choice_button_hover_zoom = max(1.0, min(1.8, float(self._choice_button_hover_zoom)))
+
+        orient = str(layout.get("choice_button_orientation") or "vertical").strip().lower()
+        self._choice_button_orientation = "horizontal" if orient in {"h", "horizontal", "row", "x"} else "vertical"
+
+        try:
+            self._choice_button_font_size = int(layout.get("choice_button_font_size", 20) or 20)
+        except Exception:
+            self._choice_button_font_size = 20
+        self._choice_button_font_size = max(8, min(72, int(self._choice_button_font_size)))
+
+        self._choice_button_text_color = self._color_from_cfg(layout.get("choice_button_text_color"), (230, 230, 230))
+        self._choice_button_text_hover_color = self._color_from_cfg(
+            layout.get("choice_button_text_hover_color"),
+            self._choice_button_text_color,
+        )
+
+        try:
+            self._choice_overlay_alpha = int(layout.get("choice_overlay_alpha", 180))
+        except Exception:
+            self._choice_overlay_alpha = 180
+        self._choice_overlay_alpha = max(0, min(255, int(self._choice_overlay_alpha)))
+
+        self._choice_button_bg_image = str(layout.get("choice_button_bg_image") or "").strip()
+        try:
+            self._choice_button_bg_alpha = int(layout.get("choice_button_bg_alpha", 255))
+        except Exception:
+            self._choice_button_bg_alpha = 255
+        self._choice_button_bg_alpha = max(0, min(255, int(self._choice_button_bg_alpha)))
+
+        pad = layout.get("choice_button_padding")
+        if isinstance(pad, (list, tuple)) and len(pad) >= 2:
+            try:
+                self._choice_button_padding = (max(0, int(pad[0])), max(0, int(pad[1])))
+            except Exception:
+                self._choice_button_padding = (18, 10)
+        else:
+            self._choice_button_padding = (18, 10)
+
+        ms = layout.get("choice_button_min_size")
+        if isinstance(ms, (list, tuple)) and len(ms) >= 2:
+            try:
+                self._choice_button_min_size = (max(0, int(ms[0])), max(0, int(ms[1])))
+            except Exception:
+                self._choice_button_min_size = (0, 0)
+        else:
+            self._choice_button_min_size = (0, 0)
+
+        # reset hover selection + cached hitboxes when layout changes
+        if not self._choice_overlay:
+            self._choice_selected = -1
+        self._choice_button_hitboxes = [None] * len(self._choice_options)
+
     def _apply_function_menus_from_game_config(self, cfg: dict | None) -> None:
         cfg = cfg or {}
         fm = cfg.get("function_menus") if isinstance(cfg, dict) else None
@@ -740,6 +1563,7 @@ class VNGameRuntime:
             merged.setdefault("page_prev_pos", [40, self.render_size[1] - 60])
             merged.setdefault("page_next_pos", [140, self.render_size[1] - 60])
             merged.setdefault("page_text_pos", [240, self.render_size[1] - 60])
+            merged.setdefault("page_size", DEFAULT_PAGE_SIZE)
 
         if name == "settings":
             merged.setdefault("slider_pos", [80, 140])
@@ -753,6 +1577,24 @@ class VNGameRuntime:
             merged.setdefault("text_area", [40, 100, self.render_size[0] - 80, self.render_size[1] - 160])
 
         return merged
+
+    def _active_slot_page_size(self, overlay_type: str | None = None) -> int:
+        """Slots-per-page for save/load overlays.
+
+        Value comes from function menu config when enabled; clamped to 1..10.
+        """
+
+        ot = overlay_type or self._overlay_type()
+        if ot not in {"save", "load"}:
+            return int(DEFAULT_PAGE_SIZE)
+        if not getattr(self, "_function_menus_enabled", False):
+            return int(DEFAULT_PAGE_SIZE)
+        try:
+            cfg = self._get_function_menu_cfg(str(ot))
+            size = int(cfg.get("page_size", DEFAULT_PAGE_SIZE))
+        except Exception:
+            size = int(DEFAULT_PAGE_SIZE)
+        return max(1, min(10, int(size)))
 
     def _load_overlay_background(self, rel_path: str) -> pygame.Surface | None:
         s = (rel_path or "").strip()
@@ -854,6 +1696,12 @@ class VNGameRuntime:
         if render_pos is None:
             return True
 
+        def _slot_exists(slot_id: int) -> bool:
+            try:
+                return bool(slot_file_path(self.save_dir, int(slot_id)).exists())
+            except Exception:
+                return False
+
         mx, my = render_pos
 
         r_close = (self._overlay_hitboxes or {}).get("close")
@@ -870,8 +1718,15 @@ class VNGameRuntime:
                 if rect.collidepoint(mx, my):
                     if ot == "save":
                         self.save_game(slot_id)
-                        self._save_overlay = False
+                        # 保持停留在存档界面，仅刷新显示（缩略图缓存按槽位失效）
+                        try:
+                            self._invalidate_slot_thumbnail_cache(int(slot_id))
+                        except Exception:
+                            pass
                     else:
+                        # 空槽位点击：吞掉事件但不退出读档界面
+                        if not _slot_exists(slot_id):
+                            return True
                         self.load_game(slot_id)
                         self._load_overlay = False
                     return True
@@ -929,6 +1784,15 @@ class VNGameRuntime:
             return None
         x, y = render_pos
         for idx, rect in enumerate(self._hud_button_hitboxes):
+            if rect is not None and rect.collidepoint(x, y):
+                return idx
+        return None
+
+    def _hit_test_choice_button(self, render_pos):
+        if not self._choice_button_hitboxes:
+            return None
+        x, y = render_pos
+        for idx, rect in enumerate(self._choice_button_hitboxes):
             if rect is not None and rect.collidepoint(x, y):
                 return idx
         return None
@@ -1102,6 +1966,11 @@ class VNGameRuntime:
 
         Safe on platforms that don't support system cursors.
         """
+        # script lock overrides auto cursor behavior
+        if isinstance(getattr(self, "_script_cursor_lock_style", None), str) and self._script_cursor_lock_style:
+            self._set_system_cursor(self._script_cursor_lock_style)
+            return
+
         desired = bool(hand)
         if desired == bool(getattr(self, "_mouse_cursor_is_hand", False)):
             return
@@ -1111,6 +1980,21 @@ class VNGameRuntime:
         except Exception:
             # ignore if system cursor is not supported
             self._mouse_cursor_is_hand = desired
+
+    def _set_system_cursor(self, style: str) -> None:
+        s = str(style or "").strip().lower()
+        mapping = {
+            "arrow": pygame.SYSTEM_CURSOR_ARROW,
+            "hand": pygame.SYSTEM_CURSOR_HAND,
+            "ibeam": pygame.SYSTEM_CURSOR_IBEAM,
+            "wait": pygame.SYSTEM_CURSOR_WAIT,
+            "crosshair": pygame.SYSTEM_CURSOR_CROSSHAIR,
+        }
+        cur = mapping.get(s, pygame.SYSTEM_CURSOR_ARROW)
+        try:
+            pygame.mouse.set_cursor(cur)
+        except Exception:
+            pass
 
     def _enter_menu(self):
         self.mode = "menu"
@@ -1132,11 +2016,22 @@ class VNGameRuntime:
         except Exception:
             pass
         self._bgm_current = None
+        if isinstance(self._game_cfg_cache, dict):
+            self._apply_menu_config(self._game_cfg_cache)
+        show_overlay = self._loading_overlay_enabled_for("enter_menu")
+        if show_overlay:
+            self._loading_begin("正在加载主菜单...", subtitle=None)
         self._load_menu_assets()
+        if show_overlay:
+            self._loading_end()
         if self._menu_bgm_path:
             self._ensure_bgm(self._menu_bgm_path, loop=self._menu_bgm_loop, fade=True)
 
-    def _start_new_game(self):
+    def _start_new_game(self, reset_globals: bool | None = None):
+        show_overlay = self._loading_overlay_enabled_for("start_game")
+        if show_overlay:
+            self._loading_begin("正在开始游戏...", subtitle=None)
+        self._loading_progress(0.12, "初始化游戏状态...")
         self.mode = "game"
         self._save_overlay = False
         self._load_overlay = False
@@ -1146,7 +2041,12 @@ class VNGameRuntime:
         self._history_overlay = False
         self._stop_bgm()
         self._stop_video()
-        self._init_variables_from_defs()
+        do_reset = self._reset_globals_on_start if reset_globals is None else bool(reset_globals)
+        # reset_globals_on_start=False 的语义是“不要清空已存在的运行时变量”。
+        # 但首次开局 variables 为空时仍应从定义初始化，否则 F3 会看到空变量。
+        if do_reset or not (isinstance(self.variables, dict) and self.variables):
+            self._init_variables_from_defs()
+        self._loading_progress(0.45, "加载对白与流程...")
         self.fast_skip = False
         self._fast_skip_timer = 0.0
         self.current_index = 0
@@ -1155,7 +2055,22 @@ class VNGameRuntime:
         self._voice_played_index = None
         self._bgm_current = None
         self._stop_voice_playback()
-        self._reload_dialogues()
+        # Fast path: if project file unchanged since last load, reuse loaded dialogues/graph and cached assets.
+        if not self._project_changed_since_last_dialogue_load():
+            if self.graph_mode:
+                self._select_graph_start_node_id()
+                self._sub_index = 0
+            else:
+                self.current_index = 0
+                self._sub_index = 0
+                self.current_node_id = None
+            self._on_enter_node()
+            self._reset_typing_state()
+        else:
+            self._reload_dialogues()
+        self._loading_progress(0.95, "进入游戏...")
+        if show_overlay:
+            self._loading_end()
 
     def _continue_latest(self):
         latest_slot = self._find_latest_slot(include_autosave=True)
@@ -1228,7 +2143,7 @@ class VNGameRuntime:
             return
         action = self._menu_items[self._menu_selected].get("action")
         if action == "start":
-            self._start_new_game()
+            self._start_new_game(reset_globals=self._reset_globals_on_start)
         elif action == "continue":
             self._continue_autosave()
         elif action == "load":
@@ -1256,20 +2171,57 @@ class VNGameRuntime:
         return latest
 
     def _init_variables_from_defs(self):
-        self.variables = {}
+        protected = getattr(self, "_protected_vars", set()) or set()
+        old = dict(self.variables) if isinstance(self.variables, dict) else {}
+        out: dict[str, float] = {}
         for item in self._global_var_defs or []:
             if not isinstance(item, dict):
                 continue
             name = item.get("name")
             if not name:
                 continue
+            name = str(name)
             try:
                 init_val = float(item.get("initial", 0.0))
             except Exception:
                 init_val = 0.0
-            self.variables[name] = init_val
+
+            if name in protected:
+                if name in old:
+                    try:
+                        out[name] = float(old.get(name))
+                    except Exception:
+                        out[name] = init_val
+                elif name in (self._persistent_vars or {}):
+                    try:
+                        out[name] = float(self._persistent_vars.get(name))
+                    except Exception:
+                        out[name] = init_val
+                else:
+                    out[name] = init_val
+            else:
+                out[name] = init_val
+
+        self.variables = out
+        self._update_persistent_from_runtime()
+        self._save_persistent_vars()
+
+    def _invalidate_slot_thumbnail_cache(self, slot: int) -> None:
+        """Remove cached thumbnails for a given slot (all sizes/mtimes)."""
+
+        try:
+            p = str(slot_thumbnail_path(self.save_dir, int(slot)))
+        except Exception:
+            return
+        try:
+            for k in list(self._slot_thumbnail_cache.keys()):
+                if k and k[0] == p:
+                    self._slot_thumbnail_cache.pop(k, None)
+        except Exception:
+            return
 
     def _load_menu_assets(self):
+        self._loading_progress(0.05, "加载主菜单资源...")
         # optional title background and bgm (config first, then fallbacks)
         candidates_img = []
         if self._menu_bg_path:
@@ -1290,6 +2242,7 @@ class VNGameRuntime:
                 except Exception:
                     continue
         self._menu_bg = bg_surface
+        self._loading_progress(0.35, "加载主菜单资源...")
 
         candidates_bgm = []
         if self._menu_bgm_path:
@@ -1307,6 +2260,7 @@ class VNGameRuntime:
                 bgm_path = str(p)
                 break
         self._menu_bgm_path = bgm_path
+        self._loading_progress(0.55, "加载主菜单资源...")
 
         candidates_video: list[str] = []
         if self._menu_video_path:
@@ -1322,6 +2276,7 @@ class VNGameRuntime:
                 video_path = str(p)
                 break
         self._menu_video_path = video_path or ""
+        self._loading_progress(0.65, "加载主菜单资源...")
 
         # title image
         self._menu_title_image_surface = None
@@ -1344,6 +2299,7 @@ class VNGameRuntime:
                 self._menu_title_image_surface = img
             except Exception:
                 self._menu_title_image_surface = None
+        self._loading_progress(0.78, "加载主菜单资源...")
 
         # option button images
         self._menu_option_image_surfaces = {}
@@ -1364,6 +2320,7 @@ class VNGameRuntime:
                 self._menu_option_image_surfaces[action] = img
             except Exception:
                 continue
+        self._loading_progress(0.92, "加载主菜单资源...")
 
         # indicator image (optional)
         self._menu_option_indicator_image_surface = None
@@ -1374,14 +2331,19 @@ class VNGameRuntime:
                     self._menu_option_indicator_image_surface = pygame.image.load(str(p)).convert_alpha()
                 except Exception:
                     self._menu_option_indicator_image_surface = None
+        self._loading_progress(1.0, "加载主菜单资源...")
 
     def _preload_menu_media(self):
         """预加载主菜单媒体，避免进入时黑屏或卡顿。"""
+        self._loading_push(0.0, 0.55)
         self._load_menu_assets()
+        self._loading_pop()
+        self._loading_progress(0.62, "预加载主菜单媒体...")
         # 预取视频首帧
         if self._menu_video_path:
             self._video_time = 0.0
             self._update_video(self._menu_video_path, self._menu_video_loop, 0.0)
+        self._loading_progress(0.78, "预加载主菜单媒体...")
         # 预加载BGM到缓冲（不播放）
         if self._menu_bgm_path:
             try:
@@ -1391,11 +2353,18 @@ class VNGameRuntime:
                 pygame.mixer.music.stop()
             except Exception:
                 pass
+        self._loading_progress(1.0, "预加载主菜单媒体...")
 
     def _start_splash(self):
         self.mode = "splash"
         self._splash_elapsed = 0.0
+        show_overlay = self._loading_overlay_enabled_for("load_game")
+        if show_overlay:
+            self._loading_begin("启动中...", subtitle=(self.project_path.name if self.project_path else None))
+        self._loading_progress(0.05, "预加载主菜单媒体...")
         self._preload_menu_media()
+        if show_overlay:
+            self._loading_end()
 
     def _render_splash(self, dt: float):
         self._splash_elapsed += dt
@@ -1411,7 +2380,7 @@ class VNGameRuntime:
         if self._splash_elapsed >= self._splash_time:
             # 设计器“从节点开始预览”：跳过主菜单，直接进入游戏
             if self._preview_start_node_id is not None:
-                self._start_new_game()
+                self._start_new_game(reset_globals=True)
             else:
                 self._enter_menu()
 
@@ -1428,11 +2397,40 @@ class VNGameRuntime:
         while self.running:
             dt = self.clock.tick(60) / 1000.0
             self._last_dt = dt
+            self._process_main_thread_script_actions()
+            self._update_script_runtime(dt)
             self.render_surface.fill(self.bg_color)
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.quit_game()
+
+                # modal alert from function scripts: swallow inputs until dismissed
+
+                # modal alert from function scripts: swallow inputs until dismissed
+                if self._script_modal_message is not None:
+                    if event.type == pygame.KEYDOWN:
+                        self._script_modal_message = None
+                        continue
+                    if event.type == pygame.MOUSEBUTTONDOWN and getattr(event, "button", None) == 1:
+                        self._script_modal_message = None
+                        continue
+                    # keep blocking all other inputs while modal is showing
+                    continue
+
+                # input lock from function scripts (game mode only)
+                if self.mode == "game" and self._is_script_input_locked():
+                    if event.type in (
+                        pygame.KEYDOWN,
+                        pygame.KEYUP,
+                        pygame.MOUSEMOTION,
+                        pygame.MOUSEBUTTONDOWN,
+                        pygame.MOUSEBUTTONUP,
+                        pygame.MOUSEWHEEL,
+                        pygame.TEXTINPUT,
+                    ):
+                        continue
+
                 if event.type == pygame.KEYDOWN:
                     # lazy init help hotkey mapping after pygame init
                     if self._help_key is None:
@@ -1444,10 +2442,15 @@ class VNGameRuntime:
                             break
                         else:
                             if self._preview_start_node_id is not None:
-                                self._start_new_game()
+                                self._start_new_game(reset_globals=True)
                             else:
                                 self._enter_menu()
                             continue
+
+                    # 截图模式：任意键恢复（并吞掉该次输入，避免误推进对白/触发按钮）
+                    if self.mode == "game" and self._screenshot_hide_ui:
+                        self._screenshot_hide_ui = False
+                        continue
                     # global overlay handling (works in menu or game)
                     if event.key == pygame.K_ESCAPE and (
                         self._save_overlay
@@ -1492,34 +2495,54 @@ class VNGameRuntime:
                         self._toggle_help_overlay()
                         continue
 
+                    # 截图模式切换（游戏内）
+                    if self.mode == "game" and event.key == pygame.K_F12:
+                        self._screenshot_hide_ui = not self._screenshot_hide_ui
+                        continue
+
                     # save/load overlay paging (10 slots per page)
                     if (self._save_overlay or self._load_overlay) and event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN):
                         delta = -1 if event.key in (pygame.K_UP, pygame.K_PAGEUP) else 1
-                        self._save_page = clamp_page(self._save_page + delta, self._save_slots, self._save_page_size)
+                        ps = self._active_slot_page_size()
+                        self._save_page = clamp_page(self._save_page + delta, self._save_slots, ps)
                         continue
 
                     # load autosave (A)
                     if self._load_overlay and event.key == pygame.K_a:
-                        self.load_game(AUTO_SAVE_SLOT)
-                        self._load_overlay = False
-                        self._overlay_return_mode = None
+                        # 空的自动存档：不做任何事，也不退出读档界面
+                        try:
+                            if slot_file_path(self.save_dir, AUTO_SAVE_SLOT).exists():
+                                self.load_game(AUTO_SAVE_SLOT)
+                                self._load_overlay = False
+                                self._overlay_return_mode = None
+                        except Exception:
+                            pass
                         continue
 
                     # save/load overlay digit selection (0-9)
                     if self._save_overlay or self._load_overlay:
                         digit = self._key_to_digit(event.key)
                         if digit is not None:
-                            slot = digit_to_slot(self._save_page, digit, page_size=self._save_page_size)
+                            ps = self._active_slot_page_size()
+                            slot = digit_to_slot(self._save_page, digit, page_size=ps)
                             if slot is not None and 1 <= slot <= self._save_slots:
                                 if self._load_overlay:
-                                    self.load_game(slot)
-                                    self._load_overlay = False
-                                    self._overlay_return_mode = None
+                                    # 空槽位数字键：不做任何事，也不退出读档界面
+                                    try:
+                                        if slot_file_path(self.save_dir, slot).exists():
+                                            self.load_game(slot)
+                                            self._load_overlay = False
+                                            self._overlay_return_mode = None
+                                    except Exception:
+                                        pass
                                     continue
                                 if self._save_overlay:
                                     self.save_game(slot)
-                                    self._save_overlay = False
-                                    self._restore_mode_if_needed()
+                                    # 保持停留在存档界面，仅刷新显示
+                                    try:
+                                        self._invalidate_slot_thumbnail_cache(int(slot))
+                                    except Exception:
+                                        pass
                                     continue
                     if self._settings_overlay:
                         if self._handle_settings_key(event.key):
@@ -1639,6 +2662,10 @@ class VNGameRuntime:
                         self._apply_choice(key_map.get(event.key, -1))
                         continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                    # 截图模式：右键恢复（并吞掉该次输入）
+                    if self.mode == "game" and self._screenshot_hide_ui:
+                        self._screenshot_hide_ui = False
+                        continue
                     if self._help_right_click:
                         self._toggle_help_overlay()
                         continue
@@ -1653,6 +2680,16 @@ class VNGameRuntime:
                         self._set_mouse_cursor(hand=cursor_hand)
                         continue
 
+                    # choice overlay hover (mouse-enabled)
+                    if self.mode == "game" and self._choice_overlay and self._choice_buttons_enabled:
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        if rp is not None:
+                            hit = self._hit_test_choice_button(rp)
+                            self._choice_selected = int(hit) if hit is not None else -1
+                            cursor_hand = hit is not None
+                        self._set_mouse_cursor(hand=cursor_hand)
+                        continue
+
                     if self.mode == "game" and self._hud_buttons_enabled and not (
                         self._save_overlay
                         or self._load_overlay
@@ -1661,7 +2698,7 @@ class VNGameRuntime:
                         or self._history_overlay
                         or self._help_overlay
                         or self._exit_confirm_overlay
-                    ):
+                    ) and not self._ui_hidden_for_current_node():
                         rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
                         if rp is not None:
                             hit = self._hit_test_hud_button(rp)
@@ -1685,10 +2722,25 @@ class VNGameRuntime:
                     # apply cursor change (menu/hud clickable areas)
                     self._set_mouse_cursor(hand=cursor_hand)
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    # 截图模式：左键恢复（并吞掉该次输入）
+                    if self.mode == "game" and self._screenshot_hide_ui:
+                        self._screenshot_hide_ui = False
+                        continue
                     # function-menu overlays (mouse-enabled)
                     if self._function_menus_enabled and self._overlay_type() is not None:
                         rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
                         self._overlay_handle_mouse_down(rp)
+                        continue
+
+                    # choice overlay (mouse-enabled, only when enabled by UI layout)
+                    if self.mode == "game" and self._choice_overlay and self._choice_buttons_enabled:
+                        rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
+                        if rp is not None:
+                            hit = self._hit_test_choice_button(rp)
+                            if hit is not None:
+                                self._choice_selected = int(hit)
+                                self._apply_choice(int(hit))
+                        # do not fall through to advance_dialogue when choice overlay is open
                         continue
 
                     if self.mode == "menu":
@@ -1717,7 +2769,7 @@ class VNGameRuntime:
                         or self._history_overlay
                         or self._help_overlay
                         or self._exit_confirm_overlay
-                    ):
+                    ) and not self._ui_hidden_for_current_node():
                         rp = self._window_pos_to_render_pos(getattr(event, "pos", None))
                         if rp is not None:
                             hit = self._hit_test_hud_button(rp)
@@ -1725,7 +2777,15 @@ class VNGameRuntime:
                                 self._hud_selected = hit
                                 self._activate_hud_button(hit)
                                 continue
-                    if not (self._save_overlay or self._load_overlay or self._settings_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay):
+                    if not (
+                        self._save_overlay
+                        or self._load_overlay
+                        or self._settings_overlay
+                        or self._choice_overlay
+                        or self._history_overlay
+                        or self._help_overlay
+                        or self._exit_confirm_overlay
+                    ):
                         if self._auto_next_lock_active():
                             self._reveal_current_text()
                         else:
@@ -1750,6 +2810,8 @@ class VNGameRuntime:
             if not self.running:
                 break
 
+            self._update_choice_timeout(dt)
+
             if self.mode == "splash":
                 self._render_splash(dt)
             elif self.mode == "menu":
@@ -1772,8 +2834,395 @@ class VNGameRuntime:
                 # 避免同一帧内由于 fast-skip 再次推进
                 if not advanced_this_tick:
                     self._update_fast_skip(dt)
+
+            self._render_script_layers(dt)
             self._blit_to_window()
             pygame.display.flip()
+
+    def _update_choice_timeout(self, dt: float) -> None:
+        if not self._choice_overlay:
+            self._choice_timeout_remaining = None
+            self._choice_default_index = -1
+            return
+
+        # pause countdown while other overlays are open
+        if self._save_overlay or self._load_overlay or self._settings_overlay or self._history_overlay or self._help_overlay or self._exit_confirm_overlay:
+            return
+
+        remaining = getattr(self, "_choice_timeout_remaining", None)
+        if remaining is None:
+            return
+        try:
+            remaining = float(remaining) - max(0.0, float(dt))
+        except Exception:
+            remaining = 0.0
+        self._choice_timeout_remaining = remaining
+        if remaining > 0.0:
+            return
+
+        default_idx = int(getattr(self, "_choice_default_index", -1))
+        if default_idx < 0:
+            self._choice_timeout_remaining = None
+            return
+        if default_idx >= len(self._choice_targets or []):
+            self._choice_timeout_remaining = None
+            return
+
+        # Ensure we only fire once
+        self._choice_timeout_remaining = None
+        self._apply_choice(default_idx)
+
+    def _update_script_runtime(self, dt: float) -> None:
+        """Update timers and transient script-driven state (main thread)."""
+        try:
+            self._script_time_now += max(0.0, float(dt))
+        except Exception:
+            return
+
+        # toast life
+        try:
+            if self._script_toasts:
+                alive: list[dict] = []
+                for t in self._script_toasts:
+                    if not isinstance(t, dict):
+                        continue
+                    rem = float(t.get("remaining", 0.0)) - max(0.0, float(dt))
+                    if rem > 0.0:
+                        t["remaining"] = rem
+                        alive.append(t)
+                self._script_toasts = alive
+        except Exception:
+            pass
+
+        # flash
+        try:
+            if isinstance(self._script_flash, dict):
+                rem = float(self._script_flash.get("remaining", 0.0)) - max(0.0, float(dt))
+                if rem <= 0.0:
+                    self._script_flash = None
+                else:
+                    self._script_flash["remaining"] = rem
+        except Exception:
+            self._script_flash = None
+
+        # shake
+        try:
+            if isinstance(self._script_shake, dict):
+                rem = float(self._script_shake.get("remaining", 0.0)) - max(0.0, float(dt))
+                if rem <= 0.0:
+                    self._script_shake = None
+                    self._script_shake_offset = (0.0, 0.0)
+                else:
+                    self._script_shake["remaining"] = rem
+                    duration = max(0.001, float(self._script_shake.get("duration", 0.001)))
+                    strength = float(self._script_shake.get("strength", 0.0))
+                    decay = bool(self._script_shake.get("decay", True))
+                    if decay:
+                        strength = strength * max(0.0, min(1.0, rem / duration))
+                    self._script_shake_offset = (
+                        random.uniform(-strength, strength),
+                        random.uniform(-strength, strength),
+                    )
+        except Exception:
+            self._script_shake = None
+            self._script_shake_offset = (0.0, 0.0)
+
+        # input lock
+        try:
+            if self._script_input_lock_remaining is not None:
+                rem = float(self._script_input_lock_remaining) - max(0.0, float(dt))
+                if rem <= 0.0:
+                    self._script_input_lock_remaining = None
+                else:
+                    self._script_input_lock_remaining = rem
+        except Exception:
+            self._script_input_lock_remaining = None
+
+        try:
+            expr = getattr(self, "_script_input_lock_until_expr", None)
+            if isinstance(expr, str) and expr.strip():
+                # optional timeout to prevent deadlocks
+                if self._script_input_lock_until_timeout is not None:
+                    t_rem = float(self._script_input_lock_until_timeout) - max(0.0, float(dt))
+                    if t_rem <= 0.0:
+                        self._script_input_lock_until_expr = None
+                        self._script_input_lock_until_timeout = None
+                    else:
+                        self._script_input_lock_until_timeout = t_rem
+                # unlock once condition becomes True
+                if self._script_input_lock_until_expr is not None and self._eval_script_input_lock_expr(str(expr)):
+                    self._script_input_lock_until_expr = None
+                    self._script_input_lock_until_timeout = None
+            else:
+                self._script_input_lock_until_expr = None
+                self._script_input_lock_until_timeout = None
+        except Exception:
+            self._script_input_lock_until_expr = None
+            self._script_input_lock_until_timeout = None
+
+        # script images life
+        try:
+            if isinstance(self._script_images, dict) and self._script_images:
+                alive: dict[str, dict] = {}
+                for k, info in list(self._script_images.items()):
+                    if not isinstance(info, dict):
+                        continue
+                    rem = info.get("remaining", None)
+                    if rem is None:
+                        alive[str(k)] = info
+                        continue
+                    try:
+                        rem2 = float(rem) - max(0.0, float(dt))
+                    except Exception:
+                        rem2 = 0.0
+                    if rem2 > 0.0:
+                        info["remaining"] = rem2
+                        alive[str(k)] = info
+                self._script_images = alive
+        except Exception:
+            pass
+
+        # timers
+        now = float(self._script_time_now)
+        due: list[dict] = []
+        with self._script_timer_lock:
+            for tid, info in list(self._script_timers.items()):
+                if not isinstance(info, dict):
+                    continue
+                try:
+                    if float(info.get("next", 0.0)) <= now:
+                        due.append(dict(info))
+                except Exception:
+                    continue
+
+        for info in sorted(due, key=lambda x: float(x.get("next", 0.0))):
+            self._fire_script_timer(info)
+
+    def _create_script_timer(self, seconds: float, script: str, *, interval: float = 0.0, repeat: int = 0, host_node_id=None) -> int:
+        delay = max(0.0, float(seconds))
+        interval = max(0.0, float(interval))
+        rep = int(repeat)
+        # normalize repeat for interval timers:
+        # - rep < 0: infinite
+        # - rep == 0: run once
+        if interval > 0.0 and rep == 0:
+            rep = 1
+
+        with self._script_timer_lock:
+            tid = int(self._script_timer_next_id)
+            self._script_timer_next_id += 1
+            self._script_timers[tid] = {
+                "id": tid,
+                "next": float(self._script_time_now) + delay,
+                "interval": interval,
+                "repeat": rep,
+                "script": str(script or ""),
+                "host_node_id": host_node_id,
+            }
+        return tid
+
+    def _clear_script_timer(self, timer_id: int) -> bool:
+        with self._script_timer_lock:
+            return self._script_timers.pop(int(timer_id), None) is not None
+
+    def _fire_script_timer(self, info: dict) -> None:
+        tid = int(info.get("id", 0) or 0)
+        script = str(info.get("script", "") or "")
+        if tid <= 0 or not script.strip():
+            return
+
+        # reschedule/remove under lock (avoid double-fire)
+        with self._script_timer_lock:
+            cur = self._script_timers.get(tid)
+            if not isinstance(cur, dict):
+                return
+            interval = float(cur.get("interval", 0.0) or 0.0)
+            repeat = int(cur.get("repeat", 0) or 0)
+
+            if interval > 0.0:
+                if repeat > 0:
+                    repeat -= 1
+                    cur["repeat"] = repeat
+                if repeat == 0:
+                    self._script_timers.pop(tid, None)
+                else:
+                    cur["next"] = float(self._script_time_now) + max(0.001, interval)
+                    self._script_timers[tid] = cur
+            else:
+                self._script_timers.pop(tid, None)
+
+        host_node_id = info.get("host_node_id")
+        t = threading.Thread(
+            target=self._execute_timer_script_worker,
+            args=(tid, host_node_id, script),
+            daemon=True,
+        )
+        t.start()
+
+    def _execute_timer_script_worker(self, timer_id: int, host_node_id, script: str) -> None:
+        try:
+            entry_snapshot = dict(self._current_entry() or {})
+        except Exception:
+            entry_snapshot = {}
+        try:
+            vars_snapshot = dict(self.variables) if isinstance(getattr(self, "variables", None), dict) else {}
+        except Exception:
+            vars_snapshot = {}
+
+        fn = {"node_type": "timer", "id": int(timer_id)}
+        api = VNGameRuntime._FunctionScriptAPI(self, host_node_id, fn)
+        try:
+            self._exec_function_script(str(script), api, entry_snapshot, vars_snapshot, fn, -1)
+        except Exception as exc:
+            api.log(f"timer script error: {exc}")
+
+    def _render_script_layers(self, dt: float) -> None:
+        """Draw script-driven overlays on the render surface."""
+        # flash overlay
+        try:
+            if isinstance(self._script_flash, dict):
+                duration = max(0.001, float(self._script_flash.get("duration", 0.001)))
+                remaining = max(0.0, float(self._script_flash.get("remaining", 0.0)))
+                base_alpha = int(self._script_flash.get("alpha", 180) or 180)
+                base_alpha = max(0, min(255, base_alpha))
+                p = max(0.0, min(1.0, remaining / duration))
+                alpha = int(round(base_alpha * p))
+                color = self._script_flash.get("color", (255, 255, 255))
+                try:
+                    r, g, b = int(color[0]), int(color[1]), int(color[2])
+                except Exception:
+                    r, g, b = 255, 255, 255
+                if alpha > 0:
+                    overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
+                    overlay.fill((max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), alpha))
+                    self.render_surface.blit(overlay, (0, 0))
+        except Exception:
+            pass
+
+        # toasts
+        try:
+            if self._script_toasts:
+                font = getattr(self, "font", None)
+                if font is not None:
+                    margin = 14
+                    y = self.render_size[1] - 60
+                    for t in self._script_toasts[-3:]:
+                        text = str(t.get("text", "") or "")
+                        if not text:
+                            continue
+                        surf = font.render(text, True, (255, 255, 255))
+                        pad_x, pad_y = 12, 8
+                        w = surf.get_width() + pad_x * 2
+                        h = surf.get_height() + pad_y * 2
+                        x = (self.render_size[0] - w) // 2
+                        bg = pygame.Surface((w, h), pygame.SRCALPHA)
+                        bg.fill((0, 0, 0, 170))
+                        self.render_surface.blit(bg, (x, y))
+                        self.render_surface.blit(surf, (x + pad_x, y + pad_y))
+                        y -= (h + margin)
+        except Exception:
+            pass
+
+        # modal alert
+        try:
+            if isinstance(self._script_modal_message, dict):
+                text = str(self._script_modal_message.get("text", "") or "")
+                if text:
+                    overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
+                    overlay.fill((0, 0, 0, 140))
+                    self.render_surface.blit(overlay, (0, 0))
+                    font = getattr(self, "font", None)
+                    title_font = getattr(self, "name_font", None)
+                    title = str(self._script_modal_message.get("title", "提示") or "提示")
+                    if font is not None and title_font is not None:
+                        max_w = self.render_size[0] - 160
+                        lines: list[str] = []
+                        cur = ""
+                        for ch in text:
+                            test = cur + ch
+                            if cur and font.size(test)[0] > max_w:
+                                lines.append(cur)
+                                cur = ch
+                            else:
+                                cur = test
+                        if cur:
+                            lines.append(cur)
+                        lines = lines[:10]
+
+                        title_surf = title_font.render(title, True, (255, 255, 255))
+                        line_surfs = [font.render(ln, True, (235, 235, 235)) for ln in lines]
+                        hint_surf = font.render("按任意键关闭", True, (210, 210, 210))
+                        w = max(title_surf.get_width(), hint_surf.get_width(), *(s.get_width() for s in line_surfs)) + 40
+                        h = title_surf.get_height() + hint_surf.get_height() + sum(s.get_height() for s in line_surfs) + 48
+                        w = min(self.render_size[0] - 80, w)
+                        x = (self.render_size[0] - w) // 2
+                        y = (self.render_size[1] - h) // 2
+                        box = pygame.Surface((w, h), pygame.SRCALPHA)
+                        box.fill((20, 22, 28, 235))
+                        self.render_surface.blit(box, (x, y))
+                        yy = y + 18
+                        self.render_surface.blit(title_surf, (x + 20, yy))
+                        yy += title_surf.get_height() + 14
+                        for s in line_surfs:
+                            self.render_surface.blit(s, (x + 20, yy))
+                            yy += s.get_height() + 6
+                        self.render_surface.blit(hint_surf, (x + 20, y + h - hint_surf.get_height() - 16))
+        except Exception:
+            pass
+
+        # top-most script images
+        try:
+            if isinstance(self._script_images, dict) and self._script_images:
+                items = [v for v in self._script_images.values() if isinstance(v, dict)]
+                items.sort(key=lambda x: float(x.get("z", 1000.0)))
+                for info in items:
+                    surf = info.get("surface")
+                    rect = info.get("rect")
+                    if surf is None or rect is None:
+                        continue
+                    self.render_surface.blit(surf, rect)
+        except Exception:
+            pass
+
+    def _is_script_input_locked(self) -> bool:
+        try:
+            if self._script_input_lock_remaining is not None and float(self._script_input_lock_remaining) > 0.0:
+                return True
+        except Exception:
+            pass
+        try:
+            expr = getattr(self, "_script_input_lock_until_expr", None)
+            return bool(isinstance(expr, str) and expr.strip())
+        except Exception:
+            return False
+
+    def _eval_script_input_lock_expr(self, expr: str) -> bool:
+        """Evaluate an input-lock 'until' expression safely on the main thread."""
+        s = str(expr or "").strip()
+        if not s:
+            return True
+        try:
+            safe_builtins = {
+                "True": True,
+                "False": False,
+                "None": None,
+                "int": int,
+                "float": float,
+                "str": str,
+                "bool": bool,
+                "len": len,
+                "min": min,
+                "max": max,
+                "abs": abs,
+                "sum": sum,
+            }
+            g = {"__builtins__": safe_builtins}
+            l = {"vars": dict(self.variables) if isinstance(getattr(self, "variables", None), dict) else {}}
+            code = compile(s, "<function-input-lock-until>", "eval")
+            return bool(eval(code, g, l))
+        except Exception:
+            # On error, keep locked.
+            return False
 
     def _window_pos_to_render_pos(self, window_pos):
         """Convert window/screen mouse position to render_surface coordinates.
@@ -1873,6 +3322,7 @@ class VNGameRuntime:
 
     def _render_scene(self, dt: float):
         entry = self._current_entry()
+        dlg_style, name_style, dlg_font, name_font = self._effective_text_style_for_entry(entry)
         speaker = entry.get("speaker") or "角色"
         content = entry.get("content") or entry.get("title") or ""
         bg_path = entry.get("background") or ""
@@ -1882,7 +3332,7 @@ class VNGameRuntime:
         video_path = entry.get("video") or ""
         bgm_path = entry.get("bgm") or ""
         stop_bgm = bool(entry.get("stop_bgm"))
-        hide_textbox = bool(entry.get("hide_textbox", False))
+        hide_textbox = bool(entry.get("hide_textbox", False)) or bool(self._screenshot_hide_ui)
         portrait_fade = bool(entry.get("portrait_fade", False))
         portrait_fade_duration = entry.get("portrait_fade_duration", None)
         portrait2_fade = bool(entry.get("portrait2_fade", False))
@@ -1951,14 +3401,25 @@ class VNGameRuntime:
                 name_surface = pygame.Surface((self.name_area.width, self.name_area.height), pygame.SRCALPHA)
                 name_surface.fill((0, 0, 0, 180))
                 self.render_surface.blit(name_surface, (self.name_area.x, self.name_area.y))
-            name_text = self.name_font.render(speaker, True, (220, 220, 220))
+
+            name_color = name_style.get("color", (220, 220, 220))
+            name_ow = int(name_style.get("outline_width", 0) or 0)
+            name_oc = name_style.get("outline_color", (0, 0, 0))
+            name_surf = self._render_text_surface(str(speaker), name_font, name_color, name_ow, name_oc)
             left_pad = min(self.text_margin, max(4, self.name_area.width - 10))
-            vert_pad = max(4, (self.name_area.height - name_text.get_height()) // 2)
-            self.render_surface.blit(name_text, (self.name_area.x + left_pad, self.name_area.y + vert_pad))
+            vert_pad = max(4, (self.name_area.height - name_surf.get_height()) // 2)
+            self.render_surface.blit(name_surf, (self.name_area.x + left_pad, self.name_area.y + vert_pad))
 
             # render dialogue text with simple wrapping
             shown_text = content[: self.current_visible_len] if content else ""
-            self._render_wrapped_text(shown_text, self.text_area, self.font, self.text_color)
+            self._render_wrapped_text(
+                shown_text,
+                self.text_area,
+                dlg_font,
+                dlg_style.get("color", (235, 235, 240)),
+                int(dlg_style.get("outline_width", 0) or 0),
+                dlg_style.get("outline_color", (0, 0, 0)),
+            )
 
             # draw small triangle indicator when line finished
             if self.current_visible_len >= len(content):
@@ -1968,7 +3429,9 @@ class VNGameRuntime:
             self._render_debug_hud(entry)
 
         # in-game HUD button group (mouse-only)
-        self._render_hud_buttons()
+        # hide when textbox is hidden (node directive) or in screenshot mode
+        if not hide_textbox:
+            self._render_hud_buttons()
 
         if self._history_overlay:
             self._render_history_overlay()
@@ -2291,13 +3754,18 @@ class VNGameRuntime:
         hint_surf = self.font.render(hint, True, (200, 200, 200))
         self.render_surface.blit(hint_surf, (60, self.render_size[1] - 60))
 
-    def _render_wrapped_text(self, text: str, area: pygame.Rect, font, color):
+    def _render_wrapped_text(self, text: str, area: pygame.Rect, font, color, outline_width: int = 0, outline_color=(0, 0, 0)):
         words = list(text)
         lines = []
         current = ""
+        try:
+            ow = max(0, int(outline_width))
+        except Exception:
+            ow = 0
         for ch in words:
             test = current + ch
-            if font.size(test)[0] > area.width - self.text_margin * 2:
+            avail = area.width - self.text_margin * 2 - ow * 2
+            if font.size(test)[0] > max(10, avail):
                 lines.append(current)
                 current = ch
             else:
@@ -2307,8 +3775,8 @@ class VNGameRuntime:
 
         y = area.y + self.text_margin
         for line in lines:
-            surf = font.render(line, True, color)
-            self.render_surface.blit(surf, (area.x + self.text_margin, y))
+            surf = self._render_text_surface(line, font, color, ow, outline_color)
+            self.render_surface.blit(surf, (area.x + self.text_margin - ow, y - ow))
             y += font.get_linesize()
 
     def _update_typing(self, dt: float):
@@ -2443,8 +3911,16 @@ class VNGameRuntime:
             except Exception:
                 result = 0.0
             self.variables[str(dest)] = result
+            # protected vars persist across save/load/new-game resets
+            try:
+                dest_name = str(dest)
+                if dest_name in (getattr(self, "_protected_vars", set()) or set()):
+                    self._persistent_vars[dest_name] = float(result)
+                    self._persistent_vars_dirty = True
+            except Exception:
+                pass
 
-    def _on_enter_node(self, skip_media: bool = False):
+    def _on_enter_node(self, skip_media: bool = False, apply_var_ops: bool = True):
         entry = self._current_entry()
         # reset auto-next countdown whenever we enter a node/sub-dialogue
         self._auto_next_remaining = None
@@ -2455,10 +3931,19 @@ class VNGameRuntime:
                     self._auto_next_remaining = max(0.0, min(600.0, secs))
             except Exception:
                 self._auto_next_remaining = None
-        self._apply_var_ops(entry)
+        if apply_var_ops:
+            self._apply_var_ops(entry)
+
+        # 功能节点：仅在“进入宿主节点”时触发一次（文本节点的后续子对白不重复触发）
+        if self.graph_mode and self.current_node_id is not None and self._sub_index == 0:
+            fn_key = self.current_node_id
+            if self._function_played_key != fn_key:
+                self._trigger_function_nodes_for_host(fn_key, entry)
+                self._function_played_key = fn_key
         stop_bgm = bool(entry.get("stop_bgm")) if entry else False
         bgm = entry.get("bgm") or "" if entry else ""
         voice = entry.get("voice") or "" if entry else ""
+        sfx = entry.get("sfx") or "" if entry else ""
         ui_file = entry.get("ui_file") or ""
 
         if entry and entry.get("video"):
@@ -2498,6 +3983,11 @@ class VNGameRuntime:
         if self._voice_played_index != voice_key:
             self._schedule_voice(voice)
             self._voice_played_index = voice_key
+
+        sfx_key = (self.current_node_id, self._sub_index) if self.graph_mode else self.current_index
+        if self._sfx_played_index != sfx_key:
+            self._schedule_sfx(sfx)
+            self._sfx_played_index = sfx_key
 
         self._append_history(entry)
         # 预取下一个节点/对白的素材，进一步降低跳转卡顿
@@ -3081,12 +4571,33 @@ class VNGameRuntime:
                 if subs and 0 <= self._sub_index < len(subs):
                     sub = subs[self._sub_index]
                     merged = dict(node)
+                    sub_has_style_enabled = isinstance(sub, dict) and ("text_style_enabled" in sub)
+                    sub_has_styles = isinstance(sub, dict) and ("text_styles" in sub)
                     merged.update({
                         "speaker": sub.get("speaker", merged.get("speaker", "")),
                         "content": sub.get("text", merged.get("content", "")),
                         "portrait": sub.get("portrait", merged.get("portrait", "")),
                         "portrait2": sub.get("portrait2", merged.get("portrait2", "")),
                         "voice": sub.get("voice", merged.get("voice", "")),
+                        "sfx": sub.get("sfx", merged.get("sfx", "")),
+                        "text_style_enabled": (
+                            bool(sub.get("text_style_enabled", False))
+                            if sub_has_style_enabled
+                            else bool(merged.get("text_style_enabled", False))
+                        ),
+                        "text_styles": (
+                            sub.get("text_styles")
+                            if sub_has_styles and isinstance(sub.get("text_styles"), dict)
+                            else (merged.get("text_styles") if isinstance(merged.get("text_styles"), dict) else {})
+                        ),
+                        # 变量处理：
+                        # - 子对话可独立存储并在进入该子对话时执行；
+                        # - 兼容旧数据：若子对话未配置 var_ops，则仅在第 1 条子对话时回退到节点级 var_ops（避免多条子对话重复执行）。
+                        "var_ops": (
+                            sub.get("var_ops")
+                            if isinstance(sub.get("var_ops"), list)
+                            else (merged.get("var_ops") if self._sub_index == 0 and isinstance(merged.get("var_ops"), list) else [])
+                        ),
                         # UI 配置迁移：优先使用子对话的 ui_file；若未配置则回退到节点级（兼容旧数据）
                         "ui_file": sub.get("ui_file") or merged.get("ui_file", ""),
                         "hide_textbox": bool(sub.get("hide_textbox", False)),
@@ -3112,7 +4623,17 @@ class VNGameRuntime:
         flow = data.get("flow_nodes") or {}
         nodes = flow.get("nodes") or []
         connections = flow.get("connections") or []
-        self.nodes_map = {n.get("id"): n for n in nodes if n.get("id") is not None}
+        # function nodes are not part of the traversal graph; they are bound to host nodes.
+        function_nodes = [n for n in nodes if isinstance(n, dict) and str(n.get("node_type", "")).lower() == "function"]
+        self._function_nodes_by_host = {}
+        for fn in function_nodes:
+            host = fn.get("bound_to")
+            if host is None:
+                continue
+            self._function_nodes_by_host.setdefault(host, []).append(fn)
+
+        graph_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id") is not None and str(n.get("node_type", "")).lower() != "function"]
+        self.nodes_map = {n.get("id"): n for n in graph_nodes if n.get("id") is not None}
         self.adjacency = {nid: [] for nid in self.nodes_map}
         self._connection_order = {nid: [] for nid in self.nodes_map}
         indegree = {nid: 0 for nid in self.nodes_map}
@@ -3155,6 +4676,664 @@ class VNGameRuntime:
         # 预热节点素材，减少首次进入卡顿
         self._warm_caches_from_flow(nodes, preload_limit=100)
 
+    def _process_main_thread_script_actions(self):
+        # Execute queued actions produced by function-node scripts.
+        try:
+            with self._script_queue_lock:
+                if not self._script_main_queue:
+                    return
+                tasks = list(self._script_main_queue)
+                self._script_main_queue.clear()
+        except Exception:
+            return
+        for fn in tasks:
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[功能节点] 主线程任务执行失败: {exc}")
+
+    def _enqueue_main_thread_action(self, fn):
+        try:
+            with self._script_queue_lock:
+                self._script_main_queue.append(fn)
+        except Exception:
+            pass
+
+    class _FunctionScriptAPI:
+        def __init__(self, runtime: "VNGameRuntime", host_node_id, function_node: dict):
+            self._rt = runtime
+            self.host_node_id = host_node_id
+            self.function_node = function_node
+            self.fs = VNGameRuntime._FunctionFSAPI(runtime)
+            self.ui = VNGameRuntime._FunctionUIAPI(runtime)
+            self.fx = VNGameRuntime._FunctionFXAPI(runtime)
+            self.audio = VNGameRuntime._FunctionAudioAPI(runtime)
+            self.time = VNGameRuntime._FunctionTimeAPI(runtime, host_node_id)
+
+        def log(self, *args):
+            try:
+                nid = self.function_node.get("id")
+            except Exception:
+                nid = None
+            prefix = f"[功能节点 host={self.host_node_id} fn={nid}]"
+            try:
+                print(prefix, *args)
+            except Exception:
+                print(prefix)
+
+        def set_var(self, name, value):
+            key = str(name)
+            self._rt._enqueue_main_thread_action(lambda: self._rt.variables.__setitem__(key, value))
+
+        def get_var(self, name, default=None):
+            try:
+                return self._rt.variables.get(str(name), default)
+            except Exception:
+                return default
+
+        def request_exit(self):
+            self._rt._enqueue_main_thread_action(self._rt.quit_game)
+
+        def request_restart(self, reset_globals: bool = False):
+            self._rt._enqueue_main_thread_action(lambda: self._rt._start_new_game(reset_globals=bool(reset_globals)))
+
+    class _FunctionFSAPI:
+        """A capability-based filesystem API for function-node scripts.
+
+        - Safe mode (default): restricts all operations to runtime._function_fs_root
+        - Unsafe mode: allows absolute paths and escaping root
+        """
+
+        def __init__(self, runtime: "VNGameRuntime"):
+            self._rt = runtime
+
+        def _allow_unsafe(self) -> bool:
+            return bool(getattr(self._rt, "_allow_unsafe_function_scripts", False))
+
+        def _root(self) -> Path:
+            try:
+                return Path(getattr(self._rt, "_function_fs_root", getattr(self._rt, "_project_dir", Path.cwd()))).resolve()
+            except Exception:
+                return Path.cwd().resolve()
+
+        def _resolve(self, user_path: str | Path) -> Path:
+            p = Path(user_path)
+            if p.is_absolute():
+                if self._allow_unsafe():
+                    return p.resolve()
+                raise PermissionError("Absolute paths are not allowed in safe mode")
+            resolved = (self._root() / p).resolve()
+            if self._allow_unsafe():
+                return resolved
+            try:
+                resolved.relative_to(self._root())
+            except Exception:
+                raise PermissionError("Path escapes function_script_fs_root")
+            return resolved
+
+        def abspath(self, user_path: str | Path) -> str:
+            return str(self._resolve(user_path))
+
+        def exists(self, user_path: str | Path) -> bool:
+            try:
+                return self._resolve(user_path).exists()
+            except Exception:
+                return False
+
+        def is_file(self, user_path: str | Path) -> bool:
+            try:
+                return self._resolve(user_path).is_file()
+            except Exception:
+                return False
+
+        def is_dir(self, user_path: str | Path) -> bool:
+            try:
+                return self._resolve(user_path).is_dir()
+            except Exception:
+                return False
+
+        def mkdir(self, user_path: str | Path, parents: bool = True, exist_ok: bool = True) -> str:
+            p = self._resolve(user_path)
+            p.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
+            return str(p)
+
+        def listdir(self, user_path: str | Path = ".", pattern: str | None = None, recursive: bool = False) -> list[str]:
+            base = self._resolve(user_path)
+            if not base.exists() or not base.is_dir():
+                return []
+            if pattern and recursive:
+                return [str(p) for p in base.rglob(pattern)]
+            if pattern:
+                return [str(p) for p in base.glob(pattern)]
+            return [str(p) for p in base.iterdir()]
+
+        def glob(self, pattern: str) -> list[str]:
+            # safe mode: glob is relative to root
+            if self._allow_unsafe() and ("\\" in pattern or ":" in pattern or pattern.startswith("/")):
+                return [str(Path(p)) for p in glob.glob(pattern, recursive=True)]
+            base = self._root()
+            return [str(Path(p)) for p in glob.glob(str((base / pattern).resolve()), recursive=True)]
+
+        def read_text(self, user_path: str | Path, encoding: str = "utf-8") -> str:
+            p = self._resolve(user_path)
+            return p.read_text(encoding=encoding)
+
+        def write_text(self, user_path: str | Path, content: str, encoding: str = "utf-8", append: bool = False) -> str:
+            p = self._resolve(user_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if append else "w"
+            with open(p, mode, encoding=encoding) as f:
+                f.write(str(content))
+            return str(p)
+
+        def read_bytes(self, user_path: str | Path) -> bytes:
+            p = self._resolve(user_path)
+            return p.read_bytes()
+
+        def write_bytes(self, user_path: str | Path, content: bytes, append: bool = False) -> str:
+            p = self._resolve(user_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            mode = "ab" if append else "wb"
+            with open(p, mode) as f:
+                f.write(content)
+            return str(p)
+
+        def copy(self, src: str | Path, dst: str | Path, overwrite: bool = True) -> str:
+            s = self._resolve(src)
+            d = self._resolve(dst)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            if d.exists() and not overwrite:
+                raise FileExistsError(str(d))
+            shutil.copy2(s, d)
+            return str(d)
+
+        def copytree(self, src: str | Path, dst: str | Path, overwrite: bool = True) -> str:
+            s = self._resolve(src)
+            d = self._resolve(dst)
+            if d.exists() and overwrite:
+                shutil.rmtree(d)
+            shutil.copytree(s, d)
+            return str(d)
+
+        def move(self, src: str | Path, dst: str | Path, overwrite: bool = True) -> str:
+            s = self._resolve(src)
+            d = self._resolve(dst)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            if d.exists() and overwrite:
+                if d.is_dir():
+                    shutil.rmtree(d)
+                else:
+                    d.unlink(missing_ok=True)
+            return str(Path(shutil.move(str(s), str(d))))
+
+        def remove(self, user_path: str | Path, missing_ok: bool = True) -> bool:
+            p = self._resolve(user_path)
+            if not p.exists():
+                return bool(missing_ok)
+            if p.is_dir():
+                shutil.rmtree(p)
+                return True
+            p.unlink(missing_ok=bool(missing_ok))
+            return True
+
+        def delete(self, user_path: str | Path, missing_ok: bool = True, recursive: bool = False) -> bool:
+            """Delete a file (or optionally a directory).
+
+            - Safe mode restrictions apply via _resolve().
+            - By default, directories are NOT deleted unless recursive=True.
+            """
+
+            p = self._resolve(user_path)
+            if not p.exists():
+                return bool(missing_ok)
+            if p.is_dir():
+                if not bool(recursive):
+                    raise IsADirectoryError(str(p))
+                shutil.rmtree(p)
+                return True
+            p.unlink(missing_ok=bool(missing_ok))
+            return True
+
+        def open(self, user_path: str | Path) -> str:
+            """Open a file/folder using the OS default application.
+
+            Security note:
+            - Safe mode: only allows opening common document/media types (and directories).
+              Executable/script types require unsafe mode.
+            """
+
+            p = self._resolve(user_path)
+            if not p.exists():
+                raise FileNotFoundError(str(p))
+
+            if not self._allow_unsafe() and p.is_file():
+                ext = p.suffix.lower()
+                # deny potentially executable/script types in safe mode
+                if ext in {".exe", ".bat", ".cmd", ".com", ".ps1", ".vbs", ".js", ".msi", ".lnk"}:
+                    raise PermissionError("Opening executable/script files is not allowed in safe mode")
+
+                # allow common docs/media; other extensions require unsafe mode
+                allowed = {
+                    ".txt",
+                    ".md",
+                    ".log",
+                    ".json",
+                    ".yaml",
+                    ".yml",
+                    ".csv",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".gif",
+                    ".bmp",
+                    ".wav",
+                    ".mp3",
+                    ".ogg",
+                    ".flac",
+                    ".mp4",
+                    ".webm",
+                    ".pdf",
+                }
+                if ext and ext not in allowed:
+                    raise PermissionError("File type not allowed to open in safe mode")
+
+            # Fire-and-forget open
+            if sys.platform.startswith("win"):
+                os.startfile(str(p))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+            return str(p)
+
+    class _FunctionUIAPI:
+        def __init__(self, runtime: "VNGameRuntime"):
+            self._rt = runtime
+
+        def _resolve_media_path(self, path_str: str) -> Path:
+            p = Path(str(path_str or ""))
+            allow_unsafe = bool(getattr(self._rt, "_allow_unsafe_function_scripts", False))
+            if allow_unsafe:
+                if p.is_absolute():
+                    return p.resolve()
+                return (getattr(self._rt, "_project_dir", Path.cwd()) / p).resolve()
+
+            if p.is_absolute():
+                raise PermissionError("Absolute path not allowed in safe mode")
+            root = Path(getattr(self._rt, "_function_fs_root", getattr(self._rt, "_project_dir", Path.cwd()))).resolve()
+            resolved = (root / p).resolve()
+            try:
+                resolved.relative_to(root)
+            except Exception:
+                raise PermissionError("Path escapes function_script_fs_root")
+            return resolved
+
+        def toast(self, text: str, duration: float = 2.0) -> None:
+            msg = str(text or "")
+            dur = max(0.2, float(duration))
+            self._rt._enqueue_main_thread_action(lambda: self._rt._script_toasts.append({"text": msg, "remaining": dur}))
+
+        def alert(self, text: str, title: str = "提示") -> None:
+            msg = str(text or "")
+            ttl = str(title or "提示")
+            self._rt._enqueue_main_thread_action(lambda: setattr(self._rt, "_script_modal_message", {"text": msg, "title": ttl}))
+
+        def close_alert(self) -> None:
+            self._rt._enqueue_main_thread_action(lambda: setattr(self._rt, "_script_modal_message", None))
+
+        def set_cursor(self, style: str, lock: bool = False) -> None:
+            s = str(style or "arrow")
+
+            def _apply():
+                if lock:
+                    setattr(self._rt, "_script_cursor_lock_style", s)
+                self._rt._set_system_cursor(s)
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def clear_cursor_lock(self) -> None:
+            self._rt._enqueue_main_thread_action(lambda: setattr(self._rt, "_script_cursor_lock_style", None))
+
+        def show_image(
+            self,
+            path: str,
+            x: int,
+            y: int,
+            width: int,
+            height: int,
+            duration: float = 0.0,
+            *,
+            key: str | None = None,
+            alpha: int = 255,
+            z: float = 1000.0,
+        ) -> str:
+            """Show a top-most overlay image in render-surface coordinates.
+
+            - duration <= 0: persistent until hide_image/clear_images
+            """
+
+            try:
+                if key is None:
+                    kid = int(getattr(self._rt, "_script_image_next_id", 1))
+                    setattr(self._rt, "_script_image_next_id", kid + 1)
+                    key = f"img_{kid}"
+            except Exception:
+                key = key or "img"
+
+            s = str(path or "")
+            xi, yi = int(x), int(y)
+            w = int(width)
+            h = int(height)
+            dur = float(duration or 0.0)
+            a = max(0, min(255, int(alpha)))
+            zz = float(z)
+
+            def _apply():
+                try:
+                    abs_path = self._resolve_media_path(s)
+                except Exception:
+                    return
+                if not abs_path.exists():
+                    return
+                try:
+                    img = None
+                    cache_key = (str(abs_path), max(1, w), max(1, h), a)
+                    if w > 0 and h > 0:
+                        img = self._rt._script_image_cache.get(cache_key)
+                    if img is None:
+                        base = pygame.image.load(str(abs_path)).convert_alpha()
+                        if w > 0 and h > 0:
+                            base = pygame.transform.smoothscale(base, (max(1, w), max(1, h)))
+                        if a < 255:
+                            base.set_alpha(a)
+                        img = base
+                        if w > 0 and h > 0:
+                            self._rt._script_image_cache[cache_key] = img
+                except Exception:
+                    return
+
+                ww = img.get_width() if w <= 0 else max(1, w)
+                hh = img.get_height() if h <= 0 else max(1, h)
+                rect = pygame.Rect(int(xi), int(yi), int(ww), int(hh))
+                rem = None if dur <= 0.0 else max(0.001, float(dur))
+                self._rt._script_images[str(key)] = {"surface": img, "rect": rect, "remaining": rem, "z": zz}
+
+            self._rt._enqueue_main_thread_action(_apply)
+            return str(key)
+
+        def hide_image(self, key: str) -> None:
+            k = str(key or "")
+            if not k:
+                return
+            self._rt._enqueue_main_thread_action(lambda: self._rt._script_images.pop(k, None))
+
+        def clear_images(self) -> None:
+            self._rt._enqueue_main_thread_action(lambda: setattr(self._rt, "_script_images", {}))
+
+        def lock_input(self, seconds: float) -> None:
+            dur = max(0.0, float(seconds or 0.0))
+
+            def _apply():
+                self._rt._script_input_lock_remaining = dur if dur > 0.0 else None
+                self._rt._script_input_lock_until_expr = None
+                self._rt._script_input_lock_until_timeout = None
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def lock_input_until(self, expr: str, timeout: float = 0.0) -> None:
+            e = str(expr or "").strip()
+            t = max(0.0, float(timeout or 0.0))
+
+            def _apply():
+                self._rt._script_input_lock_remaining = None
+                self._rt._script_input_lock_until_expr = e if e else None
+                self._rt._script_input_lock_until_timeout = t if t > 0.0 else None
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def unlock_input(self) -> None:
+            def _apply():
+                self._rt._script_input_lock_remaining = None
+                self._rt._script_input_lock_until_expr = None
+                self._rt._script_input_lock_until_timeout = None
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def is_input_locked(self) -> bool:
+            return bool(self._rt._is_script_input_locked())
+
+        def toggle_fullscreen(self) -> None:
+            self._rt._enqueue_main_thread_action(self._rt.toggle_fullscreen)
+
+        def set_fullscreen(self, enabled: bool = True) -> None:
+            want = bool(enabled)
+
+            def _apply():
+                cur = bool(getattr(self._rt, "is_fullscreen", False))
+                if cur != want:
+                    self._rt.toggle_fullscreen()
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def is_fullscreen(self) -> bool:
+            return bool(getattr(self._rt, "is_fullscreen", False))
+
+    class _FunctionFXAPI:
+        def __init__(self, runtime: "VNGameRuntime"):
+            self._rt = runtime
+
+        def shake(self, duration: float = 0.25, strength: float = 6.0, decay: bool = True) -> None:
+            dur = max(0.01, float(duration))
+            amp = max(0.0, float(strength))
+
+            def _apply():
+                self._rt._script_shake = {
+                    "duration": dur,
+                    "remaining": dur,
+                    "strength": amp,
+                    "decay": bool(decay),
+                }
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def flash(self, color=(255, 255, 255), duration: float = 0.18, alpha: int = 180) -> None:
+            dur = max(0.01, float(duration))
+            try:
+                c = (int(color[0]), int(color[1]), int(color[2]))
+            except Exception:
+                c = (255, 255, 255)
+            a = max(0, min(255, int(alpha)))
+
+            def _apply():
+                self._rt._script_flash = {
+                    "color": c,
+                    "duration": dur,
+                    "remaining": dur,
+                    "alpha": a,
+                }
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+    class _FunctionAudioAPI:
+        def __init__(self, runtime: "VNGameRuntime"):
+            self._rt = runtime
+
+        def _resolve_media_path(self, path_str: str) -> Path:
+            p = Path(str(path_str or ""))
+            allow_unsafe = bool(getattr(self._rt, "_allow_unsafe_function_scripts", False))
+            if allow_unsafe:
+                if p.is_absolute():
+                    return p.resolve()
+                return (getattr(self._rt, "_project_dir", Path.cwd()) / p).resolve()
+
+            # safe mode: forbid absolute and restrict to function_fs_root
+            if p.is_absolute():
+                raise PermissionError("Absolute path not allowed in safe mode")
+            root = Path(getattr(self._rt, "_function_fs_root", getattr(self._rt, "_project_dir", Path.cwd()))).resolve()
+            resolved = (root / p).resolve()
+            try:
+                resolved.relative_to(root)
+            except Exception:
+                raise PermissionError("Path escapes function_script_fs_root")
+            return resolved
+
+        def play_sfx(self, path: str, delay: float = 0.0) -> None:
+            s = str(path or "")
+            d = max(0.0, float(delay))
+
+            def _apply():
+                try:
+                    abs_path = self._resolve_media_path(s)
+                except Exception:
+                    return
+                if not abs_path.exists():
+                    return
+                if d <= 0.0:
+                    self._rt._ensure_sfx(str(abs_path))
+                else:
+                    self._rt._pending_sfx_path = abs_path
+                    self._rt._pending_sfx_delay = d
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def stop_sfx(self) -> None:
+            self._rt._enqueue_main_thread_action(self._rt._stop_sfx_playback)
+
+        def play_bgm(self, path: str, loop: bool = True, fade: bool = False) -> None:
+            s = str(path or "")
+
+            def _apply():
+                try:
+                    abs_path = self._resolve_media_path(s)
+                except Exception:
+                    return
+                if not abs_path.exists():
+                    return
+                self._rt._ensure_bgm(str(abs_path), loop=bool(loop), fade=bool(fade))
+
+            self._rt._enqueue_main_thread_action(_apply)
+
+        def stop_bgm(self) -> None:
+            self._rt._enqueue_main_thread_action(self._rt._stop_bgm)
+
+    class _FunctionTimeAPI:
+        def __init__(self, runtime: "VNGameRuntime", host_node_id):
+            self._rt = runtime
+            self._host_node_id = host_node_id
+
+        def set_timeout(self, seconds: float, script: str) -> int:
+            return int(self._rt._create_script_timer(float(seconds), str(script or ""), interval=0.0, repeat=0, host_node_id=self._host_node_id))
+
+        def set_interval(self, seconds: float, script: str, repeat: int = -1) -> int:
+            sec = max(0.001, float(seconds))
+            rep = int(repeat)
+            return int(self._rt._create_script_timer(sec, str(script or ""), interval=sec, repeat=rep, host_node_id=self._host_node_id))
+
+        def clear_timer(self, timer_id: int) -> bool:
+            return bool(self._rt._clear_script_timer(int(timer_id)))
+
+    def _trigger_function_nodes_for_host(self, host_node_id, host_entry: dict | None):
+        fn_nodes = self._function_nodes_by_host.get(host_node_id) or []
+        if not fn_nodes:
+            return
+
+        entry_snapshot = dict(host_entry) if isinstance(host_entry, dict) else {}
+        vars_snapshot = dict(self.variables) if isinstance(getattr(self, "variables", None), dict) else {}
+
+        t = threading.Thread(
+            target=self._execute_function_nodes_worker,
+            args=(host_node_id, entry_snapshot, vars_snapshot, list(fn_nodes)),
+            daemon=True,
+        )
+        t.start()
+
+    def _execute_function_nodes_worker(self, host_node_id, entry_snapshot: dict, vars_snapshot: dict, fn_nodes: list[dict]):
+        for fn in fn_nodes:
+            if not isinstance(fn, dict):
+                continue
+            rules = fn.get("rules")
+            if not isinstance(rules, list):
+                continue
+            api = VNGameRuntime._FunctionScriptAPI(self, host_node_id, fn)
+            for idx, rule in enumerate(rules):
+                if not isinstance(rule, dict):
+                    continue
+                if not bool(rule.get("enabled", True)):
+                    continue
+                cond = str(rule.get("condition", rule.get("when", "")) or "")
+                action = str(rule.get("action", rule.get("script", "")) or "")
+                if not action.strip():
+                    continue
+
+                try:
+                    if cond.strip():
+                        ok = bool(self._eval_function_script_expr(cond, api, entry_snapshot, vars_snapshot, fn, idx))
+                        if not ok:
+                            continue
+                    self._exec_function_script(action, api, entry_snapshot, vars_snapshot, fn, idx)
+                except Exception as exc:
+                    api.log(f"规则执行异常: {exc}")
+
+    def _build_function_script_env(self, api, entry_snapshot: dict, vars_snapshot: dict, fn_node: dict, rule_index: int):
+        allow_unsafe = bool(getattr(self, "_allow_unsafe_function_scripts", False))
+
+        def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if allow_unsafe:
+                return builtins.__import__(name, globals, locals, fromlist, level)
+            root = str(name).split(".")[0]
+            if root in {"math", "random", "re", "time"}:
+                return builtins.__import__(name, globals, locals, fromlist, level)
+            raise ImportError(f"Import not allowed: {name}")
+
+        if allow_unsafe:
+            globals_dict = {"__builtins__": builtins.__dict__}
+        else:
+            safe_builtins = {
+                "True": True,
+                "False": False,
+                "None": None,
+                "len": len,
+                "min": min,
+                "max": max,
+                "range": range,
+                "int": int,
+                "float": float,
+                "str": str,
+                "bool": bool,
+                "dict": dict,
+                "list": list,
+                "tuple": tuple,
+                "set": set,
+                "abs": abs,
+                "sum": sum,
+                "__import__": safe_import,
+            }
+            globals_dict = {"__builtins__": safe_builtins}
+
+        locals_dict = {
+            "engine": api,
+            "entry": dict(entry_snapshot) if isinstance(entry_snapshot, dict) else {},
+            "vars": dict(vars_snapshot) if isinstance(vars_snapshot, dict) else {},
+            "host_node_id": api.host_node_id,
+            "function_node": dict(fn_node) if isinstance(fn_node, dict) else {},
+            "rule_index": int(rule_index),
+        }
+        return globals_dict, locals_dict
+
+    def _eval_function_script_expr(self, expr: str, api, entry_snapshot: dict, vars_snapshot: dict, fn_node: dict, rule_index: int):
+        g, l = self._build_function_script_env(api, entry_snapshot, vars_snapshot, fn_node, rule_index)
+        # Allow multiline expressions from the Designer UI:
+        # treat line breaks as spaces to avoid SyntaxError in eval mode.
+        expr_norm = " ".join(str(expr or "").splitlines())
+        code = compile(expr_norm, "<function-node-condition>", "eval")
+        return eval(code, g, l)
+
+    def _exec_function_script(self, script: str, api, entry_snapshot: dict, vars_snapshot: dict, fn_node: dict, rule_index: int):
+        g, l = self._build_function_script_env(api, entry_snapshot, vars_snapshot, fn_node, rule_index)
+        code = compile(script, "<function-node-action>", "exec")
+        exec(code, g, l)
+
     def _advance_to_next_in_graph(self):
         if self.current_node_id is None:
             return
@@ -3165,6 +5344,8 @@ class VNGameRuntime:
         self._choice_overlay = False
         self._choice_options = []
         self._choice_targets = []
+        self._choice_timeout_remaining = None
+        self._choice_default_index = -1
         target = self._choose_next_branch(next_nodes)
         if target not in self.nodes_map:
             print("分支目标不存在，无法继续。")
@@ -3192,6 +5373,16 @@ class VNGameRuntime:
         self._choice_options = options
         self._choice_targets = targets
         self._choice_overlay = True
+        self._choice_selected = -1
+        self._choice_button_hitboxes = [None] * len(self._choice_options)
+
+        timeout_norm, default_idx = normalize_choice_timeout_config(entry if isinstance(entry, dict) else {}, len(self._choice_options))
+        self._choice_default_index = default_idx
+        # only start timer when both timeout + default are valid
+        if timeout_norm is not None and default_idx >= 0:
+            self._choice_timeout_remaining = float(timeout_norm)
+        else:
+            self._choice_timeout_remaining = None
 
     def _apply_choice(self, idx: int):
         if not self._choice_overlay:
@@ -3202,6 +5393,10 @@ class VNGameRuntime:
         self._choice_overlay = False
         self._choice_options = []
         self._choice_targets = []
+        self._choice_timeout_remaining = None
+        self._choice_default_index = -1
+        self._choice_selected = -1
+        self._choice_button_hitboxes = []
         self.variables["last_choice"] = idx
         if target not in self.nodes_map:
             print("选择目标不存在，结束剧情。")
@@ -3217,60 +5412,77 @@ class VNGameRuntime:
         if not targets:
             self._advance_to_next_in_graph()
             return
-        var_name = (entry.get("condition_var") or "").strip()
-        value_token = entry.get("condition_value")
-        op = entry.get("condition_op", "==")
-        is_const = bool(entry.get("condition_const", False))
-        chosen = None
 
-        def _as_float(val):
-            try:
-                return float(val)
-            except Exception:
-                return None
-
-        if var_name and targets:
-            left_val = self.variables.get(var_name)
-            right_val = value_token if is_const else self.variables.get(str(value_token), 0.0)
-            lf = _as_float(left_val)
-            rf = _as_float(right_val)
-            if lf is not None and rf is not None:
-                l_cmp, r_cmp = lf, rf
-            else:
-                l_cmp, r_cmp = str(left_val), str(right_val)
-
-            result = False
-            if op == "==":
-                result = l_cmp == r_cmp
-            elif op == "!=":
-                result = l_cmp != r_cmp
-            elif op == ">":
-                result = l_cmp > r_cmp
-            elif op == ">=":
-                result = l_cmp >= r_cmp
-            elif op == "<":
-                result = l_cmp < r_cmp
-            elif op == "<=":
-                result = l_cmp <= r_cmp
-
-            if result:
-                chosen = targets[0] if targets else None
-            elif len(targets) > 1:
-                chosen = targets[1]
-
-        if chosen is None and targets:
-            chosen = self._choose_next_branch(targets)
-        if chosen is None:
-            print("条件节点无有效分支，结束剧情。")
+        # New: rules list (ordered). Rule i maps to outgoing edge i; last edge is the default-else branch.
+        rules = entry.get("condition_rules")
+        if not (isinstance(rules, list) and rules):
+            # Strict mode: legacy single-condition fields are NOT supported.
+            # If a condition node has no rules, treat the last outgoing edge as the default-else.
+            chosen = targets[-1] if targets else None
+            if chosen is None and targets:
+                chosen = self._choose_next_branch(targets)
+            if chosen is None:
+                print("条件节点无有效分支，结束剧情。")
+                return
+            if chosen not in self.nodes_map:
+                print("条件分支目标不存在，无法继续。")
+                return
+            self.current_node_id = chosen
+            self._sub_index = 0
+            self._voice_played_index = None
+            self._on_enter_node()
+            self._reset_typing_state()
             return
-        if chosen not in self.nodes_map:
-            print("条件分支目标不存在，无法继续。")
+
+        if isinstance(rules, list) and rules:
+            chosen = None
+
+            def _eval_rule(rule_obj: dict) -> bool:
+                if not isinstance(rule_obj, dict):
+                    return False
+                logic = str(rule_obj.get("logic") or "and").strip().lower()
+                if logic not in {"and", "or"}:
+                    logic = "and"
+                exprs = rule_obj.get("exprs")
+                if isinstance(exprs, str):
+                    expr_list = [line.strip() for line in exprs.splitlines() if line.strip()]
+                elif isinstance(exprs, list):
+                    expr_list = [str(x).strip() for x in exprs if str(x).strip()]
+                else:
+                    expr_list = []
+                if not expr_list:
+                    return False
+                if logic == "and":
+                    return all(eval_var_expr(e, self.variables) for e in expr_list)
+                return any(eval_var_expr(e, self.variables) for e in expr_list)
+
+            matched = False
+            for idx, r in enumerate(rules[:50]):
+                if _eval_rule(r):
+                    matched = True
+                    if idx < len(targets):
+                        chosen = targets[idx]
+                    break
+
+            if not matched:
+                else_idx = len(rules)
+                if else_idx < len(targets):
+                    chosen = targets[else_idx]
+
+            if chosen is None and targets:
+                chosen = self._choose_next_branch(targets)
+            if chosen is None:
+                print("条件节点无有效分支，结束剧情。")
+                return
+            if chosen not in self.nodes_map:
+                print("条件分支目标不存在，无法继续。")
+                return
+            self.current_node_id = chosen
+            self._sub_index = 0
+            self._voice_played_index = None
+            self._on_enter_node()
+            self._reset_typing_state()
             return
-        self.current_node_id = chosen
-        self._sub_index = 0
-        self._voice_played_index = None
-        self._on_enter_node()
-        self._reset_typing_state()
 
     def _scale_to_fit(self, img: pygame.Surface, max_w: int, max_h: int) -> pygame.Surface:
         w, h = img.get_size()
@@ -3294,6 +5506,14 @@ class VNGameRuntime:
 
         x = (screen_w - scaled_w) // 2
         y = (screen_h - scaled_h) // 2
+
+        # apply script shake (render coords -> window coords)
+        try:
+            ox, oy = getattr(self, "_script_shake_offset", (0.0, 0.0))
+            x += int(round(float(ox) * float(scale)))
+            y += int(round(float(oy) * float(scale)))
+        except Exception:
+            pass
         self.screen.fill((0, 0, 0))
         self.screen.blit(blit_surface, (x, y))
 
@@ -3303,7 +5523,11 @@ class VNGameRuntime:
         nodes = flow.get("nodes") or []
         connections = flow.get("connections") or []
 
-        nodes_map = {n.get("id"): n for n in nodes if n.get("id") is not None}
+        nodes_map = {
+            n.get("id"): n
+            for n in nodes
+            if isinstance(n, dict) and n.get("id") is not None and str(n.get("node_type", "")).lower() != "function"
+        }
         if not nodes_map:
             return []
 
@@ -3342,10 +5566,6 @@ class VNGameRuntime:
             stop_bgm = bool(n.get("stop_bgm"))
             node_type = n.get("node_type", "text")
             options = n.get("options", [])
-            condition_var = n.get("condition_var", "")
-            condition_value = n.get("condition_value", "")
-            condition_op = n.get("condition_op", "==")
-            condition_const = bool(n.get("condition_const", False))
             var_ops = n.get("var_ops", [])
             sub_items = n.get("sub_dialogues") or []
             if node_type == "text" and sub_items:
@@ -3365,10 +5585,6 @@ class VNGameRuntime:
                         "stop_bgm": stop_bgm,
                         "node_type": node_type,
                         "options": options,
-                        "condition_var": condition_var,
-                        "condition_value": condition_value,
-                        "condition_op": condition_op,
-                        "condition_const": condition_const,
                         "var_ops": var_ops,
                         "video": video,
                         "video_loop": video_loop,
@@ -3393,10 +5609,6 @@ class VNGameRuntime:
                         "stop_bgm": stop_bgm,
                         "node_type": node_type,
                         "options": options,
-                        "condition_var": condition_var,
-                        "condition_value": condition_value,
-                        "condition_op": condition_op,
-                        "condition_const": condition_const,
                         "var_ops": var_ops,
                         "hide_textbox": False,
                         "portrait_fade": False,
@@ -3426,6 +5638,9 @@ class VNGameRuntime:
 
         # apply HUD button group config from UI layout (if any)
         self._apply_hud_buttons_from_ui_layout(layout)
+
+        # apply choice button group config from UI layout (if any)
+        self._apply_choice_buttons_from_ui_layout(layout)
 
         # apply function menu overlays config from UI layout (only if project config is absent)
         if not bool(getattr(self, "_function_menus_from_project", False)):
@@ -3517,11 +5732,113 @@ class VNGameRuntime:
         if len(self._history) > 10:
             self._history = self._history[-10:]
 
-    def _load_font(self, size: int, bold: bool = False):
+    def _load_font(self, size: int, bold: bool = False, family: str | None = None, font_path: str | None = None):
+        # Prefer font file if provided
         try:
-            return pygame.font.SysFont("SimHei", size, bold=bold)
+            fp = (font_path or "").strip()
+            if fp:
+                abs_path = self._resolve_path(fp)
+                if abs_path.exists():
+                    f = pygame.font.Font(str(abs_path), size)
+                    try:
+                        f.set_bold(bool(bold))
+                    except Exception:
+                        pass
+                    return f
+        except Exception:
+            pass
+
+        # Fallback to system font family (try to resolve a real font file first).
+        try:
+            preferred = [str(family or "").strip(), "Microsoft YaHei", "SimHei", "SimSun", "NSimSun", "Arial Unicode MS", "Noto Sans CJK SC", "Source Han Sans SC"]
+            for fam in preferred:
+                if not fam:
+                    continue
+                try:
+                    fp2 = pygame.font.match_font(fam)
+                except Exception:
+                    fp2 = None
+                if fp2:
+                    f2 = pygame.font.Font(fp2, size)
+                    try:
+                        f2.set_bold(bool(bold))
+                    except Exception:
+                        pass
+                    return f2
+        except Exception:
+            pass
+
+        # Last resort
+        try:
+            fam = (family or "SimHei")
+            return pygame.font.SysFont(fam, size, bold=bold)
         except Exception:
             return pygame.font.Font(None, size)
+
+    def _default_text_styles(self) -> dict:
+        return {
+            "dialogue": {
+                "font_family": "SimHei",
+                "font_path": "",
+                "size": 22,
+                "color": [235, 235, 240],
+                "bold": False,
+                "outline_color": [0, 0, 0],
+                "outline_width": 0,
+            },
+            "name": {
+                "font_family": "SimHei",
+                "font_path": "",
+                "size": 24,
+                "color": [220, 220, 220],
+                "bold": True,
+                "outline_color": [0, 0, 0],
+                "outline_width": 0,
+            },
+        }
+
+    def _coerce_rgb(self, val, default_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+        if isinstance(val, (list, tuple)) and len(val) >= 3:
+            try:
+                r, g, b = int(val[0]), int(val[1]), int(val[2])
+                return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+            except Exception:
+                return default_rgb
+        return default_rgb
+
+    def _apply_text_style_config(self, cfg: dict):
+        styles = {}
+        try:
+            styles = (cfg or {}).get("text_styles", {})
+        except Exception:
+            styles = {}
+        if not isinstance(styles, dict):
+            styles = {}
+        dlg_style, name_style, dlg_font, name_font = self._compute_text_styles_from_text_styles(styles)
+        self._dialogue_style = dlg_style
+        self._name_style = name_style
+        self.font = dlg_font
+        self.name_font = name_font
+
+    def _render_text_surface(self, text: str, font, color, outline_width: int = 0, outline_color=(0, 0, 0)):
+        try:
+            ow = max(0, int(outline_width))
+        except Exception:
+            ow = 0
+        if ow <= 0:
+            return font.render(str(text), True, color)
+        base = font.render(str(text), True, color)
+        outline = font.render(str(text), True, outline_color)
+        w = base.get_width() + ow * 2
+        h = base.get_height() + ow * 2
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        for dx in range(-ow, ow + 1):
+            for dy in range(-ow, ow + 1):
+                if dx * dx + dy * dy > ow * ow:
+                    continue
+                surf.blit(outline, (ow + dx, ow + dy))
+        surf.blit(base, (ow, ow))
+        return surf
 
     def toggle_fullscreen(self):
         """Toggle fullscreen mode with F11."""
@@ -3609,13 +5926,19 @@ class VNGameRuntime:
         self._pending_voice_delay = max(0.0, delay)
 
     def _process_pending_audio(self, dt: float):
-        if not self._pending_voice_path:
-            return
-        self._pending_voice_delay -= dt
-        if self._pending_voice_delay <= 0:
-            self._ensure_voice(str(self._pending_voice_path))
-            self._pending_voice_path = None
-            self._pending_voice_delay = 0.0
+        if self._pending_voice_path:
+            self._pending_voice_delay -= dt
+            if self._pending_voice_delay <= 0:
+                self._ensure_voice(str(self._pending_voice_path))
+                self._pending_voice_path = None
+                self._pending_voice_delay = 0.0
+
+        if self._pending_sfx_path:
+            self._pending_sfx_delay -= dt
+            if self._pending_sfx_delay <= 0:
+                self._ensure_sfx(str(self._pending_sfx_path))
+                self._pending_sfx_path = None
+                self._pending_sfx_delay = 0.0
 
     def _stop_bgm(self):
         """Stop current BGM playback and clear state."""
@@ -3637,13 +5960,151 @@ class VNGameRuntime:
             pass
         self._voice_channel = None
 
+    def _stop_sfx_playback(self):
+        """Stop any playing sfx and clear pending schedule."""
+        self._pending_sfx_path = None
+        self._pending_sfx_delay = 0.0
+        try:
+            if self._sfx_channel and self._sfx_channel.get_busy():
+                self._sfx_channel.stop()
+        except Exception:
+            pass
+        self._sfx_channel = None
+
+    def _ensure_sfx(self, sfx_path: str):
+        if not sfx_path:
+            return
+        abs_path = self._resolve_path(sfx_path)
+        if not abs_path.exists():
+            return
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            if abs_path not in self._sfx_cache:
+                self._sfx_cache[abs_path] = pygame.mixer.Sound(str(abs_path))
+            sound = self._sfx_cache[abs_path]
+            if self._sfx_channel and self._sfx_channel.get_busy():
+                self._sfx_channel.stop()
+            master = float(self._settings.get("master_volume", 1.0))
+            sfx_vol = float(self._settings.get("sfx_volume", 1.0))
+            volume = max(0.0, min(1.0, master * sfx_vol))
+            sound.set_volume(volume)
+            self._sfx_channel = sound.play()
+        except Exception:
+            pass
+
+    def _schedule_sfx(self, sfx_path: str, delay: float = 0.05):
+        if not sfx_path:
+            self._pending_sfx_path = None
+            self._pending_sfx_delay = 0.0
+            return
+        abs_path = self._resolve_path(sfx_path)
+        if not abs_path.exists():
+            self._pending_sfx_path = None
+            self._pending_sfx_delay = 0.0
+            return
+        self._pending_sfx_path = abs_path
+        self._pending_sfx_delay = max(0.0, delay)
+
+    def _effective_text_style_for_entry(self, entry: dict) -> tuple[dict, dict, object, object]:
+        """Return (dialogue_style, name_style, dialogue_font, name_font) for current entry.
+
+        Entry may opt-in to override via:
+        - text_style_enabled: bool
+        - text_styles: {dialogue:{...}, name:{...}}
+        """
+        try:
+            if isinstance(entry, dict) and bool(entry.get("text_style_enabled", False)) and isinstance(entry.get("text_styles"), dict):
+                key = json.dumps(entry.get("text_styles") or {}, ensure_ascii=False, sort_keys=True)
+                cached = self._entry_text_style_cache.get(key)
+                if cached:
+                    return cached
+                dlg_style, name_style, dlg_font, name_font = self._compute_text_styles_from_text_styles(entry.get("text_styles") or {})
+                self._entry_text_style_cache[key] = (dlg_style, name_style, dlg_font, name_font)
+                return self._entry_text_style_cache[key]
+        except Exception:
+            pass
+        return (self._dialogue_style, self._name_style, self.font, self.name_font)
+
+    def _compute_text_styles_from_text_styles(self, text_styles: dict) -> tuple[dict, dict, object, object]:
+        styles = text_styles if isinstance(text_styles, dict) else {}
+        defaults = self._default_text_styles()
+
+        dlg = defaults["dialogue"].copy()
+        nm = defaults["name"].copy()
+        try:
+            if isinstance(styles.get("dialogue"), dict):
+                dlg.update(styles.get("dialogue") or {})
+            if isinstance(styles.get("name"), dict):
+                nm.update(styles.get("name") or {})
+        except Exception:
+            pass
+
+        dlg_family = str(dlg.get("font_family") or defaults["dialogue"]["font_family"])
+        nm_family = str(nm.get("font_family") or defaults["name"]["font_family"])
+        dlg_font_path = str(dlg.get("font_path") or "").strip()
+        nm_font_path = str(nm.get("font_path") or "").strip()
+        try:
+            dlg_size = int(dlg.get("size") or defaults["dialogue"]["size"])
+        except Exception:
+            dlg_size = int(defaults["dialogue"]["size"])
+        try:
+            nm_size = int(nm.get("size") or defaults["name"]["size"])
+        except Exception:
+            nm_size = int(defaults["name"]["size"])
+        dlg_size = max(8, min(120, dlg_size))
+        nm_size = max(8, min(120, nm_size))
+
+        dlg_bold = bool(dlg.get("bold", defaults["dialogue"]["bold"]))
+        nm_bold = bool(nm.get("bold", defaults["name"]["bold"]))
+
+        dlg_color = self._coerce_rgb(dlg.get("color"), (235, 235, 240))
+        nm_color = self._coerce_rgb(nm.get("color"), (220, 220, 220))
+        dlg_outline_color = self._coerce_rgb(dlg.get("outline_color"), (0, 0, 0))
+        nm_outline_color = self._coerce_rgb(nm.get("outline_color"), (0, 0, 0))
+        try:
+            dlg_ow = int(dlg.get("outline_width") or 0)
+        except Exception:
+            dlg_ow = 0
+        try:
+            nm_ow = int(nm.get("outline_width") or 0)
+        except Exception:
+            nm_ow = 0
+        dlg_ow = max(0, min(20, dlg_ow))
+        nm_ow = max(0, min(20, nm_ow))
+
+        dlg_style = {
+            "font_family": dlg_family,
+            "font_path": dlg_font_path,
+            "size": dlg_size,
+            "bold": dlg_bold,
+            "color": dlg_color,
+            "outline_color": dlg_outline_color,
+            "outline_width": dlg_ow,
+        }
+        name_style = {
+            "font_family": nm_family,
+            "font_path": nm_font_path,
+            "size": nm_size,
+            "bold": nm_bold,
+            "color": nm_color,
+            "outline_color": nm_outline_color,
+            "outline_width": nm_ow,
+        }
+        dlg_font = self._load_font(dlg_size, bold=dlg_bold, family=dlg_family, font_path=dlg_font_path)
+        name_font = self._load_font(nm_size, bold=nm_bold, family=nm_family, font_path=nm_font_path)
+        return dlg_style, name_style, dlg_font, name_font
+
     def save_game(self, slot: int = 1):
         try:
             self.save_dir.mkdir(parents=True, exist_ok=True)
+            self._update_persistent_from_runtime()
+            self._save_persistent_vars()
             save_data = {
                 "current_index": self.current_index,
                 "current_node_id": self.current_node_id,
                 "graph_mode": self.graph_mode,
+                "sub_index": int(getattr(self, "_sub_index", 0) or 0),
                 "variables": self.variables,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "branch_strategy": self.branch_strategy,
@@ -3653,24 +6114,234 @@ class VNGameRuntime:
             save_path = slot_file_path(self.save_dir, slot)
             with open(save_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(save_data, f, allow_unicode=True)
+
+            # 保存缩略图（尽量不影响存档流程，失败不阻断）
+            try:
+                self._save_slot_thumbnail(int(slot))
+            except Exception:
+                pass
+
             print(f"存档完成：{save_path}")
         except Exception as exc:
             print(f"存档失败: {exc}")
 
-    def load_game(self, slot: int = 1):
+    def _capture_scene_only_surface_for_thumbnail(self, dt: float = 0.0) -> pygame.Surface | None:
+        """Render a UI-free scene snapshot for save thumbnails.
+
+        Intentionally excludes textbox UI, HUD buttons, and all overlays (save/load/settings/help/history/choice/etc).
+        """
+
+        entry = self._current_entry()
+        if not entry:
+            return None
+
         try:
-            save_path = slot_file_path(self.save_dir, slot)
-            if not save_path.exists():
-                print("未找到存档文件")
-                return
+            w, h = int(self.render_size[0]), int(self.render_size[1])
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+
+        try:
+            dst = pygame.Surface((w, h))
+        except Exception:
+            return None
+
+        old_surface = getattr(self, "render_surface", None)
+        try:
+            self.render_surface = dst
+
+            bg_path = entry.get("background") or ""
+            portrait_path = entry.get("portrait") or ""
+            portrait2_path = entry.get("portrait2") or ""
+            video_path = entry.get("video") or ""
+            bg_fade_duration = entry.get("bg_fade_duration", None)
+
+            portrait_fade = bool(entry.get("portrait_fade", False))
+            portrait_fade_duration = entry.get("portrait_fade_duration", None)
+            portrait2_fade = bool(entry.get("portrait2_fade", False))
+            portrait2_fade_duration = entry.get("portrait2_fade_duration", None)
+
+            # Draw video or background (match scene visuals, but skip UI/overlays)
+            if video_path:
+                try:
+                    self._update_video(video_path, bool(entry.get("video_loop", False)), float(dt))
+                except Exception:
+                    pass
+
+                if getattr(self, "_video_surface", None) is not None:
+                    self.render_surface.blit(self._video_surface, (0, 0))
+                else:
+                    if bg_path:
+                        try:
+                            self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)), duration=bg_fade_duration)
+                            self._render_background(float(dt))
+                        except Exception:
+                            self.render_surface.fill(self.bg_color)
+                    else:
+                        self.render_surface.fill(self.bg_color)
+            else:
+                try:
+                    if getattr(self, "_video_clip", None):
+                        self._stop_video()
+                except Exception:
+                    pass
+
+                try:
+                    self._update_background(bg_path, fade_in=bool(entry.get("bg_fade_in", False)), duration=bg_fade_duration)
+                    self._render_background(float(dt))
+                except Exception:
+                    self.render_surface.fill(self.bg_color)
+
+            # Draw portraits (character sprites)
+            try:
+                self._draw_portrait2(portrait2_path, portrait2_fade, float(dt), fade_in_duration=portrait2_fade_duration)
+                self._draw_portrait(portrait_path, portrait_fade, float(dt), fade_in_duration=portrait_fade_duration)
+            except Exception:
+                pass
+
+            return dst
+        finally:
+            self.render_surface = old_surface
+
+    def _save_slot_thumbnail(self, slot: int, *, max_width: int = 320) -> str:
+        """Capture a save thumbnail.
+
+        Prefer a UI-free scene snapshot, falling back to current render_surface on failure.
+        """
+
+        src = None
+        try:
+            src = self._capture_scene_only_surface_for_thumbnail()
+        except Exception:
+            src = None
+
+        if src is None:
+            try:
+                src = self.render_surface
+            except Exception:
+                return ""
+
+        if src is None:
+            return ""
+
+        w, h = int(src.get_width()), int(src.get_height())
+        if w <= 0 or h <= 0:
+            return ""
+
+        mw = max(64, int(max_width))
+        tw = min(mw, w)
+        th = max(1, int(round(tw * (h / float(w)))))
+
+        try:
+            thumb = pygame.transform.smoothscale(src, (int(tw), int(th)))
+        except Exception:
+            thumb = pygame.transform.scale(src, (int(tw), int(th)))
+
+        out_path = slot_thumbnail_path(self.save_dir, int(slot))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pygame.image.save(thumb, str(out_path))
+        return str(out_path)
+
+    def _load_slot_thumbnail_surface(self, slot: int, size: tuple[int, int]) -> pygame.Surface | None:
+        """Load & scale a slot thumbnail, with caching."""
+
+        p = slot_thumbnail_path(self.save_dir, int(slot))
+        if not p.exists():
+            return None
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+
+        tw, th = max(1, int(size[0])), max(1, int(size[1]))
+        key = (str(p), tw, th, mtime)
+        cached = self._slot_thumbnail_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            img = pygame.image.load(str(p)).convert()
+        except Exception:
+            return None
+
+        try:
+            scaled = pygame.transform.smoothscale(img, (tw, th))
+        except Exception:
+            scaled = pygame.transform.scale(img, (tw, th))
+
+        # 清理旧缓存（同 path+size 不同 mtime 的旧键）
+        try:
+            prefix = (str(p), tw, th)
+            for k in list(self._slot_thumbnail_cache.keys()):
+                if k[:3] == prefix and k != key:
+                    self._slot_thumbnail_cache.pop(k, None)
+        except Exception:
+            pass
+
+        self._slot_thumbnail_cache[key] = scaled
+        return scaled
+
+    def load_game(self, slot: int = 1):
+        save_path = slot_file_path(self.save_dir, slot)
+        if not save_path.exists():
+            print("未找到存档文件")
+            return
+
+        show_overlay = self._loading_overlay_enabled_for("load_save")
+        if show_overlay:
+            self._loading_begin("正在读取存档...", subtitle=f"槽位 {slot}")
+
+        try:
             self.fast_skip = False
             self._fast_skip_timer = 0.0
+            self._loading_progress(0.18, "读取存档文件...", subtitle=f"槽位 {slot}")
             with open(save_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
+            self._loading_progress(0.45, "恢复游戏状态...", subtitle=f"槽位 {slot}")
             self.branch_strategy = data.get("branch_strategy", self.branch_strategy)
-            self.variables = data.get("variables", {})
+            # protected vars do NOT rollback on load: ignore save values for protected names.
+            protected = getattr(self, "_protected_vars", set()) or set()
+            old_vars = dict(self.variables) if isinstance(self.variables, dict) else {}
+            saved_vars = data.get("variables", {})
+            self.variables = saved_vars if isinstance(saved_vars, dict) else {}
+            if protected:
+                init_map: dict[str, float] = {}
+                try:
+                    for item in (self._global_var_defs or []):
+                        if not isinstance(item, dict):
+                            continue
+                        n = item.get("name")
+                        if not n:
+                            continue
+                        try:
+                            init_map[str(n)] = float(item.get("initial", 0.0))
+                        except Exception:
+                            init_map[str(n)] = 0.0
+                except Exception:
+                    init_map = {}
+
+                for name in protected:
+                    # Prefer current runtime value (no rollback), then persistent, then initial.
+                    if name in old_vars:
+                        try:
+                            self.variables[name] = float(old_vars.get(name))
+                        except Exception:
+                            self.variables[name] = float(init_map.get(name, 0.0))
+                        continue
+                    if isinstance(self._persistent_vars, dict) and name in self._persistent_vars:
+                        try:
+                            self.variables[name] = float(self._persistent_vars.get(name))
+                        except Exception:
+                            self.variables[name] = float(init_map.get(name, 0.0))
+                        continue
+                    self.variables[name] = float(init_map.get(name, 0.0))
             self._history = []
             self._history_overlay = False
+            try:
+                self._sub_index = int(data.get("sub_index", 0) or 0)
+            except Exception:
+                self._sub_index = 0
             saved_graph = bool(data.get("graph_mode", False))
             if saved_graph and self.nodes_map:
                 node_id = data.get("current_node_id")
@@ -3680,6 +6351,20 @@ class VNGameRuntime:
                 self.graph_mode = True
                 self.current_node_id = node_id
                 self.current_index = 0
+
+                # clamp sub_index for text nodes with sub_dialogues; other nodes force 0
+                try:
+                    node = self.nodes_map.get(self.current_node_id, {}) or {}
+                    if str(node.get("node_type") or "").lower() == "text":
+                        subs = node.get("sub_dialogues") or []
+                        if isinstance(subs, list) and subs:
+                            self._sub_index = max(0, min(int(self._sub_index), len(subs) - 1))
+                        else:
+                            self._sub_index = 0
+                    else:
+                        self._sub_index = 0
+                except Exception:
+                    self._sub_index = 0
             else:
                 idx = int(data.get("current_index", 0))
                 if idx < 0 or idx >= len(self.dialogues):
@@ -3687,19 +6372,31 @@ class VNGameRuntime:
                     return
                 self.graph_mode = False
                 self.current_index = idx
+                self._sub_index = 0
             size_data = data.get("window_size")
             if isinstance(size_data, (list, tuple)) and len(size_data) == 2:
                 self.screen = pygame.display.set_mode(size_data)
                 self._apply_window_size(tuple(size_data))
             self._stop_bgm()
             self._voice_played_index = None
-            self._on_enter_node()
+            # 读档：恢复到当前节点/子对话位置时，不应重复执行 var_ops（变量处理）。
+            # 变量处理应只在“真实推进进入该 entry”时触发，而不是加载存档时重放。
+            self._on_enter_node(apply_var_ops=False)
             self._reset_typing_state()
+            self._update_persistent_from_runtime()
+            self._save_persistent_vars()
             print(f"读取存档完成：{save_path}")
             self.mode = "game"
             self._overlay_return_mode = None
+            self._loading_progress(1.0, "读取存档完成", subtitle=f"槽位 {slot}")
         except Exception as exc:
             print(f"读档失败: {exc}")
+        finally:
+            if show_overlay:
+                try:
+                    self._loading_end()
+                except Exception:
+                    pass
 
     def _build_summary(self) -> str:
         entry = self._current_entry() or {"speaker": "", "content": ""}
@@ -3899,11 +6596,17 @@ class VNGameRuntime:
             ah = max(20, ah)
 
             key_name = self._help_hotkey_name or "F1"
+            ps = self._active_slot_page_size("save")
+            if ps == 10:
+                slot_hint = f"↑/↓ 翻页（每页{ps}个） | 数字 0-9 选择槽位（0=第10个）"
+            else:
+                slot_hint = f"↑/↓ 翻页（每页{ps}个） | 数字 1-{ps} 选择槽位"
             base_lines = [
                 "基础：左键/Space/Enter 下一句",
                 "ESC 返回主菜单（会二次确认，并自动存档）",
                 "F5 打开保存  |  F9 打开读取  |  F10 设置",
-                "↑/↓ 翻页（每页10个） | 数字 0-9 选择槽位（0=第10个）",
+                "F12 截图模式：隐藏对话框/姓名框/功能按钮；任意按键或鼠标左右键恢复",
+                slot_hint,
                 "A 读取自动存档（仅读档界面）",
                 "TAB 切换快进 | 按住 S 快进 | H 历史记录 | F11 全屏",
                 f"帮助菜单：右键 或 {key_name}",
@@ -3970,6 +6673,7 @@ class VNGameRuntime:
                 ("master_volume", "主音量"),
                 ("bgm_volume", "BGM音量"),
                 ("voice_volume", "语音音量"),
+                ("sfx_volume", "音效音量"),
             ]
             for i, (key, label) in enumerate(items):
                 y = sy + i * gap
@@ -4037,8 +6741,9 @@ class VNGameRuntime:
             return
 
         if ot in {"save", "load"}:
-            pages = page_count(self._save_slots, self._save_page_size)
-            self._save_page = clamp_page(self._save_page, self._save_slots, self._save_page_size)
+            ps = self._active_slot_page_size(ot)
+            pages = page_count(self._save_slots, ps)
+            self._save_page = clamp_page(self._save_page, self._save_slots, ps)
             page_tip = f"第{self._save_page + 1}/{pages}页"
             title = f"保存 {page_tip}" if ot == "save" else f"读取 {page_tip}"
 
@@ -4090,12 +6795,27 @@ class VNGameRuntime:
                 row = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
                 row.fill((255, 255, 255, a))
                 overlay.blit(row, rect.topleft)
+
+                # thumbnail
+                thumb_h = max(24, rect.h - 6)
+                ratio = float(self.render_size[0]) / float(self.render_size[1]) if self.render_size[1] else 1.6
+                thumb_w = max(40, min(180, int(thumb_h * ratio)))
+                tx0 = rect.x + 10
+                ty0 = rect.y + (rect.h - thumb_h) // 2
+                box = pygame.Surface((thumb_w, thumb_h), pygame.SRCALPHA)
+                box.fill((0, 0, 0, 90))
+                overlay.blit(box, (tx0, ty0))
+                thumb = self._load_slot_thumbnail_surface(slot_id, (thumb_w, thumb_h))
+                if thumb is not None:
+                    overlay.blit(thumb, (tx0, ty0))
+
                 surf = font.render(line, True, text_color)
-                overlay.blit(surf, (rect.x + 12, rect.y + (rect.h - surf.get_height()) // 2))
+                text_x = tx0 + thumb_w + 12
+                overlay.blit(surf, (text_x, rect.y + (rect.h - surf.get_height()) // 2))
                 y += rh + sp
 
-            start = self._save_page * self._save_page_size + 1
-            end = min(self._save_slots, start + self._save_page_size - 1)
+            start = self._save_page * ps + 1
+            end = min(self._save_slots, start + ps - 1)
             for slot_id in range(start, end + 1):
                 meta = slots.get(slot_id)
                 line = f"槽位{slot_id}  " + (f"{meta.get('timestamp','')} - {meta.get('summary','')}" if meta else "<空>")
@@ -4105,8 +6825,22 @@ class VNGameRuntime:
                 row = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
                 row.fill((255, 255, 255, a))
                 overlay.blit(row, rect.topleft)
+
+                thumb_h = max(24, rect.h - 6)
+                ratio = float(self.render_size[0]) / float(self.render_size[1]) if self.render_size[1] else 1.6
+                thumb_w = max(40, min(180, int(thumb_h * ratio)))
+                tx0 = rect.x + 10
+                ty0 = rect.y + (rect.h - thumb_h) // 2
+                box = pygame.Surface((thumb_w, thumb_h), pygame.SRCALPHA)
+                box.fill((0, 0, 0, 90))
+                overlay.blit(box, (tx0, ty0))
+                thumb = self._load_slot_thumbnail_surface(slot_id, (thumb_w, thumb_h))
+                if thumb is not None:
+                    overlay.blit(thumb, (tx0, ty0))
+
                 surf = font.render(line, True, text_color)
-                overlay.blit(surf, (rect.x + 12, rect.y + (rect.h - surf.get_height()) // 2))
+                text_x = tx0 + thumb_w + 12
+                overlay.blit(surf, (text_x, rect.y + (rect.h - surf.get_height()) // 2))
                 y += rh + sp
 
             prev_pos = cfg.get("page_prev_pos", [40, self.render_size[1] - 60])
@@ -4289,6 +7023,142 @@ class VNGameRuntime:
         self.render_surface.blit(overlay, (0, 0))
 
     def _render_choice_overlay(self):
+        # Custom choice button group from UI layout (mouse + hover zoom)
+        if self._choice_buttons_enabled:
+            overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
+            if int(self._choice_overlay_alpha) > 0:
+                overlay.fill((0, 0, 0, int(self._choice_overlay_alpha)))
+
+            # Build stable layout positions using UNZOOMED sizes.
+            base_size = max(8, int(float(self._choice_button_font_size) * float(self._choice_button_scale)))
+            choice_font = self._load_font(base_size)
+            pad_x, pad_y = self._choice_button_padding
+            min_w, min_h = self._choice_button_min_size
+            center_x, center_y = self._choice_button_pos
+            spacing = int(self._choice_button_spacing)
+            zoom = float(self._choice_button_hover_zoom)
+
+            raw_bg = None
+            bg_path = (self._choice_button_bg_image or "").strip()
+            if bg_path:
+                p = self._resolve_path(bg_path)
+                if p.exists():
+                    key = str(p)
+                    raw_bg = self._choice_button_bg_surface_cache.get(key)
+                    if raw_bg is None:
+                        try:
+                            raw_bg = pygame.image.load(str(p)).convert_alpha()
+                            self._choice_button_bg_surface_cache[key] = raw_bg
+                        except Exception:
+                            raw_bg = None
+
+            # reset hitboxes to match current options
+            self._choice_button_hitboxes = [None] * len(self._choice_options)
+
+            layout: list[dict] = []
+
+            # Pre-compute base sizes (unzoomed) per option.
+            sizes: list[tuple[int, int]] = []
+            labels: list[str] = []
+            for text in self._choice_options:
+                label = str(text)
+                labels.append(label)
+                text_surf = choice_font.render(label, True, (255, 255, 255))
+                bw = max(int(min_w), int(text_surf.get_width() + pad_x * 2))
+                bh = max(int(min_h), int(text_surf.get_height() + pad_y * 2))
+                sizes.append((int(bw), int(bh)))
+
+            cx, cy = int(center_x), int(center_y)
+            if self._choice_button_orientation == "horizontal":
+                total_w = sum(w for w, _ in sizes) + spacing * max(0, len(sizes) - 1)
+                cur_x = int(cx - total_w / 2)
+                for idx, (label, (bw, bh)) in enumerate(zip(labels, sizes)):
+                    y = int(cy - bh / 2)
+                    layout.append({
+                        "idx": idx,
+                        "label": label,
+                        "x": int(cur_x),
+                        "y": int(y),
+                        "w": int(bw),
+                        "h": int(bh),
+                    })
+                    cur_x += int(bw) + spacing
+            else:
+                total_h = sum(h for _, h in sizes) + spacing * max(0, len(sizes) - 1)
+                cur_y = int(cy - total_h / 2)
+                for idx, (label, (bw, bh)) in enumerate(zip(labels, sizes)):
+                    x = int(cx - bw / 2)
+                    layout.append({
+                        "idx": idx,
+                        "label": label,
+                        "x": int(x),
+                        "y": int(cur_y),
+                        "w": int(bw),
+                        "h": int(bh),
+                    })
+                    cur_y += int(bh) + spacing
+
+            for it in layout:
+                idx = int(it["idx"])
+                sel = idx == int(self._choice_selected)
+                x0 = int(it["x"])
+                y0 = int(it["y"])
+                bw = int(it["w"])
+                bh = int(it["h"])
+                z = float(zoom if sel else 1.0)
+                w = max(1, int(bw * z))
+                h = max(1, int(bh * z))
+                dx = x0 - (w - bw) // 2
+                dy = y0 - (h - bh) // 2
+
+                if raw_bg is not None:
+                    try:
+                        img = pygame.transform.smoothscale(raw_bg, (w, h))
+                    except Exception:
+                        img = pygame.transform.scale(raw_bg, (w, h))
+                    if int(self._choice_button_bg_alpha) != 255:
+                        try:
+                            img = img.copy()
+                            img.set_alpha(int(self._choice_button_bg_alpha))
+                        except Exception:
+                            pass
+                    overlay.blit(img, (dx, dy))
+                else:
+                    box = pygame.Surface((w, h), pygame.SRCALPHA)
+                    box.fill((0, 0, 0, 140))
+                    overlay.blit(box, (dx, dy))
+                    try:
+                        pygame.draw.rect(overlay, (255, 255, 255, 120), pygame.Rect(dx, dy, w, h), width=2)
+                    except Exception:
+                        pass
+
+                base_col = self._choice_button_text_color
+                hov_col = self._choice_button_text_hover_color
+                col = hov_col if sel else base_col
+                label = str(it.get("label") or "")
+                txt = choice_font.render(label, True, col)
+                if z != 1.0:
+                    try:
+                        tw = max(1, int(txt.get_width() * z))
+                        th = max(1, int(txt.get_height() * z))
+                        txt = pygame.transform.smoothscale(txt, (tw, th))
+                    except Exception:
+                        pass
+                tx = int(dx + w / 2 - txt.get_width() / 2)
+                ty = int(dy + h / 2 - txt.get_height() / 2)
+                overlay.blit(txt, (tx, ty))
+
+                if 0 <= idx < len(self._choice_button_hitboxes):
+                    self._choice_button_hitboxes[idx] = pygame.Rect(dx, dy, w, h)
+
+            hint = "ESC 取消 | 鼠标点击选择 | 数字键 1-9"
+            hint_surf = self.font.render(hint, True, (200, 200, 200))
+            overlay.blit(hint_surf, (40, self.render_size[1] - 50))
+
+            self.render_surface.blit(overlay, (0, 0))
+            return
+
+        # Default choice overlay (keyboard digits)
         overlay = pygame.Surface(self.render_size, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 180))
         title = "请选择 (数字键)"
@@ -4324,9 +7194,11 @@ class VNGameRuntime:
             try:
                 with open(auto_path, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f) or {}
+                thumb_path = slot_thumbnail_path(self.save_dir, AUTO_SAVE_SLOT)
                 meta[AUTO_SAVE_SLOT] = {
                     "timestamp": data.get("timestamp", ""),
                     "summary": data.get("summary", ""),
+                    "thumbnail": str(thumb_path) if thumb_path.exists() else "",
                 }
             except Exception:
                 pass
@@ -4338,9 +7210,11 @@ class VNGameRuntime:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f) or {}
+                thumb_path = slot_thumbnail_path(self.save_dir, idx)
                 meta[idx] = {
                     "timestamp": data.get("timestamp", ""),
                     "summary": data.get("summary", ""),
+                    "thumbnail": str(thumb_path) if thumb_path.exists() else "",
                 }
             except Exception:
                 continue
@@ -4378,6 +7252,7 @@ class VNGameRuntime:
             "master_volume": 1.0,
             "bgm_volume": 0.6,
             "voice_volume": 1.0,
+            "sfx_volume": 1.0,
         }
         if not self.settings_path.exists():
             return defaults
@@ -4408,6 +7283,9 @@ class VNGameRuntime:
         voice_volume = float(self._settings.get("voice_volume", 1.0))
         voice_volume = max(0.0, min(1.0, voice_volume))
         self._settings["voice_volume"] = voice_volume
+        sfx_volume = float(self._settings.get("sfx_volume", 1.0))
+        sfx_volume = max(0.0, min(1.0, sfx_volume))
+        self._settings["sfx_volume"] = sfx_volume
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
@@ -4463,6 +7341,7 @@ class VNGameRuntime:
     def quit_game(self):
         """退出游戏，释放资源"""
         self._stop_voice_playback()
+        self._stop_sfx_playback()
         try:
             if pygame.mixer.get_init():
                 pygame.mixer.music.stop()

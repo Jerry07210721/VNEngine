@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QScrollArea,
     QSplitter,
+    QInputDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -67,6 +68,16 @@ class AICGPanel(QWidget):
         self.reload_btn = QPushButton("刷新待生成列表")
         self.reload_btn.clicked.connect(self.refresh)
         header.addWidget(self.reload_btn)
+
+        self.add_manual_btn = QPushButton("手动新增")
+        self.add_manual_btn.clicked.connect(self._add_manual_item)
+        header.addWidget(self.add_manual_btn)
+
+        self.delete_manual_btn = QPushButton("删除(手动)")
+        self.delete_manual_btn.clicked.connect(self._delete_current_item)
+        self.delete_manual_btn.setEnabled(False)
+        header.addWidget(self.delete_manual_btn)
+
         header.addStretch(1)
         layout.addLayout(header)
 
@@ -358,6 +369,7 @@ class AICGPanel(QWidget):
             self.pending_items = []
             self.list_widget.clear()
             self._clear_detail()
+            self._update_delete_btn_state()
             return
 
         self.project_label.setText(f"工程：{project.ai_project_info.name}")
@@ -370,10 +382,13 @@ class AICGPanel(QWidget):
             self._clear_detail()
             self.progress_label.setText("状态：无待生成CG")
 
+        self._update_delete_btn_state()
+
     def _populate_list(self):
         self.list_widget.clear()
         for item in self.pending_items:
-            text = f"{item.cg_id} ({item.status})"
+            src = "手动" if self._is_manual_item(item) else "自动"
+            text = f"[{src}] {item.cg_id} ({item.status})"
             lw = QListWidgetItem(text)
             lw.setData(Qt.ItemDataRole.UserRole, item.item_id)
             self.list_widget.addItem(lw)
@@ -389,6 +404,86 @@ class AICGPanel(QWidget):
         self.current_item = item
         if item:
             self._show_item(item)
+        self._update_delete_btn_state()
+
+    def _is_manual_item(self, item: CGPendingItem | None) -> bool:
+        if not item:
+            return False
+        return str(getattr(item, "source", "auto") or "auto").strip().lower() == "manual"
+
+    def _update_delete_btn_state(self):
+        try:
+            self.delete_manual_btn.setEnabled(bool(self.current_item and self._is_manual_item(self.current_item)))
+        except Exception:
+            return
+
+    def _add_manual_item(self):
+        project = self.project_manager.current_project
+        if not project:
+            QMessageBox.information(self, "提示", "请先加载 AI 工程。")
+            return
+
+        cg_id, ok = QInputDialog.getText(self, "手动新增CG", "CG ID（如 cg_001）：")
+        if not ok:
+            return
+        cg_id = (cg_id or "").strip()
+        if not cg_id:
+            QMessageBox.warning(self, "提示", "CG ID 不能为空。")
+            return
+
+        node_id, ok = QInputDialog.getText(self, "手动新增CG", "关联节点ID（可选，默认 manual）：", text="manual")
+        if not ok:
+            return
+        node_id = (node_id or "").strip() or "manual"
+
+        desc, ok = QInputDialog.getMultiLineText(self, "手动新增CG", "CG 场景描述：")
+        if not ok:
+            return
+        desc = (desc or "").strip() or cg_id
+
+        item_index = len(self.pending_items) + 1
+        item_id = f"manual_cg_item_{item_index:05d}"
+        existing_ids = {getattr(it, "item_id", "") for it in self.pending_items}
+        while item_id in existing_ids:
+            item_index += 1
+            item_id = f"manual_cg_item_{item_index:05d}"
+
+        self.pending_items.append(
+            CGPendingItem(
+                source="manual",
+                item_id=item_id,
+                cg_id=cg_id,
+                node_id=node_id,
+                description=desc,
+                characters=[],
+                atmosphere="",
+                status="pending",
+                file_path=f"resources/images/cg/{cg_id}.png",
+            )
+        )
+
+        self._persist_pending_lists()
+        self._populate_list()
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self._update_delete_btn_state()
+
+    def _delete_current_item(self):
+        if not self.current_item:
+            return
+        if not self._is_manual_item(self.current_item):
+            QMessageBox.information(self, "提示", "该条目为自动生成，不能删除；如需处理请用“重置/标记完成/刷新”。")
+            return
+
+        item_id = self.current_item.item_id
+        self.pending_items = [it for it in self.pending_items if it.item_id != item_id]
+        self.current_item = None
+        self._persist_pending_lists()
+        self._populate_list()
+        if self.pending_items:
+            self.list_widget.setCurrentRow(0)
+        else:
+            self._clear_detail()
+        self._update_delete_btn_state()
 
     def _get_item_by_id(self, item_id: str) -> Optional[CGPendingItem]:
         for it in self.pending_items:
@@ -1222,4 +1317,5 @@ class AICGPanel(QWidget):
             item_data = self._get_item_by_id(item_widget.data(Qt.ItemDataRole.UserRole))
             if not item_data:
                 continue
-            item_widget.setText(f"{item_data.cg_id} ({item_data.status})")
+            src = "手动" if self._is_manual_item(item_data) else "自动"
+            item_widget.setText(f"[{src}] {item_data.cg_id} ({item_data.status})")
