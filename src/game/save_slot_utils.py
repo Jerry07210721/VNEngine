@@ -24,6 +24,19 @@ def slot_file_path(save_dir: Path, slot: int) -> Path:
     return save_dir / f"slot_{int(slot)}.json"
 
 
+def slot_thumbnail_path(save_dir: Path, slot: int, *, ext: str = "png") -> Path:
+    """Return the thumbnail image path for a slot.
+
+    - Manual slots: 1..N => slot_<n>_thumb.png
+    - Auto slot: 0 => autosave_thumb.png
+    """
+
+    e = str(ext or "png").lstrip(".") or "png"
+    if int(slot) == AUTO_SAVE_SLOT:
+        return save_dir / f"autosave_thumb.{e}"
+    return save_dir / f"slot_{int(slot)}_thumb.{e}"
+
+
 def page_count(total_slots: int, page_size: int = DEFAULT_PAGE_SIZE) -> int:
     total = max(0, int(total_slots))
     size = max(1, int(page_size))

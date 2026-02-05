@@ -29,6 +29,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
 from src.ai.core.ai_project_manager import AIProjectManager
+from src.designer.async_elapsed_runner import AsyncElapsedRunner
 from src.ai.core.config_manager import ConfigManager
 from src.designer.ai_assist_dialog import APIConfigDialog
 
@@ -55,6 +56,7 @@ class AIProjectWindow(QMainWindow):
         super().__init__(parent)
         
         self.project_manager = AIProjectManager()
+        self._io_runner = AsyncElapsedRunner(self)
         self.config_manager = ConfigManager()
         
         # 当前工程状态
@@ -343,7 +345,6 @@ class AIProjectWindow(QMainWindow):
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.setValue(0)
         dlg.show()
-        QApplication.processEvents()
         return dlg
 
     def load_project_file(self, file_path: str) -> bool:
@@ -353,25 +354,46 @@ class AIProjectWindow(QMainWindow):
         if not self.check_save_current():
             return False
 
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在打开AI工程文件，请稍候...")
-            project = self.project_manager.load_project(file_path)
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return False
+
+        busy = self._show_busy_dialog("正在打开AI工程文件，请稍候...")
+        ok_flag = {"ok": False}
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.load_project(file_path)
+
+        def _on_success(project):
             if project:
                 self.is_modified = False
                 self.update_window_title()
                 self.refresh_all_panels()
                 self.statusBar().showMessage(f"已加载工程: {project.ai_project_info.name}")
-                return True
+                ok_flag["ok"] = True
+                return
             QMessageBox.critical(self, "错误", "加载工程失败，请检查文件格式")
-            return False
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"打开AI工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在打开AI工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
+        return bool(ok_flag["ok"])
         
     # ==================== 工程操作 ====================
     
@@ -394,31 +416,48 @@ class AIProjectWindow(QMainWindow):
         # 获取工程名称
         project_name = Path(file_path).stem
         
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在创建/保存AI工程文件，请稍候...")
-            # 创建工程
-            project = self.project_manager.create_new_project(
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        busy = self._show_busy_dialog("正在创建/保存AI工程文件，请稍候...")
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.create_new_project(
                 project_name=project_name,
                 save_path=file_path,
-                story_title=project_name
+                story_title=project_name,
             )
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
-        
-        if project:
-            self.is_modified = False
-            self.update_window_title()
-            self.refresh_all_panels()
-            self.statusBar().showMessage(f"已创建新工程: {project_name}")
-            QMessageBox.information(self, "成功", f"AI工程已创建：\n{file_path}")
-        else:
-            QMessageBox.critical(self, "错误", "创建工程失败")
+
+        def _on_success(project):
+            if project:
+                self.is_modified = False
+                self.update_window_title()
+                self.refresh_all_panels()
+                self.statusBar().showMessage(f"已创建新工程: {project_name}")
+                QMessageBox.information(self, "成功", f"AI工程已创建：\n{file_path}")
+            else:
+                QMessageBox.critical(self, "错误", "创建工程失败")
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"创建AI工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在创建/保存AI工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
     
     def open_project(self):
         """打开AI工程"""
@@ -443,23 +482,43 @@ class AIProjectWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "没有打开的工程")
             return
 
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
-            if self.project_manager.save_project():
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.save_project()
+
+        def _on_success(ok: bool):
+            if ok:
                 self.is_modified = False
                 self.update_window_title()
                 self.statusBar().showMessage("工程已保存")
                 self.project_saved.emit(self.project_manager.current_file_path)
             else:
                 QMessageBox.critical(self, "错误", "保存失败")
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"保存AI工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在保存AI工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
     
     def save_project_as(self):
         """另存为"""
@@ -477,22 +536,42 @@ class AIProjectWindow(QMainWindow):
         if not file_path:
             return
         
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
-            if self.project_manager.save_project(file_path):
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        busy = self._show_busy_dialog("正在保存AI工程文件，请稍候...")
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.save_project(file_path)
+
+        def _on_success(ok: bool):
+            if ok:
                 self.is_modified = False
                 self.update_window_title()
                 self.statusBar().showMessage(f"工程已另存为: {file_path}")
             else:
                 QMessageBox.critical(self, "错误", "保存失败")
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"保存AI工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在保存AI工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
     
     def close_project(self):
         """关闭当前工程"""
@@ -608,7 +687,7 @@ class AIProjectWindow(QMainWindow):
             self,
             "关于",
             "VNEngine AI辅助工程\n\n"
-            "版本: V2.5\n"
+            "版本: V2.6\n"
             "多智能体协作GalGame制作引擎\n\n"
             "© 2026 VNEngine Team"
         )

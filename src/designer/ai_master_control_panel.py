@@ -23,8 +23,11 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QFileDialog,
     QSizePolicy,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QElapsedTimer
+
+from src.designer.async_elapsed_runner import AsyncElapsedRunner
 
 from src.ai.core.ai_project_manager import AIProjectManager
 from src.ai.core.config_manager import ConfigManager
@@ -61,6 +64,9 @@ class AIMasterControlPanel(QWidget):
         self._elapsed_updater.timeout.connect(self._update_elapsed_label)
         self._busy_label = None
         self._busy_prefix = ""
+
+        # 文件IO（保存/加载）专用 runner：用于显示“计时弹窗”，避免大指令保存时 UI 假死。
+        self._io_runner = AsyncElapsedRunner(self)
         try:
             self.step_generator = StepGenerator(config_manager)
         except Exception as exc:  # 延迟提示，避免界面直接崩溃
@@ -82,6 +88,10 @@ class AIMasterControlPanel(QWidget):
             "step3": None,
             "step4": None,
         }
+
+        # UI 侧缓存：用于判断“是否已保存最新编辑的指令”
+        self._saved_instruction_cache: dict[str, str] = {}
+        self._saved_step4_instruction_cache: dict[int, str] = {}
 
         self.init_ui()
         self.refresh()
@@ -306,6 +316,11 @@ class AIMasterControlPanel(QWidget):
         self.step4_status = QLabel("状态：等待指令")
         self.step4_status.setProperty("pill", "true")
         step4_header.addWidget(self.step4_status)
+
+        self.step4_word_stats = QLabel("文本量：目标 - | 本次 -")
+        self.step4_word_stats.setProperty("pill", "true")
+        step4_header.addWidget(self.step4_word_stats)
+
         step4_header.addStretch(1)
         step4_layout.addLayout(step4_header)
 
@@ -322,10 +337,12 @@ class AIMasterControlPanel(QWidget):
         self.step4_prepare_btn = QPushButton("准备指令")
         self.step4_send_btn = QPushButton("发送/生成")
         self.step4_stop_btn = QPushButton("强制停止")
+        self.step4_save_instruction_btn = QPushButton("保存指令")
         self.step4_save_btn = QPushButton("保存结果")
         self.step4_prepare_btn.clicked.connect(self.prepare_chapter_detail)
         self.step4_send_btn.clicked.connect(self.send_chapter_detail)
         self.step4_stop_btn.clicked.connect(self._force_stop_current_task)
+        self.step4_save_instruction_btn.clicked.connect(self.save_step4_instruction)
         self.step4_save_btn.clicked.connect(self.save_chapter_detail)
 
         self.step4_max_tokens_label = QLabel("maxTokens：")
@@ -339,6 +356,7 @@ class AIMasterControlPanel(QWidget):
         # Put step controls on the right side (match step1-3 header layout)
         selector_row.addStretch(1)
         selector_row.addWidget(self.step4_prepare_btn)
+        selector_row.addWidget(self.step4_save_instruction_btn)
         selector_row.addWidget(self.step4_send_btn)
         selector_row.addWidget(self.step4_stop_btn)
         selector_row.addWidget(self.step4_save_btn)
@@ -475,10 +493,12 @@ class AIMasterControlPanel(QWidget):
         prepare_btn = QPushButton("准备指令")
         send_btn = QPushButton("发送/生成")
         stop_btn = QPushButton("强制停止")
+        save_instruction_btn = QPushButton("保存指令")
         prepare_btn.clicked.connect(prepare_handler)
         send_btn.clicked.connect(send_handler)
         stop_btn.clicked.connect(self._force_stop_current_task)
         header.addWidget(prepare_btn)
+        header.addWidget(save_instruction_btn)
         header.addWidget(send_btn)
         header.addWidget(stop_btn)
         if save_handler:
@@ -537,6 +557,10 @@ class AIMasterControlPanel(QWidget):
         card._max_tokens_label = max_tokens_label
         card._max_tokens_spin = max_tokens_spin
         card._step_key = step_key
+        card._save_instruction_btn = save_instruction_btn
+
+        # bind save instruction
+        save_instruction_btn.clicked.connect(lambda: self.save_step_instruction(step_key, instruction, status))
         return card
 
     @staticmethod
@@ -617,6 +641,9 @@ class AIMasterControlPanel(QWidget):
         # 刷新每步 maxTokens（从工程持久化数据回填）
         self._refresh_step_max_tokens_ui()
 
+        # 回填每步已保存指令
+        self._load_saved_instructions_into_ui()
+
         # 渲染步骤5
         if self.pending_lists:
             summary = self._summarize_pending(self.pending_lists, getattr(history, "step5_flow_nodes", None))
@@ -654,6 +681,339 @@ class AIMasterControlPanel(QWidget):
             except Exception:
                 pass
 
+        # 清空 UI 缓存（避免切工程残留）
+        self._saved_instruction_cache = {}
+        self._saved_step4_instruction_cache = {}
+
+    # ==================== 指令保存/发送一致性 ====================
+
+    def _persist_ai_project_to_disk(self) -> bool:
+        """立即将当前 AI 工程持久化到 .vnai 文件。"""
+
+        if not self.project_manager.current_project:
+            return False
+        # 沿用工程管理器已知路径
+        try:
+            return bool(self.project_manager.save_project())
+        except Exception:
+            return False
+
+    def _show_busy_dialog(self, text: str) -> QProgressDialog:
+        """显示不可取消的忙碌提示，用于大文件保存时避免“卡死”错觉。"""
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle("请稍候")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setValue(0)
+        dlg.show()
+        return dlg
+
+    def _persist_ai_project_to_disk_with_busy_dialog(self, base_text: str, *, on_done=None) -> None:
+        """后台保存工程文件，并显示带耗时的弹窗。"""
+
+        if not self.project_manager.current_project:
+            if on_done is not None:
+                on_done(False)
+            return
+
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在保存工程文件，请稍候...")
+            return
+
+        busy = self._show_busy_dialog(base_text)
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return bool(self.project_manager.save_project())
+
+        def _on_success(ok: bool):
+            if on_done is not None:
+                on_done(bool(ok))
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"保存AI工程失败：{err_text}")
+            if on_done is not None:
+                on_done(False)
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text=base_text,
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
+
+    def _saved_instruction_for_step(self, step_key: str) -> str:
+        project = self.project_manager.current_project
+        if not project:
+            return ""
+        history = project.generation_history
+        if isinstance(getattr(history, "saved_step_instructions", None), dict):
+            return (history.saved_step_instructions.get(step_key) or "").strip()
+        return ""
+
+    def _saved_instruction_for_step4(self, chapter_index: int) -> str:
+        project = self.project_manager.current_project
+        if not project:
+            return ""
+        history = project.generation_history
+        mapping = getattr(history, "step4_saved_instructions", None)
+        if isinstance(mapping, dict):
+            return (mapping.get(str(int(chapter_index))) or "").strip()
+        return ""
+
+    def _set_saved_instruction_for_step(self, step_key: str, text: str) -> None:
+        project = self.project_manager.current_project
+        if not project:
+            return
+        history = project.generation_history
+        if not isinstance(getattr(history, "saved_step_instructions", None), dict):
+            history.saved_step_instructions = {}
+        history.saved_step_instructions[step_key] = text
+        project.update_modified_time()
+
+    def _set_saved_instruction_for_step4(self, chapter_index: int, text: str) -> None:
+        project = self.project_manager.current_project
+        if not project:
+            return
+        history = project.generation_history
+        if not isinstance(getattr(history, "step4_saved_instructions", None), dict):
+            history.step4_saved_instructions = {}
+        history.step4_saved_instructions[str(int(chapter_index))] = text
+        project.update_modified_time()
+
+    def save_step_instruction(self, step_key: str, editor: QTextEdit, status_label: QLabel | None = None) -> None:
+        if not self._ensure_project():
+            return
+        text = (editor.toPlainText() or "").strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "没有可保存的指令内容。")
+            return
+
+        self._set_saved_instruction_for_step(step_key, text)
+        self._saved_instruction_cache[step_key] = text
+
+        if status_label is not None:
+            status_label.setText("状态：正在保存指令...")
+
+        def _done(ok: bool):
+            if ok:
+                if status_label is not None:
+                    status_label.setText("状态：指令已保存")
+                self._record_instruction(f"manual_save_instruction_{step_key}", text, {}, None, "success")
+                self.modified.emit()
+            else:
+                if status_label is not None:
+                    status_label.setText("状态：保存失败")
+
+        self._persist_ai_project_to_disk_with_busy_dialog("正在保存指令到AI工程文件，请稍候...", on_done=_done)
+
+    def save_step4_instruction(self) -> None:
+        if not self._ensure_project():
+            return
+        chapters_struct = self._chapter_list()
+        if not chapters_struct:
+            QMessageBox.warning(self, "提示", "请先完成步骤3并选择章节后再保存指令。")
+            return
+        idx = self.chapter_selector.currentIndex()
+        if idx < 0 or idx >= len(chapters_struct):
+            QMessageBox.warning(self, "提示", "请选择有效的章节。")
+            return
+        text = (self.step4_instruction.toPlainText() or "").strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "没有可保存的指令内容。")
+            return
+
+        self._set_saved_instruction_for_step4(idx, text)
+        self._saved_step4_instruction_cache[idx] = text
+
+        self.step4_status.setText(f"状态：第{idx+1}章正在保存指令...")
+
+        def _done(ok: bool):
+            if ok:
+                self.step4_status.setText(f"状态：第{idx+1}章指令已保存")
+                self._record_instruction(
+                    f"manual_save_instruction_step4_ch{idx}",
+                    text,
+                    {"chapter_index": idx},
+                    None,
+                    "success",
+                )
+                self.modified.emit()
+            else:
+                self.step4_status.setText(f"状态：第{idx+1}章保存失败")
+
+        self._persist_ai_project_to_disk_with_busy_dialog("正在保存指令到AI工程文件，请稍候...", on_done=_done)
+
+    def _load_saved_instructions_into_ui(self) -> None:
+        """从工程持久化字段回填 UI，并更新缓存。"""
+        project = self.project_manager.current_project
+        if not project:
+            return
+
+        # step1-3
+        for group in (getattr(self, "step1_group", None), getattr(self, "step2_group", None), getattr(self, "step3_group", None)):
+            if not group or not hasattr(group, "_step_key"):
+                continue
+            step_key = getattr(group, "_step_key", "")
+            if not step_key:
+                continue
+            saved = self._saved_instruction_for_step(step_key)
+            if saved:
+                try:
+                    group._instruction.blockSignals(True)
+                    group._instruction.setPlainText(saved)
+                finally:
+                    group._instruction.blockSignals(False)
+                self._saved_instruction_cache[step_key] = saved
+
+        # step4（当前选择章节）
+        chapters_struct = self._chapter_list()
+        idx = self.chapter_selector.currentIndex()
+        if chapters_struct and 0 <= idx < len(chapters_struct):
+            saved4 = self._saved_instruction_for_step4(idx)
+            if saved4:
+                try:
+                    self.step4_instruction.blockSignals(True)
+                    self.step4_instruction.setPlainText(saved4)
+                finally:
+                    self.step4_instruction.blockSignals(False)
+                self._saved_step4_instruction_cache[idx] = saved4
+
+    def _ensure_send_uses_saved_instruction(self, step_key: str, editor: QTextEdit, *, chapter_index: int | None = None) -> str | None:
+        """确保发送时使用“最新编辑且已保存”的指令。
+
+        - 若编辑器内容与已保存版本一致：直接返回已保存文本
+        - 若不一致：提示用户先保存（可选自动保存并继续）
+        """
+        if not self._ensure_project():
+            return None
+
+        current_text = (editor.toPlainText() or "").strip()
+        if not current_text:
+            QMessageBox.warning(self, "提示", "请先准备/编辑指令后再发送。")
+            return None
+
+        if chapter_index is None:
+            saved_text = self._saved_instruction_for_step(step_key)
+        else:
+            saved_text = self._saved_instruction_for_step4(chapter_index)
+
+        # 已保存且一致
+        if saved_text and saved_text.strip() == current_text:
+            return saved_text.strip()
+
+        # 未保存或不一致：要求保存
+        choice = QMessageBox.question(
+            self,
+            "指令未保存",
+            "当前指令已修改但尚未保存。\n为了保证发送的是‘最新编辑且已保存’的指令，请先保存。\n\n是否现在保存并继续发送？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return None
+
+        # 自动保存
+        if chapter_index is None:
+            self._set_saved_instruction_for_step(step_key, current_text)
+            self._saved_instruction_cache[step_key] = current_text
+        else:
+            self._set_saved_instruction_for_step4(chapter_index, current_text)
+            self._saved_step4_instruction_cache[chapter_index] = current_text
+        self._persist_ai_project_to_disk()
+        self.modified.emit()
+        return current_text
+
+    def _ensure_send_uses_saved_instruction_async(
+        self,
+        step_key: str,
+        editor: QTextEdit,
+        *,
+        chapter_index: int | None = None,
+        status_label: QLabel | None = None,
+        on_ready=None,
+    ) -> None:
+        """异步版本：确保发送时使用“最新编辑且已保存”的指令。
+
+        设计目的：当指令很大时，保存工程文件可能阻塞 UI。
+        这里使用带耗时的忙碌弹窗后台保存，保存成功后再继续发送。
+
+        Args:
+            step_key: step1/step2/step3/step4
+            editor: 指令编辑框
+            chapter_index: step4 时指定章节
+            status_label: 用于回显“正在保存/保存失败”等状态
+            on_ready: 保存完成且可发送时回调 on_ready(instruction: str)
+        """
+
+        if on_ready is None:
+            return
+        if not self._ensure_project():
+            return
+
+        current_text = (editor.toPlainText() or "").strip()
+        if not current_text:
+            QMessageBox.warning(self, "提示", "请先准备/编辑指令后再发送。")
+            return
+
+        if chapter_index is None:
+            saved_text = self._saved_instruction_for_step(step_key)
+        else:
+            saved_text = self._saved_instruction_for_step4(chapter_index)
+
+        # 已保存且一致：直接继续
+        if saved_text and saved_text.strip() == current_text:
+            on_ready(saved_text.strip())
+            return
+
+        # 未保存或不一致：要求保存
+        choice = QMessageBox.question(
+            self,
+            "指令未保存",
+            "当前指令已修改但尚未保存。\n为了保证发送的是‘最新编辑且已保存’的指令，请先保存。\n\n是否现在保存并继续发送？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+
+        # 先把“已保存指令”写入工程对象（保存文件会把它落盘）
+        if chapter_index is None:
+            self._set_saved_instruction_for_step(step_key, current_text)
+            self._saved_instruction_cache[step_key] = current_text
+        else:
+            self._set_saved_instruction_for_step4(chapter_index, current_text)
+            self._saved_step4_instruction_cache[chapter_index] = current_text
+
+        if status_label is not None:
+            try:
+                status_label.setText("状态：正在保存指令...")
+            except Exception:
+                pass
+
+        def _done(ok: bool):
+            if ok:
+                self.modified.emit()
+                on_ready(current_text)
+            else:
+                if status_label is not None:
+                    try:
+                        status_label.setText("状态：保存失败")
+                    except Exception:
+                        pass
+
+        self._persist_ai_project_to_disk_with_busy_dialog("正在保存指令到AI工程文件，请稍候...", on_done=_done)
+
     def _refresh_step_max_tokens_ui(self) -> None:
         groups = [getattr(self, "step1_group", None), getattr(self, "step2_group", None), getattr(self, "step3_group", None)]
         for g in groups:
@@ -688,6 +1048,18 @@ class AIMasterControlPanel(QWidget):
 
     def on_chapter_changed(self, idx: int):
         self._load_chapter_detail(idx)
+
+        # 切换章节时：回填该章节已保存指令（若有）
+        try:
+            saved = self._saved_instruction_for_step4(idx)
+            if saved:
+                self.step4_instruction.setPlainText(saved)
+                self._saved_step4_instruction_cache[idx] = saved
+            else:
+                # 未保存则清空，避免误发上一章指令
+                self.step4_instruction.clear()
+        except Exception:
+            return
 
     def _ensure_project(self) -> bool:
         if self.project_manager.current_project is None:
@@ -897,15 +1269,100 @@ class AIMasterControlPanel(QWidget):
         if idx < 0:
             self.step4_result.clear()
             self.step4_status.setText("状态：等待指令")
+            try:
+                self.step4_word_stats.setText("文本量：目标 - | 本次 -")
+            except Exception:
+                pass
             return
         if idx < len(self.chapter_details):
             detail = self.chapter_details[idx]
             if detail:
                 self.step4_result.setPlainText(self._format_preview(detail))
                 self.step4_status.setText(f"状态：第{idx+1}章已加载")
+                self._update_step4_word_stats_from_detail(idx, detail)
                 return
         self.step4_result.clear()
         self.step4_status.setText("状态：等待指令")
+        try:
+            self.step4_word_stats.setText("文本量：目标 - | 本次 -")
+        except Exception:
+            pass
+
+    def _calc_cn_char_target_range(self, target_words: int) -> tuple[int, int]:
+        """与 StepGenerator 口径一致：默认 ±5% 且最小容差 30。"""
+        try:
+            target_words = int(target_words or 0)
+        except Exception:
+            target_words = 0
+        if target_words <= 0:
+            return 0, 0
+        tolerance = max(30, int(target_words * 0.05))
+        return max(1, target_words - tolerance), target_words + tolerance
+
+    def _update_step4_word_stats(self, *, target_min: int, target_max: int, actual: int | None) -> None:
+        try:
+            if target_min > 0 and target_max > 0:
+                target_text = f"{target_min}~{target_max}"
+            else:
+                target_text = "-"
+            actual_text = str(int(actual)) if actual is not None else "-"
+            self.step4_word_stats.setText(f"文本量：目标 {target_text} | 本次 {actual_text}")
+        except Exception:
+            return
+
+    def _update_step4_word_stats_from_params(self, idx: int, params: dict | None) -> None:
+        params = params or {}
+        min_cn = params.get("cn_char_min")
+        max_cn = params.get("cn_char_max")
+        try:
+            min_cn = int(min_cn or 0)
+            max_cn = int(max_cn or 0)
+        except Exception:
+            min_cn, max_cn = 0, 0
+        if min_cn <= 0 or max_cn <= 0:
+            # 兜底：从章节列表 estimated_words 计算
+            chapters = self._chapter_list()
+            if 0 <= idx < len(chapters):
+                est = chapters[idx].get("estimated_words") or chapters[idx].get("target_words") or 0
+                min_cn, max_cn = self._calc_cn_char_target_range(int(est or 0))
+        self._update_step4_word_stats(target_min=min_cn, target_max=max_cn, actual=None)
+
+    def _update_step4_word_stats_from_detail(self, idx: int, detail: dict | None) -> None:
+        detail = detail or {}
+        # 目标区间：优先从 parameters
+        params = detail.get("parameters") if isinstance(detail, dict) else None
+        if isinstance(params, dict):
+            try:
+                min_cn = int(params.get("cn_char_min") or 0)
+                max_cn = int(params.get("cn_char_max") or 0)
+            except Exception:
+                min_cn, max_cn = 0, 0
+        else:
+            min_cn, max_cn = 0, 0
+
+        if min_cn <= 0 or max_cn <= 0:
+            chapters = self._chapter_list()
+            if 0 <= idx < len(chapters):
+                est = chapters[idx].get("estimated_words") or chapters[idx].get("target_words") or 0
+                min_cn, max_cn = self._calc_cn_char_target_range(int(est or 0))
+
+        # 实际：优先使用 detail.metrics.cn_char_count；否则尝试从 structured 计算
+        actual = None
+        try:
+            metrics = detail.get("metrics") if isinstance(detail, dict) else None
+            if isinstance(metrics, dict) and metrics.get("cn_char_count") is not None:
+                actual = int(metrics.get("cn_char_count"))
+        except Exception:
+            actual = None
+        if actual is None:
+            try:
+                structured = detail.get("structured") if isinstance(detail, dict) else None
+                if self.step_generator and isinstance(structured, dict) and hasattr(self.step_generator, "_count_cn_chars_in_chapter_struct"):
+                    actual = int(self.step_generator._count_cn_chars_in_chapter_struct(structured))
+            except Exception:
+                actual = None
+
+        self._update_step4_word_stats(target_min=min_cn, target_max=max_cn, actual=actual)
 
     def _manual_result_payload(self, text: str, parameters: dict | None, extra: dict | None = None) -> dict:
         payload = {
@@ -932,7 +1389,7 @@ class AIMasterControlPanel(QWidget):
         params = dict(params or {})
         params["max_tokens"] = self._get_step_max_tokens("step1")
         self.step1_group._instruction.setPlainText(instruction)
-        self.step1_group._status.setText("状态：指令已生成，待发送")
+        self.step1_group._status.setText("状态：指令已生成，请先保存指令再发送")
         self.step_parameters["step1"] = params
         self._record_instruction("generate_personas_prepare", instruction, params, None, "pending")
         self.modified.emit()
@@ -944,22 +1401,27 @@ class AIMasterControlPanel(QWidget):
             return
         params = dict(self.step_parameters.get("step1") or {})
         params["max_tokens"] = self._get_step_max_tokens("step1")
-        instruction = self.step1_group._instruction.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
-            return
-        def _task():
-            return self.step_generator.generate_personas(instruction, params)
 
-        def _on_success(result):
-            self.personas_data = result
-            self.step1_group._result.setPlainText(self._format_preview(result))
-            self.project_manager.update_generation_step("step1_personas", result)
-            self._record_instruction("generate_personas", instruction, params, result, "success")
-            self.step1_group._status.setText("状态：已生成")
-            self.modified.emit()
+        def _start_send(instruction: str):
+            def _task():
+                return self.step_generator.generate_personas(instruction, params)
 
-        self._run_async(self.step1_group._status, "状态：生成中", _task, _on_success)
+            def _on_success(result):
+                self.personas_data = result
+                self.step1_group._result.setPlainText(self._format_preview(result))
+                self.project_manager.update_generation_step("step1_personas", result)
+                self._record_instruction("generate_personas", instruction, params, result, "success")
+                self.step1_group._status.setText("状态：已生成")
+                self.modified.emit()
+
+            self._run_async(self.step1_group._status, "状态：生成中", _task, _on_success)
+
+        self._ensure_send_uses_saved_instruction_async(
+            "step1",
+            self.step1_group._instruction,
+            status_label=self.step1_group._status,
+            on_ready=_start_send,
+        )
 
     def save_personas_result(self):
         if not self._ensure_project():
@@ -1002,7 +1464,7 @@ class AIMasterControlPanel(QWidget):
         params = dict(params or {})
         params["max_tokens"] = self._get_step_max_tokens("step2")
         self.step2_group._instruction.setPlainText(instruction)
-        self.step2_group._status.setText("状态：指令已生成，待发送")
+        self.step2_group._status.setText("状态：指令已生成，请先保存指令再发送")
         self.step_parameters["step2"] = params
         self._record_instruction("generate_outline_prepare", instruction, params, None, "pending")
         self.modified.emit()
@@ -1014,22 +1476,27 @@ class AIMasterControlPanel(QWidget):
             return
         params = dict(self.step_parameters.get("step2") or {})
         params["max_tokens"] = self._get_step_max_tokens("step2")
-        instruction = self.step2_group._instruction.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
-            return
-        def _task():
-            return self.step_generator.generate_outline(instruction, params)
 
-        def _on_success(result):
-            self.outline_data = result
-            self.step2_group._result.setPlainText(self._format_preview(result))
-            self.project_manager.update_generation_step("step2_outline", result)
-            self._record_instruction("generate_outline", instruction, params, result, "success")
-            self.step2_group._status.setText("状态：已生成")
-            self.modified.emit()
+        def _start_send(instruction: str):
+            def _task():
+                return self.step_generator.generate_outline(instruction, params)
 
-        self._run_async(self.step2_group._status, "状态：生成中", _task, _on_success)
+            def _on_success(result):
+                self.outline_data = result
+                self.step2_group._result.setPlainText(self._format_preview(result))
+                self.project_manager.update_generation_step("step2_outline", result)
+                self._record_instruction("generate_outline", instruction, params, result, "success")
+                self.step2_group._status.setText("状态：已生成")
+                self.modified.emit()
+
+            self._run_async(self.step2_group._status, "状态：生成中", _task, _on_success)
+
+        self._ensure_send_uses_saved_instruction_async(
+            "step2",
+            self.step2_group._instruction,
+            status_label=self.step2_group._status,
+            on_ready=_start_send,
+        )
 
     def save_outline_result(self):
         if not self._ensure_project():
@@ -1067,12 +1534,13 @@ class AIMasterControlPanel(QWidget):
             QMessageBox.warning(self, "提示", "请先完成步骤2：故事大纲。")
             return
         story_config = self._story_dict()
+        characters = self._characters_dict()
         outline = self.outline_data or self.project_manager.current_project.generation_history.step2_outline
-        instruction, params = self.step_generator.prepare_chapters_instruction(story_config, outline or {})
+        instruction, params = self.step_generator.prepare_chapters_instruction(story_config, outline or {}, character_config=characters)
         params = dict(params or {})
         params["max_tokens"] = self._get_step_max_tokens("step3")
         self.step3_group._instruction.setPlainText(instruction)
-        self.step3_group._status.setText("状态：指令已生成，待发送")
+        self.step3_group._status.setText("状态：指令已生成，请先保存指令再发送")
         self.step_parameters["step3"] = params
         self._record_instruction("generate_chapters_prepare", instruction, params, None, "pending")
         self.modified.emit()
@@ -1084,23 +1552,28 @@ class AIMasterControlPanel(QWidget):
             return
         params = dict(self.step_parameters.get("step3") or {})
         params["max_tokens"] = self._get_step_max_tokens("step3")
-        instruction = self.step3_group._instruction.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
-            return
-        def _task():
-            return self.step_generator.generate_chapters(instruction, params)
 
-        def _on_success(result):
-            self.chapters_data = result
-            self.step3_group._result.setPlainText(self._format_preview(result))
-            self.project_manager.update_generation_step("step3_chapters", result)
-            self._record_instruction("generate_chapters", instruction, params, result, "success")
-            self.step3_group._status.setText("状态：已生成")
-            self._refresh_chapter_selector()
-            self.modified.emit()
+        def _start_send(instruction: str):
+            def _task():
+                return self.step_generator.generate_chapters(instruction, params)
 
-        self._run_async(self.step3_group._status, "状态：生成中", _task, _on_success)
+            def _on_success(result):
+                self.chapters_data = result
+                self.step3_group._result.setPlainText(self._format_preview(result))
+                self.project_manager.update_generation_step("step3_chapters", result)
+                self._record_instruction("generate_chapters", instruction, params, result, "success")
+                self.step3_group._status.setText("状态：已生成")
+                self._refresh_chapter_selector()
+                self.modified.emit()
+
+            self._run_async(self.step3_group._status, "状态：生成中", _task, _on_success)
+
+        self._ensure_send_uses_saved_instruction_async(
+            "step3",
+            self.step3_group._instruction,
+            status_label=self.step3_group._status,
+            on_ready=_start_send,
+        )
 
     def save_chapters_result(self):
         if not self._ensure_project():
@@ -1159,18 +1632,22 @@ class AIMasterControlPanel(QWidget):
         except Exception:
             chapters_plan = None
 
+        personas = self.personas_data or self.project_manager.current_project.generation_history.step1_personas
+
         instruction, params = self.step_generator.prepare_chapter_detail_instruction(
             idx,
             chapter_info,
             prev_context,
             self._story_dict(),
             self._characters_dict(),
+            personas,
             chapters_plan,
         )
         params = dict(params or {})
         params["max_tokens"] = self._get_step_max_tokens("step4")
         self.step4_instruction.setPlainText(instruction)
-        self.step4_status.setText(f"状态：第{idx+1}章指令已生成，待发送")
+        self.step4_status.setText(f"状态：第{idx+1}章指令已生成，请先保存指令再发送")
+        self._update_step4_word_stats_from_params(idx, params)
         self.step_parameters["step4"] = params
         self._record_instruction("generate_chapter_detail_prepare", instruction, params, None, "pending")
         self.modified.emit()
@@ -1189,32 +1666,39 @@ class AIMasterControlPanel(QWidget):
         if idx < 0 or idx >= len(chapters_struct):
             QMessageBox.warning(self, "提示", "请选择有效的章节。")
             return
-        instruction = self.step4_instruction.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请先准备指令后再发送。")
-            return
         params = dict(self.step_parameters.get("step4") or {"chapter_index": idx})
         params["chapter_index"] = idx
         params["max_tokens"] = self._get_step_max_tokens("step4")
-        def _task():
-            return self.step_generator.generate_chapter_detail(instruction, params)
 
-        def _on_success(detail):
-            # 兼容 LLM 输出带噪导致 structured=None：尽量做一次规范化
-            try:
-                detail = self.step_generator._normalize_chapter_detail(detail)
-            except Exception:
-                pass
-            while len(self.chapter_details) <= idx:
-                self.chapter_details.append({})
-            self.chapter_details[idx] = detail
-            self.step4_result.setPlainText(self._format_preview(detail))
-            self.project_manager.update_generation_step("step4_chapter_details", self.chapter_details)
-            self._record_instruction("generate_chapter_detail", instruction, params, detail, "success")
-            self.step4_status.setText(f"状态：第{idx+1}章已生成")
-            self.modified.emit()
+        def _start_send(instruction: str):
+            def _task():
+                return self.step_generator.generate_chapter_detail(instruction, params)
 
-        self._run_async(self.step4_status, f"状态：第{idx+1}章生成中", _task, _on_success)
+            def _on_success(detail):
+                # 兼容 LLM 输出带噪导致 structured=None：尽量做一次规范化
+                try:
+                    detail = self.step_generator._normalize_chapter_detail(detail)
+                except Exception:
+                    pass
+                while len(self.chapter_details) <= idx:
+                    self.chapter_details.append({})
+                self.chapter_details[idx] = detail
+                self.step4_result.setPlainText(self._format_preview(detail))
+                self._update_step4_word_stats_from_detail(idx, detail)
+                self.project_manager.update_generation_step("step4_chapter_details", self.chapter_details)
+                self._record_instruction("generate_chapter_detail", instruction, params, detail, "success")
+                self.step4_status.setText(f"状态：第{idx+1}章已生成")
+                self.modified.emit()
+
+            self._run_async(self.step4_status, f"状态：第{idx+1}章生成中", _task, _on_success)
+
+        self._ensure_send_uses_saved_instruction_async(
+            "step4",
+            self.step4_instruction,
+            chapter_index=idx,
+            status_label=self.step4_status,
+            on_ready=_start_send,
+        )
 
     def save_chapter_detail(self):
         if not self._ensure_project():
@@ -1249,6 +1733,18 @@ class AIMasterControlPanel(QWidget):
         while len(self.chapter_details) <= idx:
             self.chapter_details.append({})
         self.chapter_details[idx] = detail
+
+        # 尝试补充/刷新 metrics.cn_char_count（用户手动编辑后也能看到对比）
+        try:
+            if self.step_generator and isinstance(detail, dict) and isinstance(detail.get("structured"), dict):
+                cn_chars = int(self.step_generator._count_cn_chars_in_chapter_struct(detail.get("structured")))
+                detail.setdefault("metrics", {})
+                if isinstance(detail.get("metrics"), dict):
+                    detail["metrics"]["cn_char_count"] = cn_chars
+                self._update_step4_word_stats_from_detail(idx, detail)
+        except Exception:
+            pass
+
         self.project_manager.update_generation_step("step4_chapter_details", self.chapter_details)
         self.step4_status.setText(f"状态：第{idx+1}章已保存(手动)")
         self._record_instruction(

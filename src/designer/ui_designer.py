@@ -10,7 +10,7 @@ import json
 import shutil
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QRect
 from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -107,6 +107,24 @@ class LayoutPreview(QWidget):
         self._hud_hover_color = [255, 255, 255]
         self._hud_buttons: list[dict] = []
         self._hud_rect = [20, 20, 120, 60]  # computed bounding box (base coords)
+
+        # choice button group preview (for choice nodes)
+        self._choice_enabled = False
+        self._choice_pos = [120, 140]
+        self._choice_spacing = 12
+        self._choice_scale = 1.0
+        self._choice_hover_zoom = 1.08
+        self._choice_orientation = "vertical"  # 'vertical' | 'horizontal'
+        self._choice_font_size = 20
+        self._choice_color = [230, 230, 230]
+        self._choice_hover_color = [255, 255, 255]
+        self._choice_overlay_alpha = 180
+        self._choice_bg_image = ""
+        self._choice_bg_alpha = 255
+        self._choice_padding = [18, 10]
+        self._choice_min_size = [0, 0]
+        self._choice_sample_options = ["选项 1", "选项 2", "选项 3"]
+        self._choice_rect = [120, 140, 220, 120]  # computed bounding box (base coords)
 
         self._pix_cache: dict[str, QPixmap] = {}
         self._selected: str | None = None
@@ -243,6 +261,95 @@ class LayoutPreview(QWidget):
         self._hud_buttons = btns if isinstance(btns, list) else []
         self._hud_rect = self._compute_hud_rect()
 
+        # choice button group
+        self._choice_enabled = bool(data.get("choice_buttons_enabled", False))
+        cp = data.get("choice_button_pos")
+        if isinstance(cp, (list, tuple)) and len(cp) >= 2:
+            try:
+                self._choice_pos = [int(cp[0]), int(cp[1])]
+            except Exception:
+                self._choice_pos = [120, 140]
+        else:
+            self._choice_pos = [120, 140]
+
+        try:
+            self._choice_spacing = int(data.get("choice_button_spacing", 12) or 12)
+        except Exception:
+            self._choice_spacing = 12
+        self._choice_spacing = max(0, min(300, int(self._choice_spacing)))
+
+        try:
+            self._choice_scale = float(data.get("choice_button_scale", 1.0) or 1.0)
+        except Exception:
+            self._choice_scale = 1.0
+        self._choice_scale = max(0.5, min(5.0, float(self._choice_scale)))
+
+        try:
+            self._choice_hover_zoom = float(data.get("choice_button_hover_zoom", 1.08) or 1.08)
+        except Exception:
+            self._choice_hover_zoom = 1.08
+        self._choice_hover_zoom = max(1.0, min(1.8, float(self._choice_hover_zoom)))
+
+        orient = str(data.get("choice_button_orientation") or "vertical").strip().lower()
+        self._choice_orientation = "horizontal" if orient in {"horizontal", "h", "row", "x"} else "vertical"
+
+        try:
+            self._choice_font_size = int(data.get("choice_button_font_size", 20) or 20)
+        except Exception:
+            self._choice_font_size = 20
+        self._choice_font_size = max(8, min(72, int(self._choice_font_size)))
+
+        col = data.get("choice_button_text_color")
+        if isinstance(col, (list, tuple)) and len(col) >= 3:
+            try:
+                self._choice_color = [int(col[0]), int(col[1]), int(col[2])]
+            except Exception:
+                self._choice_color = [230, 230, 230]
+        else:
+            self._choice_color = [230, 230, 230]
+
+        col2 = data.get("choice_button_text_hover_color")
+        if isinstance(col2, (list, tuple)) and len(col2) >= 3:
+            try:
+                self._choice_hover_color = [int(col2[0]), int(col2[1]), int(col2[2])]
+            except Exception:
+                self._choice_hover_color = list(self._choice_color)
+        else:
+            self._choice_hover_color = list(self._choice_color)
+
+        try:
+            self._choice_overlay_alpha = int(data.get("choice_overlay_alpha", 180))
+        except Exception:
+            self._choice_overlay_alpha = 180
+        self._choice_overlay_alpha = max(0, min(255, int(self._choice_overlay_alpha)))
+
+        self._choice_bg_image = str(data.get("choice_button_bg_image") or "")
+        try:
+            self._choice_bg_alpha = int(data.get("choice_button_bg_alpha", 255))
+        except Exception:
+            self._choice_bg_alpha = 255
+        self._choice_bg_alpha = max(0, min(255, int(self._choice_bg_alpha)))
+
+        pad = data.get("choice_button_padding")
+        if isinstance(pad, (list, tuple)) and len(pad) >= 2:
+            try:
+                self._choice_padding = [max(0, int(pad[0])), max(0, int(pad[1]))]
+            except Exception:
+                self._choice_padding = [18, 10]
+        else:
+            self._choice_padding = [18, 10]
+
+        ms = data.get("choice_button_min_size")
+        if isinstance(ms, (list, tuple)) and len(ms) >= 2:
+            try:
+                self._choice_min_size = [max(0, int(ms[0])), max(0, int(ms[1]))]
+            except Exception:
+                self._choice_min_size = [0, 0]
+        else:
+            self._choice_min_size = [0, 0]
+
+        self._choice_rect = self._compute_choice_rect()
+
         self._text_frame_alpha = max(0, min(255, self._text_frame_alpha))
         self._name_frame_alpha = max(0, min(255, self._name_frame_alpha))
 
@@ -291,6 +398,8 @@ class LayoutPreview(QWidget):
     def _components(self) -> list[tuple[str, list[int]]]:
         # selection priority: name/text on top, then portraits
         items: list[tuple[str, list[int]]] = []
+        if self._choice_enabled:
+            items.append(("choice", self._choice_rect))
         if self._hud_enabled:
             items.append(("hud", self._hud_rect))
         items.extend(
@@ -353,6 +462,68 @@ class LayoutPreview(QWidget):
         rects = self._hud_item_rects()
         if not rects:
             return [x0, y0, 120, 60]
+        left = min(r[0] for r in rects)
+        top = min(r[1] for r in rects)
+        right = max(r[0] + r[2] for r in rects)
+        bottom = max(r[1] + r[3] for r in rects)
+        w = max(20, int(right - left))
+        h = max(20, int(bottom - top))
+        return [int(left), int(top), int(w), int(h)]
+
+    def _resolve_size_for_choice_item(self, label: str) -> tuple[int, int]:
+        # approximate text box size; background image is stretched to box
+        s = max(0.5, min(5.0, float(self._choice_scale)))
+        font = QFont("Arial")
+        font.setPixelSize(max(8, int(float(self._choice_font_size) * s)))
+        fm = QFontMetrics(font)
+        tw = int(fm.horizontalAdvance(str(label)))
+        th = int(fm.height())
+        pad = self._choice_padding if isinstance(self._choice_padding, (list, tuple)) else [18, 10]
+        try:
+            px, py = int(pad[0]), int(pad[1])
+        except Exception:
+            px, py = 18, 10
+        w = tw + px * 2
+        h = th + py * 2
+        ms = self._choice_min_size if isinstance(self._choice_min_size, (list, tuple)) else [0, 0]
+        try:
+            mw, mh = int(ms[0]), int(ms[1])
+        except Exception:
+            mw, mh = 0, 0
+        w = max(mw, w)
+        h = max(mh, h)
+        return max(1, int(w)), max(1, int(h))
+
+    def _choice_item_rects(self) -> list[list[int]]:
+        if not self._choice_enabled:
+            return []
+        cx, cy = int(self._choice_pos[0]), int(self._choice_pos[1])
+        spacing = int(self._choice_spacing)
+        rects: list[list[int]] = []
+        labels = self._choice_sample_options if isinstance(self._choice_sample_options, list) else ["选项 1", "选项 2", "选项 3"]
+        sizes: list[tuple[int, int]] = []
+        for label in labels:
+            sizes.append(self._resolve_size_for_choice_item(str(label)))
+
+        if self._choice_orientation == "horizontal":
+            total_w = sum(w for w, _ in sizes) + spacing * max(0, len(sizes) - 1)
+            cur_x = int(cx - total_w / 2)
+            for (w, h) in sizes:
+                rects.append([int(cur_x), int(cy - h / 2), int(w), int(h)])
+                cur_x += int(w) + spacing
+        else:
+            total_h = sum(h for _, h in sizes) + spacing * max(0, len(sizes) - 1)
+            cur_y = int(cy - total_h / 2)
+            for (w, h) in sizes:
+                rects.append([int(cx - w / 2), int(cur_y), int(w), int(h)])
+                cur_y += int(h) + spacing
+        return rects
+
+    def _compute_choice_rect(self) -> list[int]:
+        cx, cy = int(self._choice_pos[0]), int(self._choice_pos[1])
+        rects = self._choice_item_rects()
+        if not rects:
+            return [int(cx - 110), int(cy - 60), 220, 120]
         left = min(r[0] for r in rects)
         top = min(r[1] for r in rects)
         right = max(r[0] + r[2] for r in rects)
@@ -486,7 +657,7 @@ class LayoutPreview(QWidget):
         w = max(float(self._min_w), float(w))
         h = max(float(self._min_h), float(h))
 
-        # Special mapping for HUD group: resize updates scale, move updates pos.
+        # Special mapping for HUD/choice group: resize updates scale, move updates pos.
         if self._selected == "hud":
             if self._drag_mode == "move":
                 self._hud_pos = [int(round(x)), int(round(y))]
@@ -498,6 +669,17 @@ class LayoutPreview(QWidget):
                 self._hud_scale = max(0.5, min(5.0, float(self._hud_scale) * float(ratio)))
                 self._hud_pos = [int(round(x)), int(round(y))]
             self._hud_rect = self._compute_hud_rect()
+        elif self._selected == "choice":
+            if self._drag_mode == "move":
+                self._choice_pos = [int(round(x + w / 2.0)), int(round(y + h / 2.0))]
+            elif self._drag_mode == "resize":
+                try:
+                    ratio = float(h) / max(1.0, float(h0))
+                except Exception:
+                    ratio = 1.0
+                self._choice_scale = max(0.5, min(5.0, float(self._choice_scale) * float(ratio)))
+                self._choice_pos = [int(round(x + w / 2.0)), int(round(y + h / 2.0))]
+            self._choice_rect = self._compute_choice_rect()
         else:
             self._set_rect_by_name(self._selected, [int(round(x)), int(round(y)), int(round(w)), int(round(h))])
         self.update()
@@ -651,6 +833,8 @@ class LayoutPreview(QWidget):
         return x, y, w, h
 
     def _get_rect_by_name(self, name: str) -> list[int]:
+        if name == "choice":
+            return self._choice_rect
         if name == "hud":
             return self._hud_rect
         if name == "text":
@@ -664,7 +848,9 @@ class LayoutPreview(QWidget):
         return self._text_rect
 
     def _set_rect_by_name(self, name: str, rect_vals: list[int]):
-        if name == "hud":
+        if name == "choice":
+            self._choice_rect = rect_vals
+        elif name == "hud":
             self._hud_rect = rect_vals
         elif name == "text":
             self._text_rect = rect_vals
@@ -709,6 +895,9 @@ class LayoutPreview(QWidget):
             "portrait2_size": [base_pw2, base_ph2],
             "portrait2_scale": float(self._portrait2_scale),
         }
+        if self._choice_enabled:
+            out["choice_button_pos"] = [int(self._choice_pos[0]), int(self._choice_pos[1])]
+            out["choice_button_scale"] = float(self._choice_scale)
         if self._hud_enabled:
             out["hud_button_pos"] = [int(self._hud_pos[0]), int(self._hud_pos[1])]
             out["hud_button_scale"] = float(self._hud_scale)
@@ -808,6 +997,56 @@ class LayoutPreview(QWidget):
                 fallback_color=QColor(0, 0, 0, 180),
                 border=QColor(255, 200, 120, 180),
             )
+
+        # choice button group (visual)
+        if self._choice_enabled:
+            choice_rect = self._choice_rect
+            wx, wy, ww, wh = self._base_to_widget_rect(choice_rect)
+            # light container hint
+            painter.setBrush(QBrush(QColor(255, 255, 255, 14)))
+            painter.setPen(QPen(QColor(255, 255, 255, 80), 1))
+            painter.drawRoundedRect(wx, wy, ww, wh, 10, 10)
+
+            col = self._choice_color if isinstance(self._choice_color, (list, tuple)) else [230, 230, 230]
+            hov = self._choice_hover_color if isinstance(self._choice_hover_color, (list, tuple)) else list(col)
+            try:
+                r, g, b = int(col[0]), int(col[1]), int(col[2])
+            except Exception:
+                r, g, b = 230, 230, 230
+            try:
+                hr, hg, hb = int(hov[0]), int(hov[1]), int(hov[2])
+            except Exception:
+                hr, hg, hb = r, g, b
+
+            sx, sy = self._sx_sy()
+            font = QFont("Arial")
+            font.setPixelSize(max(8, int(float(self._choice_font_size) * float(self._choice_scale) * min(sx, sy))))
+            painter.setFont(font)
+
+            pad = self._choice_padding if isinstance(self._choice_padding, (list, tuple)) else [18, 10]
+            try:
+                px, py = int(pad[0]), int(pad[1])
+            except Exception:
+                px, py = 18, 10
+
+            rects = self._choice_item_rects()
+            bg_pix = self._pix(self._choice_bg_image)
+            for idx, br in enumerate(rects):
+                bx, by, bw, bh = br
+                bwx, bwy, bww, bwh = self._base_to_widget_rect([bx, by, bw, bh])
+                if bg_pix is not None:
+                    painter.save()
+                    painter.setOpacity(max(0.0, min(1.0, float(self._choice_bg_alpha) / 255.0)))
+                    painter.drawPixmap(bwx, bwy, bww, bwh, bg_pix)
+                    painter.restore()
+                else:
+                    painter.setBrush(QBrush(QColor(0, 0, 0, 130)))
+                    painter.setPen(QPen(QColor(255, 255, 255, 110), 1))
+                    painter.drawRoundedRect(bwx, bwy, bww, bwh, 8, 8)
+
+                painter.setPen(QPen(QColor(hr, hg, hb, 220) if idx == 0 else QColor(r, g, b, 220), 1))
+                label = (self._choice_sample_options[idx] if idx < len(self._choice_sample_options) else f"选项 {idx + 1}")
+                painter.drawText(QRect(bwx, bwy, bww, bwh), Qt.AlignmentFlag.AlignCenter, str(label))
 
         # HUD button group (visual)
         if self._hud_enabled:
@@ -1090,6 +1329,58 @@ class UILayoutDesigner(QDialog):
 
         sec_hud.setContentLayout(hud_box)
 
+        # choice button group (for choice nodes)
+        self.choice_enabled_chk = QCheckBox("启用选项按钮组（choice 节点）")
+        self.choice_enabled_chk.setChecked(False)
+        self.choice_orient_combo = QComboBox()
+        self.choice_orient_combo.addItems(["纵向排列", "横向排列"])
+        self.choice_x = self._spin(-2000, 8000, 120)
+        self.choice_y = self._spin(-2000, 8000, 140)
+        self.choice_spacing = self._spin(0, 300, 12)
+        self.choice_scale = self._dspin(0.5, 5.0, 1.0, 0.1)
+        self.choice_hover_zoom = self._dspin(1.0, 1.8, 1.08, 0.02)
+        self.choice_font_size = self._spin(8, 72, 20)
+        self.choice_overlay_alpha = self._spin(0, 255, 180)
+        self.choice_color_edit = QLineEdit("#E6E6E6")
+        self.choice_hover_color_edit = QLineEdit("#FFFFFF")
+
+        self.choice_bg_edit = QLineEdit()
+        choice_bg_row = self._make_file_row(
+            self.choice_bg_edit,
+            lambda: self._pick_and_store_image(self.choice_bg_edit, "resources/images/ui", "选择选项按钮背景图"),
+            lambda: self._clear_line(self.choice_bg_edit),
+            "选择图片",
+        )
+        self.choice_bg_alpha = self._spin(0, 255, 255)
+        self.choice_pad_x = self._spin(0, 200, 18)
+        self.choice_pad_y = self._spin(0, 200, 10)
+        self.choice_min_w = self._spin(0, 2000, 0)
+        self.choice_min_h = self._spin(0, 2000, 0)
+
+        sec_choice = _CollapsibleSection("选项按钮组")
+        choice_box = QVBoxLayout()
+        choice_form = QFormLayout()
+        choice_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        choice_form.addRow(self.choice_enabled_chk)
+        choice_form.addRow("排列", self.choice_orient_combo)
+        choice_form.addRow("x", self.choice_x)
+        choice_form.addRow("y", self.choice_y)
+        choice_form.addRow("间距", self.choice_spacing)
+        choice_form.addRow("缩放", self.choice_scale)
+        choice_form.addRow("悬停缩放", self.choice_hover_zoom)
+        choice_form.addRow("字体大小(px)", self.choice_font_size)
+        choice_form.addRow("遮罩透明度(0-255)", self.choice_overlay_alpha)
+        choice_form.addRow("文字颜色(#RRGGBB)", self._make_color_row(self.choice_color_edit))
+        choice_form.addRow("悬停文字颜色(#RRGGBB)", self._make_color_row(self.choice_hover_color_edit))
+        choice_form.addRow("按钮背景图", choice_bg_row)
+        choice_form.addRow("背景透明度(0-255)", self.choice_bg_alpha)
+        choice_form.addRow("内边距 x", self.choice_pad_x)
+        choice_form.addRow("内边距 y", self.choice_pad_y)
+        choice_form.addRow("最小宽", self.choice_min_w)
+        choice_form.addRow("最小高", self.choice_min_h)
+        choice_box.addLayout(choice_form)
+        sec_choice.setContentLayout(choice_box)
+
         # preview sample images (only for designer preview)
         self.preview_bg_edit = QLineEdit()
         preview_bg_row = self._make_file_row(
@@ -1157,6 +1448,7 @@ class UILayoutDesigner(QDialog):
         left_layout.addWidget(sec_portrait2)
         left_layout.addWidget(sec_frames)
         left_layout.addWidget(sec_hud)
+        left_layout.addWidget(sec_choice)
         left_layout.addWidget(sec_preview_assets)
         left_layout.addStretch(1)
 
@@ -1213,6 +1505,18 @@ class UILayoutDesigner(QDialog):
             self.hud_spacing,
             self.hud_scale,
             self.hud_selected_zoom,
+            self.choice_x,
+            self.choice_y,
+            self.choice_spacing,
+            self.choice_scale,
+            self.choice_hover_zoom,
+            self.choice_font_size,
+            self.choice_overlay_alpha,
+            self.choice_bg_alpha,
+            self.choice_pad_x,
+            self.choice_pad_y,
+            self.choice_min_w,
+            self.choice_min_h,
         ]:
             sp.valueChanged.connect(self._update_preview)
 
@@ -1224,6 +1528,9 @@ class UILayoutDesigner(QDialog):
             self.preview_portrait2_edit,
             self.hud_color_edit,
             self.hud_hover_color_edit,
+            self.choice_color_edit,
+            self.choice_hover_color_edit,
+            self.choice_bg_edit,
         ]:
             ed.editingFinished.connect(self._update_preview)
 
@@ -1233,6 +1540,8 @@ class UILayoutDesigner(QDialog):
         self.grid_size.valueChanged.connect(self._update_preview)
         self.hud_enabled_chk.toggled.connect(self._update_preview)
         self.hud_orient_combo.currentIndexChanged.connect(self._update_preview)
+        self.choice_enabled_chk.toggled.connect(self._update_preview)
+        self.choice_orient_combo.currentIndexChanged.connect(self._update_preview)
         for w in self._hud_button_mode:
             w.currentIndexChanged.connect(self._update_preview)
         for w in self._hud_button_text:
@@ -1475,6 +1784,17 @@ class UILayoutDesigner(QDialog):
                     self.hud_scale.setValue(float(hs))
                 except Exception:
                     pass
+
+            cp = changed.get("choice_button_pos")
+            cs = changed.get("choice_button_scale")
+            if isinstance(cp, (list, tuple)) and len(cp) >= 2:
+                self.choice_x.setValue(int(cp[0]))
+                self.choice_y.setValue(int(cp[1]))
+            if cs is not None:
+                try:
+                    self.choice_scale.setValue(float(cs))
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
@@ -1561,6 +1881,22 @@ class UILayoutDesigner(QDialog):
             "hud_button_color": self._hex_to_rgb(self.hud_color_edit.text(), fallback=(255, 255, 255)),
             "hud_button_hover_color": self._hex_to_rgb(self.hud_hover_color_edit.text(), fallback=(255, 255, 255)),
             "hud_buttons": hud_buttons,
+
+            "choice_buttons_enabled": bool(self.choice_enabled_chk.isChecked()),
+            "choice_button_orientation": "horizontal" if self.choice_orient_combo.currentIndex() == 1 else "vertical",
+            "choice_button_pos": [int(self.choice_x.value()), int(self.choice_y.value())],
+            "choice_button_spacing": int(self.choice_spacing.value()),
+            "choice_button_scale": float(self.choice_scale.value()),
+            "choice_button_hover_zoom": float(self.choice_hover_zoom.value()),
+            "choice_button_font_size": int(self.choice_font_size.value()),
+            "choice_button_text_color": self._hex_to_rgb(self.choice_color_edit.text(), fallback=(230, 230, 230)),
+            "choice_button_text_hover_color": self._hex_to_rgb(self.choice_hover_color_edit.text(), fallback=(255, 255, 255)),
+            "choice_overlay_alpha": int(self.choice_overlay_alpha.value()),
+            "choice_button_bg_image": self.choice_bg_edit.text().strip(),
+            "choice_button_bg_alpha": int(self.choice_bg_alpha.value()),
+            "choice_button_padding": [int(self.choice_pad_x.value()), int(self.choice_pad_y.value())],
+            "choice_button_min_size": [int(self.choice_min_w.value()), int(self.choice_min_h.value())],
+
             "preview_background": self.preview_bg_edit.text().strip(),
             "preview_portrait": self.preview_portrait_edit.text().strip(),
             "preview_portrait2": self.preview_portrait2_edit.text().strip(),
@@ -1659,6 +1995,61 @@ class UILayoutDesigner(QDialog):
                     self._hud_button_image_scale[idx].setValue(float(it.get("image_scale", 1.0) or 1.0))
                 except Exception:
                     self._hud_button_image_scale[idx].setValue(1.0)
+
+            # choice button group
+            self.choice_enabled_chk.setChecked(bool(data.get("choice_buttons_enabled", False)))
+            orient = str(data.get("choice_button_orientation") or "vertical").strip().lower()
+            self.choice_orient_combo.setCurrentIndex(1 if orient in {"horizontal", "h", "row", "x"} else 0)
+            pos = data.get("choice_button_pos")
+            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                try:
+                    self.choice_x.setValue(int(pos[0]))
+                    self.choice_y.setValue(int(pos[1]))
+                except Exception:
+                    pass
+            try:
+                self.choice_spacing.setValue(int(data.get("choice_button_spacing", 12) or 12))
+            except Exception:
+                self.choice_spacing.setValue(12)
+            try:
+                self.choice_scale.setValue(float(data.get("choice_button_scale", 1.0) or 1.0))
+            except Exception:
+                self.choice_scale.setValue(1.0)
+            try:
+                self.choice_hover_zoom.setValue(float(data.get("choice_button_hover_zoom", 1.08) or 1.08))
+            except Exception:
+                self.choice_hover_zoom.setValue(1.08)
+            try:
+                self.choice_font_size.setValue(int(data.get("choice_button_font_size", 20) or 20))
+            except Exception:
+                self.choice_font_size.setValue(20)
+            try:
+                self.choice_overlay_alpha.setValue(int(data.get("choice_overlay_alpha", 180) or 180))
+            except Exception:
+                self.choice_overlay_alpha.setValue(180)
+            self.choice_color_edit.setText(self._rgb_to_hex(data.get("choice_button_text_color"), "#E6E6E6"))
+            self.choice_hover_color_edit.setText(
+                self._rgb_to_hex(data.get("choice_button_text_hover_color", data.get("choice_button_text_color")), "#FFFFFF")
+            )
+            self.choice_bg_edit.setText(str(data.get("choice_button_bg_image") or ""))
+            try:
+                self.choice_bg_alpha.setValue(int(data.get("choice_button_bg_alpha", 255) or 255))
+            except Exception:
+                self.choice_bg_alpha.setValue(255)
+            pad = data.get("choice_button_padding")
+            if isinstance(pad, (list, tuple)) and len(pad) >= 2:
+                try:
+                    self.choice_pad_x.setValue(int(pad[0]))
+                    self.choice_pad_y.setValue(int(pad[1]))
+                except Exception:
+                    pass
+            ms = data.get("choice_button_min_size")
+            if isinstance(ms, (list, tuple)) and len(ms) >= 2:
+                try:
+                    self.choice_min_w.setValue(int(ms[0]))
+                    self.choice_min_h.setValue(int(ms[1]))
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:

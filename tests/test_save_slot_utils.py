@@ -8,6 +8,7 @@ from src.game.save_slot_utils import (
     digit_to_slot,
     page_count,
     slot_file_path,
+    slot_thumbnail_path,
 )
 
 
@@ -16,6 +17,13 @@ def test_slot_file_path_manual_and_auto():
     assert slot_file_path(base, AUTO_SAVE_SLOT).name == "autosave.json"
     assert slot_file_path(base, 1).name == "slot_1.json"
     assert slot_file_path(base, 15).name == "slot_15.json"
+
+
+def test_slot_thumbnail_path_manual_and_auto():
+    base = Path("C:/tmp/saves")
+    assert slot_thumbnail_path(base, AUTO_SAVE_SLOT).name == "autosave_thumb.png"
+    assert slot_thumbnail_path(base, 1).name == "slot_1_thumb.png"
+    assert slot_thumbnail_path(base, 15).name == "slot_15_thumb.png"
 
 
 def test_page_count_and_clamp():

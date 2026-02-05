@@ -71,6 +71,119 @@ def test_step5_text_node_aggregation_and_split_rules():
     assert len(pending.bgms) >= 1
 
 
+def test_step5_sub_dialogue_var_ops_are_preserved_per_line():
+    sg = StepGenerator(ConfigManager())
+
+    story = {
+        "style": "现代",
+        "enable_condition_node": False,
+    }
+    chars = [
+        {"char_id": "char_a", "char_name": "Alice"},
+    ]
+
+    chapter_details = [
+        {
+            "structured": {
+                "chapter_title": "第1章",
+                "summary": "测试子对白变量处理",
+                "dialogues": [
+                    {"background": "bg_room"},
+                    {
+                        "speaker": "Alice",
+                        "text": "设置变量",
+                        "var_ops": [
+                            {
+                                "dest": "flag",
+                                "op": "=",
+                                "left": 0,
+                                "left_const": True,
+                                "right": 1,
+                                "right_const": True,
+                            }
+                        ],
+                    },
+                    {"speaker": "Alice", "text": "后续对白"},
+                ],
+            }
+        }
+    ]
+
+    result = sg.build_pending_and_flow(story, chars, chapter_details)
+    nodes = result["flow_nodes"]
+    assert len(nodes) == 1
+    assert nodes[0].node_type == "text"
+    assert len(nodes[0].sub_dialogues) == 2
+
+    first = nodes[0].sub_dialogues[0]
+    second = nodes[0].sub_dialogues[1]
+
+    assert isinstance(first.get("var_ops"), list)
+    assert first["var_ops"][0]["dest"] == "flag"
+    assert first["var_ops"][0]["op"] == "="
+    assert isinstance(second.get("var_ops"), list)
+    assert second.get("var_ops") in ([], None)
+
+
+def test_step5_missing_target_chapter_falls_back_to_next_chapter_to_avoid_dangling_option_node():
+    sg = StepGenerator(ConfigManager())
+
+    story = {
+        "style": "现代",
+        "enable_condition_node": False,
+    }
+    chars = [
+        {"char_id": "char_a", "char_name": "Alice"},
+    ]
+
+    chapter_details = [
+        {
+            "structured": {
+                "chapter_id": "1",
+                "chapter_title": "第1章",
+                "summary": "测试缺失目标章节",
+                "scenes": [
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "1"}]}
+                ],
+                "exit": {
+                    "type": "choice",
+                    "choice": {
+                        "prompt": "去不存在的章节？",
+                        "options": [
+                            {"text": "去不存在", "next_chapter_id": "MISSING_CHAPTER", "node": {"dialogues": []}},
+                            {"text": "去下一章", "next_chapter_id": "2", "node": {"dialogues": []}},
+                        ],
+                    },
+                },
+            }
+        },
+        {
+            "structured": {
+                "chapter_id": "2",
+                "chapter_title": "第2章",
+                "summary": "下一章",
+                "scenes": [
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "2"}]}
+                ],
+                "exit": {"type": "end"},
+            }
+        },
+    ]
+
+    result = sg.build_pending_and_flow(story, chars, chapter_details)
+    nodes = result["flow_nodes"]
+    conns = result["connections"]
+
+    start_2 = next(n for n in nodes if n.node_type == "text" and n.title == "第2章")
+    opt_missing = next(n for n in nodes if n.node_type == "text" and n.title == "选项：去不存在")
+
+    # 目标章节不存在时，应 fallback 到下一章（第2章）首节点，避免 opt_missing 无下游
+    assert any(c.source == opt_missing.id and c.target == start_2.id for c in conns)
+
+    # 额外保障：选项附属节点至少有一条出边（不悬空）
+    assert any(c.source == opt_missing.id for c in conns)
+
+
 def test_step5_pov_first_person_skips_portrait_and_voice_and_cg_pending_has_node_id():
     sg = StepGenerator(ConfigManager())
 
@@ -323,14 +436,20 @@ def test_step5_chapter_level_choice_exit_builds_branch_chapters_and_converges():
     # 不应出现旧的“分支占位”文本节点（说明没有走回退桩逻辑）
     assert all("分支占位" not in (n.content or "") for n in nodes)
 
-    # choice 的两条出边应分别指向 4A/4B 章节的首节点，并保持顺序
+    # choice 的两条出边应先进入“选项附属文本节点”，再跳转到 4A/4B 章节首节点，并保持顺序
     # 由于 node_id 是递增的，这里用 title 匹配章节首节点的 title（由 chap_title 生成）
     start_4a = next(n for n in nodes if n.node_type == "text" and n.title == "第4A章")
     start_4b = next(n for n in nodes if n.node_type == "text" and n.title == "第4B章")
     start_6 = next(n for n in nodes if n.node_type == "text" and n.title == "第6章-汇聚")
 
+    opt_a = next(n for n in nodes if n.node_type == "text" and n.title == "选项：走A线")
+    opt_b = next(n for n in nodes if n.node_type == "text" and n.title == "选项：走B线")
+
     out_from_choice = [c.target for c in conns if c.source == choice_nodes[0].id]
-    assert out_from_choice == [start_4a.id, start_4b.id]
+    assert out_from_choice == [opt_a.id, opt_b.id]
+
+    assert any(c.source == opt_a.id and c.target == start_4a.id for c in conns)
+    assert any(c.source == opt_b.id and c.target == start_4b.id for c in conns)
 
     # A/B 两章应都能连到第6章首节点（汇聚）
     in_to_6 = [c.source for c in conns if c.target == start_6.id]
@@ -592,7 +711,12 @@ def test_step5_branch_plan_fallback_creates_choice_and_route_links_when_step4_mi
     start_5b = next(n for n in nodes if n.node_type == "text" and n.title == "第5B章")
 
     out_from_choice = [c.target for c in conns if c.source == choice_nodes[0].id]
-    assert out_from_choice == [start_4a.id, start_4b.id]
+    opt_a = next(n for n in nodes if n.node_type == "text" and n.title == "选项：走A线")
+    opt_b = next(n for n in nodes if n.node_type == "text" and n.title == "选项：走B线")
+    assert out_from_choice == [opt_a.id, opt_b.id]
+
+    assert any(c.source == opt_a.id and c.target == start_4a.id for c in conns)
+    assert any(c.source == opt_b.id and c.target == start_4b.id for c in conns)
 
     # 分支内部的 route 连线应按 leads_to 顺序生成
     assert any(c.source == start_4a.id and c.target == start_5a.id for c in conns)
@@ -726,12 +850,15 @@ def test_step5_delayed_branch_via_var_ops_then_condition_from_branch_plan_fallba
                     "at_chapter_id": "5",
                     "prompt": "根据 route_flag 进入不同路线",
                     "condition": {
-                        "var": "route_flag",
-                        "op": "==",
-                        "value": 1,
-                        "const": True,
-                        "true_leads_to": ["6A"],
-                        "false_leads_to": ["6B"],
+                        "rules": [
+                            {
+                                "name": "RouteIsA",
+                                "logic": "and",
+                                "exprs": ["route_flag == 1"],
+                                "leads_to": ["6A"],
+                            }
+                        ],
+                        "else_leads_to": ["6B"],
                     },
                 },
             ],
@@ -762,8 +889,150 @@ def test_step5_delayed_branch_via_var_ops_then_condition_from_branch_plan_fallba
     # 两个选项处理节点都应合并回共通第4章
     assert all(any(c.source == n.id and c.target == start_4.id for c in conns) for n in opt_nodes)
 
-    # 第5章处应生成 condition 节点，并按 true/false 顺序指向 6A/6B
-    cond_nodes = [n for n in nodes if n.node_type == "condition" and n.condition_var == "route_flag"]
+    # 第5章处应生成 condition 节点（新结构：condition_rules + 否则分支）
+    def _rule_exprs(rule):
+        if isinstance(rule, dict):
+            return rule.get("exprs") or []
+        return getattr(rule, "exprs", None) or []
+
+    cond_nodes = [
+        n
+        for n in nodes
+        if n.node_type == "condition"
+        and isinstance(getattr(n, "condition_rules", None), list)
+        and any(
+            "route_flag" in str(expr)
+            for rule in (n.condition_rules or [])
+            for expr in _rule_exprs(rule)
+        )
+    ]
     assert len(cond_nodes) == 1
-    out_from_cond = [c.target for c in conns if c.source == cond_nodes[0].id]
-    assert out_from_cond == [start_6a.id, start_6b.id]
+    cond_node = cond_nodes[0]
+    assert any("route_flag" in str(expr) for expr in _rule_exprs(cond_node.condition_rules[0]))
+
+    # 条件节点出边应为：Rule1 + Else，并各生成一个“分支处理节点”
+    out_from_cond = [c.target for c in conns if c.source == cond_node.id]
+    assert len(out_from_cond) == 2
+    rule1_node = next(n for n in nodes if n.id == out_from_cond[0])
+    else_node = next(n for n in nodes if n.id == out_from_cond[1])
+    assert rule1_node.node_type == "text" and rule1_node.title.endswith("-Rule1")
+    assert else_node.node_type == "text" and else_node.title.endswith("-Else")
+
+    # 分支处理节点再跨章节连到目标章节起始节点
+    assert any(c.source == rule1_node.id and c.target == start_6a.id for c in conns)
+    assert any(c.source == else_node.id and c.target == start_6b.id for c in conns)
+
+
+def test_step5_scene_choice_generates_option_nodes_with_branch_dialogues_and_merges_back():
+    sg = StepGenerator(ConfigManager())
+
+    story = {
+        "style": "现代",
+        "enable_condition_node": False,
+    }
+    chars = [
+        {"char_id": "char_a", "char_name": "Alice"},
+    ]
+
+    chapter_details = [
+        {
+            "structured": {
+                "chapter_id": "1",
+                "chapter_title": "第1章",
+                "summary": "场景内选择分支",
+                "scenes": [
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "选择前"}]},
+                    {
+                        "type": "choice",
+                        "title": "路口选择",
+                        "prompt": "你要往哪边走？",
+                        "options": [
+                            {"text": "去左边", "node": {"dialogues": [{"speaker": "Alice", "text": "走左边。", "emotion": "calm"}]}, "var_ops": []},
+                            {"text": "去右边", "node": {"dialogues": [{"speaker": "Alice", "text": "走右边。", "emotion": "calm"}]}, "var_ops": []},
+                        ],
+                    },
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "选择后汇合"}]},
+                ],
+                "exit": {"type": "end"},
+            }
+        }
+    ]
+
+    result = sg.build_pending_and_flow(story, chars, chapter_details)
+    nodes = result["flow_nodes"]
+    conns = result["connections"]
+
+    choice_node = next(n for n in nodes if n.node_type == "choice" and n.title == "路口选择")
+    opt_left = next(n for n in nodes if n.node_type == "text" and n.title == "选项：去左边")
+    opt_right = next(n for n in nodes if n.node_type == "text" and n.title == "选项：去右边")
+    after_node = next(n for n in nodes if n.node_type == "text" and any((sub.get("text") or "") == "选择后汇合" for sub in (n.sub_dialogues or [])))
+
+    # choice 必须先连到两个选项节点（顺序保持）
+    out_from_choice = [c.target for c in conns if c.source == choice_node.id]
+    assert out_from_choice == [opt_left.id, opt_right.id]
+
+    # 两个选项节点都应承载分支对白，并汇合回后续节点
+    assert any((sub.get("text") or "") == "走左边。" for sub in (opt_left.sub_dialogues or []))
+    assert any((sub.get("text") or "") == "走右边。" for sub in (opt_right.sub_dialogues or []))
+    assert any(c.source == opt_left.id and c.target == after_node.id for c in conns)
+    assert any(c.source == opt_right.id and c.target == after_node.id for c in conns)
+
+
+def test_step5_scene_condition_generates_true_false_nodes_with_dialogues_and_merges_back():
+    sg = StepGenerator(ConfigManager())
+
+    story = {
+        "style": "现代",
+        "enable_condition_node": True,
+    }
+    chars = [
+        {"char_id": "char_a", "char_name": "Alice"},
+    ]
+
+    chapter_details = [
+        {
+            "structured": {
+                "chapter_id": "1",
+                "chapter_title": "第1章",
+                "summary": "场景内条件分支",
+                "scenes": [
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "判断前"}]},
+                    {
+                        "type": "condition",
+                        "title": "是否有钥匙",
+                        "prompt": "检查钥匙",
+                        "condition": {
+                            "rules": [
+                                {
+                                    "name": "HasKey",
+                                    "logic": "and",
+                                    "exprs": ["has_key == 1"],
+                                    "node": {"dialogues": [{"speaker": "Alice", "text": "有钥匙。", "emotion": "calm"}]},
+                                }
+                            ],
+                            "else_node": {"dialogues": [{"speaker": "Alice", "text": "没钥匙。", "emotion": "calm"}]},
+                        },
+                    },
+                    {"type": "text", "directives": {"background": "bg_room"}, "dialogues": [{"speaker": "Alice", "text": "判断后汇合"}]},
+                ],
+                "exit": {"type": "end"},
+            }
+        }
+    ]
+
+    result = sg.build_pending_and_flow(story, chars, chapter_details)
+    nodes = result["flow_nodes"]
+    conns = result["connections"]
+
+    cond_node = next(n for n in nodes if n.node_type == "condition" and n.title == "是否有钥匙")
+    rule1_node = next(n for n in nodes if n.node_type == "text" and n.title.endswith("-Rule1"))
+    else_node = next(n for n in nodes if n.node_type == "text" and n.title.endswith("-Else"))
+    after_node = next(n for n in nodes if n.node_type == "text" and any((sub.get("text") or "") == "判断后汇合" for sub in (n.sub_dialogues or [])))
+
+    out_from_cond = [c.target for c in conns if c.source == cond_node.id]
+    assert out_from_cond == [rule1_node.id, else_node.id]
+
+    assert any((sub.get("text") or "") == "有钥匙。" for sub in (rule1_node.sub_dialogues or []))
+    assert any((sub.get("text") or "") == "没钥匙。" for sub in (else_node.sub_dialogues or []))
+    assert any(c.source == rule1_node.id and c.target == after_node.id for c in conns)
+    assert any(c.source == else_node.id and c.target == after_node.id for c in conns)

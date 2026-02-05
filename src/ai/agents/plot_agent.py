@@ -615,6 +615,40 @@ class PlotAgent:
                 # condition 节点
                 cond = scene.get("condition")
                 if cond:
+                    if not isinstance(cond, dict):
+                        raise ValueError("scene.condition 必须是 dict")
+                    legacy_keys = {"var", "op", "value", "const"}
+                    if legacy_keys.intersection(cond.keys()):
+                        raise ValueError(
+                            "PlotAgent 仅支持新条件结构 condition_rules/rules（ordered rules + else），不再支持 var/op/value/const。"
+                        )
+
+                    raw_rules = cond.get("condition_rules")
+                    if raw_rules is None:
+                        raw_rules = cond.get("rules")
+                    if raw_rules is None:
+                        raw_rules = []
+                    if not isinstance(raw_rules, list):
+                        raise ValueError("scene.condition.condition_rules/rules 必须是 list")
+
+                    norm_rules = []
+                    for i, r in enumerate(raw_rules):
+                        if not isinstance(r, dict):
+                            continue
+                        name = str(r.get("name") or f"Rule{i+1}").strip()
+                        logic = str(r.get("logic") or "and").strip().lower()
+                        if logic not in {"and", "or"}:
+                            logic = "and"
+                        exprs = r.get("exprs")
+                        if exprs is None:
+                            exprs = r.get("expressions")
+                        if exprs is None:
+                            exprs = []
+                        if not isinstance(exprs, list):
+                            raise ValueError("rule.exprs 必须是 list")
+                        norm_exprs = [str(e).strip() for e in exprs if str(e).strip()]
+                        norm_rules.append({"name": name, "logic": logic, "exprs": norm_exprs})
+
                     cond_node = FlowNodeData(
                         id=node_id,
                         node_type="condition",
@@ -626,10 +660,7 @@ class PlotAgent:
                         voice="",
                         bgm=bgm_path,
                         bgm_loop=True,
-                        condition_var=cond.get("var", "favorability"),
-                        condition_op=cond.get("op", ">="),
-                        condition_value=str(cond.get("value", 0)),
-                        condition_const=True,
+                        condition_rules=norm_rules,
                         x=x + 200,
                         y=y,
                     )

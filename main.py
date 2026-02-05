@@ -8,8 +8,48 @@ VNEngine 视觉小说引擎入口文件
 2) 预览模式：--preview <project.vngproj>
 """
 import sys
+import os
+import re
 from src.designer.main_designer import run_designer
 from src.game.preview_runner import main as preview_main
+
+
+def _install_qt_message_filter():
+    """Filter noisy Qt font warnings on Windows.
+
+    Some system fonts can trigger repeated DirectWrite warnings like:
+    `QWindowsFontEngineDirectWrite::recalcAdvances: GetDesignGlyphMetrics failed (操作成功完成。)`
+
+    This is typically harmless but very noisy in console.
+    """
+
+    # Allow users to opt-out
+    if os.environ.get("VNENGINE_QT_LOG_FILTER", "1").strip() in ("0", "false", "False"):
+        return
+
+    try:
+        from PyQt6.QtCore import qInstallMessageHandler
+    except Exception:
+        return
+
+    pattern = re.compile(r"QWindowsFontEngineDirectWrite::recalcAdvances: GetDesignGlyphMetrics failed")
+
+    def handler(msg_type, context, message):
+        try:
+            if isinstance(message, str) and pattern.search(message):
+                return
+        except Exception:
+            pass
+        try:
+            # Fallback: print the original message
+            print(message)
+        except Exception:
+            pass
+
+    try:
+        qInstallMessageHandler(handler)
+    except Exception:
+        pass
 
 
 def _dispatch(argv):
@@ -23,6 +63,7 @@ def _dispatch(argv):
         return
 
     print("VNEngine 视觉小说引擎启动中...")
+    _install_qt_message_filter()
     run_designer()
 
 

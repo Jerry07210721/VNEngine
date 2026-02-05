@@ -1029,6 +1029,11 @@ class FunctionMenuDesigner(QDialog):
         layout_form = QFormLayout(layout_box)
 
         if key in {"save", "load"}:
+            # page size (slots per page)
+            page_size = self._spin(1, 10, 10)
+            page_size.setToolTip("每页显示的槽位数量（1-10）。影响翻页和数字键选择范围。")
+            layout_form.addRow("每页槽位数(1-10)", page_size)
+
             # slot list
             slot_pos = QWidget()
             slot_lay = QHBoxLayout(slot_pos)
@@ -1101,6 +1106,7 @@ class FunctionMenuDesigner(QDialog):
             setattr(self, f"{key}_page_next_y", npy)
             setattr(self, f"{key}_page_text_x", tpx)
             setattr(self, f"{key}_page_text_y", tpy)
+            setattr(self, f"{key}_page_size", page_size)
 
         elif key == "settings":
             spos = QWidget()
@@ -1199,7 +1205,12 @@ class FunctionMenuDesigner(QDialog):
                         lw = int(getattr(self, f"{key}_slot_list_width").value())
                         rh = int(getattr(self, f"{key}_slot_row_height").value())
                         sp = int(getattr(self, f"{key}_slot_row_spacing").value())
-                        approx_h = (rh + sp) * 10 - sp
+                        try:
+                            ps = int(getattr(self, f"{key}_page_size").value())
+                        except Exception:
+                            ps = 10
+                        ps = max(1, min(10, int(ps)))
+                        approx_h = (rh + sp) * ps - sp
                         preview.set_rect("slot_list", lx, ly, max(80, lw), max(40, approx_h))
 
                         if "row_height_handle" in preview._items:
@@ -1227,6 +1238,7 @@ class FunctionMenuDesigner(QDialog):
                         preview.set_rect("slider1", sx, sy + gap, max(80, sw), max(6, sh))
                         preview.set_rect("slider2", sx, sy + gap * 2, max(80, sw), max(6, sh))
                         preview.set_rect("slider3", sx, sy + gap * 3, max(80, sw), max(6, sh))
+                        preview.set_rect("slider4", sx, sy + gap * 4, max(80, sw), max(6, sh))
                         # gap handle at second slider
                         preview.set_rect("gap_handle", sx - 18, sy + gap - 8, 16, 16)
 
@@ -1333,6 +1345,7 @@ class FunctionMenuDesigner(QDialog):
                 )
 
                 for spn in (
+                    getattr(self, f"{key}_page_size"),
                     getattr(self, f"{key}_slot_list_x"),
                     getattr(self, f"{key}_slot_list_y"),
                     getattr(self, f"{key}_slot_list_width"),
@@ -1396,8 +1409,9 @@ class FunctionMenuDesigner(QDialog):
                 preview.add_rect("slider1", 80, 210, max(80, self.project_resolution[0] - 160), 10, on_changed=lambda _i: None)
                 preview.add_rect("slider2", 80, 280, max(80, self.project_resolution[0] - 160), 10, on_changed=lambda _i: None)
                 preview.add_rect("slider3", 80, 350, max(80, self.project_resolution[0] - 160), 10, on_changed=lambda _i: None)
+                preview.add_rect("slider4", 80, 420, max(80, self.project_resolution[0] - 160), 10, on_changed=lambda _i: None)
                 # only slider0 is directly movable/resizable; other sliders follow
-                for sn in ("slider0", "slider1", "slider2", "slider3"):
+                for sn in ("slider0", "slider1", "slider2", "slider3", "slider4"):
                     preview.style_rect(
                         sn,
                         label=sn,
@@ -1407,6 +1421,7 @@ class FunctionMenuDesigner(QDialog):
                 preview._items["slider1"]._movable = False
                 preview._items["slider2"]._movable = False
                 preview._items["slider3"]._movable = False
+                preview._items["slider4"]._movable = False
 
                 preview.add_rect("gap_handle", 62, 210 - 8, 16, 16, on_changed=on_gap_handle_changed, resizable=False, min_w=10, min_h=10)
                 preview.style_rect(
@@ -1651,6 +1666,12 @@ class FunctionMenuDesigner(QDialog):
             # layout fields
             if key in {"save", "load"}:
                 try:
+                    ps = int(spec.get("page_size", 10) or 10)
+                    ps = max(1, min(10, ps))
+                    getattr(self, f"{key}_page_size").setValue(int(ps))
+                except Exception:
+                    pass
+                try:
                     pos = spec.get("slot_list_pos", [40, 120])
                     getattr(self, f"{key}_slot_list_x").setValue(int(pos[0]))
                     getattr(self, f"{key}_slot_list_y").setValue(int(pos[1]))
@@ -1774,6 +1795,11 @@ class FunctionMenuDesigner(QDialog):
                 d["background_alpha"] = int(getattr(self, f"{key}_bg_alpha").value())
 
             if key in {"save", "load"}:
+                try:
+                    ps = int(getattr(self, f"{key}_page_size").value())
+                except Exception:
+                    ps = 10
+                d["page_size"] = max(1, min(10, int(ps)))
                 d["slot_list_pos"] = [
                     int(getattr(self, f"{key}_slot_list_x").value()),
                     int(getattr(self, f"{key}_slot_list_y").value()),

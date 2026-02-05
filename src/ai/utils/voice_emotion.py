@@ -89,19 +89,23 @@ def emotion_to_ext(emotion: str) -> Dict[str, float]:
         "surprised": {"surprised": 0.9, "happy": 0.1},
         "embarrassed": {"afraid": 0.3, "happy": 0.3, "calm": 0.4},
         "worried": {"afraid": 0.5, "melancholic": 0.3, "calm": 0.2},
-        "neutral": {"calm": 1.0},
-        "calm": {"calm": 1.0},
+        # 需求：默认值严格全 0（不自动 calm=1）。
+        # neutral/calm 返回空字典，交由 normalize_ext 填充为 8 维全 0。
+        "neutral": {},
+        "calm": {},
     }
 
-    return emotion_mapping.get(e, {"calm": 1.0})
+    return emotion_mapping.get(e, {})
 
 
 def normalize_ext(ext: Dict[str, Any]) -> Dict[str, float]:
-    """把 ext 规范成 8 维并 clamp 到 0-1；若全为 0 则 calm=1。"""
+    """把 ext 规范成 8 维并 clamp 到 0-1。
+
+    需求：默认值严格全 0（不自动 calm=1）。
+    """
 
     normalized: Dict[str, float] = {k: 0.0 for k in EXT_KEYS}
     if not isinstance(ext, dict):
-        normalized["calm"] = 1.0
         return normalized
 
     for k, v in ext.items():
@@ -117,8 +121,5 @@ def normalize_ext(ext: Dict[str, Any]) -> Dict[str, float]:
         if fv > 1.0:
             fv = 1.0
         normalized[kk] = fv
-
-    if all(abs(v) < 1e-9 for v in normalized.values()):
-        normalized["calm"] = 1.0
 
     return normalized

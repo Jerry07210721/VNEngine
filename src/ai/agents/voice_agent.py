@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import time
 from datetime import datetime
+import ast
 import json
 
 from ..api.api_manager import APIManager
@@ -162,9 +163,46 @@ class VoiceAgent:
         if explicit_ext is None:
             explicit_ext = parameters.get("ext")
 
+        def _parse_ext_candidate(value: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(value, dict):
+                return value
+            if not (isinstance(value, str) and value.strip()):
+                return None
+            s = value.strip()
+
+            # 兼容代码块包裹
+            lower = s.lower()
+            if lower.startswith("```"):
+                try:
+                    payload = s.split("```", 1)[1].split("```", 1)[0].strip()
+                    first, _, rest = payload.partition("\n")
+                    if first.strip().lower() in {"json", "json5", "js", "javascript"}:
+                        s = rest.strip()
+                    else:
+                        s = payload
+                except Exception:
+                    pass
+
+            # 优先 JSON
+            try:
+                repaired = s.replace("\ufeff", "")
+                repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+                obj = json.loads(repaired)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                pass
+
+            # 兼容 Python dict 字面量（单引号等）
+            try:
+                obj = ast.literal_eval(s)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+
         ext = None
-        if isinstance(explicit_ext, dict) and explicit_ext:
-            ext = self._normalize_ext(explicit_ext)
+        parsed_ext = _parse_ext_candidate(explicit_ext)
+        if isinstance(parsed_ext, dict) and parsed_ext:
+            ext = self._normalize_ext(parsed_ext)
         elif use_emotion_ext:
             ext = self._normalize_ext(self._map_emotion(emotion))
 

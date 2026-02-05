@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTabBar,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -870,8 +871,11 @@ class MainMenuDesigner(QDialog):
         super().__init__(parent)
         self.project_manager = project_manager
         self.project_dir = Path(project_dir) if project_dir else (Path(project_manager.project_dir) if project_manager and project_manager.project_dir else None)
-        data = (project_manager.project_data.get("game_config", {}) if project_manager else {}) or {}
-        self.base_resolution = base_resolution or (int(data.get("window_width", 800)), int(data.get("window_height", 600)))
+        game_cfg = (project_manager.project_data.get("game_config", {}) if project_manager else {}) or {}
+        self._menus: list[dict[str, Any]] = self._load_main_menus(game_cfg)
+        self._active_menu_tab: int = 0
+        data = self._menus[self._active_menu_tab]
+        self.base_resolution = base_resolution or (int(game_cfg.get("window_width", 800)), int(game_cfg.get("window_height", 600)))
 
         self.setWindowTitle("主菜单设计器")
         self.resize(980, 720)
@@ -889,6 +893,17 @@ class MainMenuDesigner(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
+
+        # main menu tabs: 主菜单1/2/3
+        self.menu_tabs = QTabBar(self)
+        self.menu_tabs.addTab("主菜单1")
+        self.menu_tabs.addTab("主菜单2")
+        self.menu_tabs.addTab("主菜单3")
+        self.menu_tabs.setExpanding(False)
+        self.menu_tabs.setMovable(False)
+        self.menu_tabs.setCurrentIndex(self._active_menu_tab)
+        self.menu_tabs.currentChanged.connect(self._on_menu_tab_changed)
+        layout.addWidget(self.menu_tabs)
 
         top_row = QHBoxLayout()
 
@@ -1119,6 +1134,16 @@ class MainMenuDesigner(QDialog):
         self.overlay_alpha.setValue(int(data.get("menu_overlay_alpha", 0)))
         other_form.addRow("遮罩透明度 (0-255)", self.overlay_alpha)
 
+        self.trigger_condition_edit = QLineEdit(str(data.get("trigger_condition", "") or ""))
+        self.trigger_condition_edit.setPlaceholderText("留空=默认主菜单；示例：flag==1 and love>=10")
+        self.trigger_condition_edit.setToolTip("触发条件：参考条件节点的变量表达式；成立则应用该主菜单样式。多个满足时按主菜单1→2→3优先级。")
+        other_form.addRow("触发条件", self.trigger_condition_edit)
+
+        self.reset_globals_chk = QCheckBox("开始游戏时重置全局变量")
+        self.reset_globals_chk.setChecked(bool(data.get("reset_globals_on_start", True)))
+        self.reset_globals_chk.setToolTip("关闭后：从主菜单点击【开始游戏】将保留当前全局变量值。")
+        other_form.addRow("", self.reset_globals_chk)
+
         self.save_slots_spin = QSpinBox()
         self.save_slots_spin.setRange(1, 200)
         self.save_slots_spin.setValue(int(data.get("save_slots", 5) or 5))
@@ -1186,6 +1211,171 @@ class MainMenuDesigner(QDialog):
         self._update_preview()
         self._initialized = True
 
+    def _load_main_menus(self, game_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """Load 3 independent main menu configs.
+
+        Backward compatible:
+        - If game_cfg.main_menus exists: use it.
+        - Else: build 主菜单1 from legacy flat keys (menu_*/save/help), and 主菜单2/3 as empty defaults.
+        """
+
+        game_cfg = game_cfg or {}
+        raw = game_cfg.get("main_menus")
+        if isinstance(raw, list) and raw:
+            menus: list[dict[str, Any]] = []
+            for it in raw[:3]:
+                menus.append(it if isinstance(it, dict) else {})
+            while len(menus) < 3:
+                menus.append({})
+            return menus
+
+        menu0: dict[str, Any] = {}
+        for k, v in (game_cfg or {}).items():
+            if isinstance(k, str) and (k.startswith("menu_") or k in {"save_slots", "enable_autosave_on_menu", "help_hotkey", "help_right_click", "reset_globals_on_start"}):
+                menu0[k] = v
+        menu0.setdefault("trigger_condition", "")
+        menu0.setdefault("reset_globals_on_start", True)
+        return [menu0, {"trigger_condition": "", "reset_globals_on_start": True}, {"trigger_condition": "", "reset_globals_on_start": True}]
+
+    def _on_menu_tab_changed(self, new_index: int):
+        if not self._initialized:
+            self._active_menu_tab = max(0, min(2, int(new_index)))
+            return
+        if self._updating:
+            return
+
+        old = self._active_menu_tab
+        try:
+            old = int(old)
+        except Exception:
+            old = 0
+        old = max(0, min(2, old))
+
+        try:
+            new_index = int(new_index)
+        except Exception:
+            new_index = 0
+        new_index = max(0, min(2, new_index))
+        if new_index == old:
+            return
+
+        # save current tab state
+        self._menus[old] = self._collect_cfg()
+        self._active_menu_tab = new_index
+
+        # load new tab state
+        self._apply_cfg_to_widgets(self._menus[new_index] or {})
+
+    def _apply_cfg_to_widgets(self, data: dict[str, Any]):
+        data = data or {}
+        self._updating = True
+        self._suppress_dirty = True
+        try:
+            # title
+            self.title_edit.setText(str(data.get("menu_title", "") or ""))
+            tp = data.get("menu_title_pos") or [60, 60]
+            try:
+                self.title_x.setValue(int(tp[0] if isinstance(tp, (list, tuple)) and len(tp) >= 2 else 60))
+                self.title_y.setValue(int(tp[1] if isinstance(tp, (list, tuple)) and len(tp) >= 2 else 60))
+            except Exception:
+                self.title_x.setValue(60)
+                self.title_y.setValue(60)
+            try:
+                self.title_scale.setValue(float(data.get("menu_title_scale", 1.0) or 1.0))
+            except Exception:
+                self.title_scale.setValue(1.0)
+            self.title_color_edit.setText(self._color_to_hex(data.get("menu_title_color", [240, 240, 255])))
+            self.title_img_edit.setText(str(data.get("menu_title_image", "") or ""))
+            ip = data.get("menu_title_image_pos") or [400, 80]
+            try:
+                self.title_img_x.setValue(int(ip[0] if isinstance(ip, (list, tuple)) and len(ip) >= 2 else 400))
+                self.title_img_y.setValue(int(ip[1] if isinstance(ip, (list, tuple)) and len(ip) >= 2 else 80))
+            except Exception:
+                self.title_img_x.setValue(400)
+                self.title_img_y.setValue(80)
+            try:
+                self.title_img_scale.setValue(float(data.get("menu_title_image_scale", 1.0) or 1.0))
+            except Exception:
+                self.title_img_scale.setValue(1.0)
+
+            # options/buttons layout
+            op = data.get("menu_option_pos") or [80, 140]
+            try:
+                self.option_x.setValue(int(op[0] if isinstance(op, (list, tuple)) and len(op) >= 2 else 80))
+                self.option_y.setValue(int(op[1] if isinstance(op, (list, tuple)) and len(op) >= 2 else 140))
+            except Exception:
+                self.option_x.setValue(80)
+                self.option_y.setValue(140)
+            try:
+                self.option_scale.setValue(float(data.get("menu_option_scale", 1.0) or 1.0))
+            except Exception:
+                self.option_scale.setValue(1.0)
+            try:
+                self.option_spacing.setValue(int(data.get("menu_option_spacing", 10) or 10))
+            except Exception:
+                self.option_spacing.setValue(10)
+            try:
+                self.option_selected_zoom.setValue(float(data.get("menu_option_selected_zoom", 1.08) or 1.08))
+            except Exception:
+                self.option_selected_zoom.setValue(1.08)
+            self.option_indicator_chk.setChecked(bool(data.get("menu_option_indicator", False)))
+            self.option_indicator_img_edit.setText(str(data.get("menu_option_indicator_image", "") or ""))
+            try:
+                self.option_indicator_img_scale.setValue(float(data.get("menu_option_indicator_image_scale", 1.0) or 1.0))
+            except Exception:
+                self.option_indicator_img_scale.setValue(1.0)
+
+            self.option_color_edit.setText(self._color_to_hex(data.get("menu_option_color", [255, 255, 255])))
+            self.option_hover_color_edit.setText(self._color_to_hex(data.get("menu_option_hover_color", data.get("menu_option_color", [255, 255, 255]))))
+
+            # per-button style
+            buttons_cfg = _normalize_menu_buttons(data.get("menu_buttons"))
+            for idx, it in enumerate(buttons_cfg):
+                is_img = (it.get("style") == "image")
+                self._button_mode[idx].setCurrentIndex(1 if is_img else 0)
+                self._button_text[idx].setText(str(it.get("label") or ""))
+                self._button_image[idx].setText(str(it.get("image") or ""))
+                try:
+                    self._button_image_scale[idx].setValue(float(it.get("image_scale", 1.0) or 1.0))
+                except Exception:
+                    self._button_image_scale[idx].setValue(1.0)
+                self._button_text[idx].setEnabled(not is_img)
+                self._button_image[idx].setEnabled(is_img)
+                self._button_image_scale[idx].setEnabled(is_img)
+                self._last_button_image_paths[idx] = self._button_image[idx].text().strip()
+
+            # media
+            self.bg_edit.setText(str(data.get("menu_background", "") or ""))
+            self.video_edit.setText(str(data.get("menu_video", "") or ""))
+            self.video_loop_chk.setChecked(bool(data.get("menu_video_loop", False)))
+            self.bgm_edit.setText(str(data.get("menu_bgm", "") or ""))
+            self.bgm_loop_chk.setChecked(bool(data.get("menu_bgm_loop", True)))
+
+            # other
+            try:
+                self.overlay_alpha.setValue(int(data.get("menu_overlay_alpha", 0) or 0))
+            except Exception:
+                self.overlay_alpha.setValue(0)
+            try:
+                self.save_slots_spin.setValue(int(data.get("save_slots", 5) or 5))
+            except Exception:
+                self.save_slots_spin.setValue(5)
+            self.enable_autosave_chk.setChecked(bool(data.get("enable_autosave_on_menu", True)))
+            self.help_hotkey_edit.setText(str(data.get("help_hotkey", "F1") or "F1"))
+            self.help_right_click_chk.setChecked(bool(data.get("help_right_click", True)))
+            self.trigger_condition_edit.setText(str(data.get("trigger_condition", "") or ""))
+            self.reset_globals_chk.setChecked(bool(data.get("reset_globals_on_start", True)))
+            try:
+                self.preview_selected.setValue(int((data.get("menu_preview_selected", 0) or 0)) + 1)
+            except Exception:
+                self.preview_selected.setValue(1)
+
+        finally:
+            self._updating = False
+            # refresh preview without marking dirty
+            self._update_preview()
+            self._suppress_dirty = False
+
     def _mark_dirty(self):
         if not self._initialized or self._suppress_dirty:
             return
@@ -1202,6 +1392,7 @@ class MainMenuDesigner(QDialog):
             self.option_hover_color_edit,
             self.title_color_edit,
             self.bgm_edit,
+            self.trigger_condition_edit,
             self.help_hotkey_edit,
             self.option_indicator_img_edit,
         ]:
@@ -1227,6 +1418,9 @@ class MainMenuDesigner(QDialog):
         self.video_loop_chk.stateChanged.connect(self._update_preview)
         self.bgm_loop_chk.stateChanged.connect(self._update_preview)
         self.option_indicator_chk.stateChanged.connect(self._update_preview)
+        self.reset_globals_chk.stateChanged.connect(self._update_preview)
+        self.enable_autosave_chk.stateChanged.connect(self._update_preview)
+        self.help_right_click_chk.stateChanged.connect(self._update_preview)
         self.chk_grid_snap.toggled.connect(self._update_preview)
         self.chk_align_guides.toggled.connect(self._update_preview)
         self.chk_align_snap.toggled.connect(self._update_preview)
@@ -1320,8 +1514,22 @@ class MainMenuDesigner(QDialog):
             if show_message:
                 QMessageBox.warning(self, "无法保存", "当前没有工程管理器，无法写入工程配置。")
             return False
+        # persist current tab first
+        try:
+            idx = int(self.menu_tabs.currentIndex())
+        except Exception:
+            idx = 0
+        idx = max(0, min(2, idx))
+        self._menus[idx] = self._collect_cfg()
+
         cfg = self.project_manager.project_data.setdefault("game_config", {})
-        cfg.update(self._collect_cfg())
+        cfg["main_menus"] = list(self._menus[:3])
+
+        # backward compatibility: mirror 主菜单1 到旧的扁平字段（供旧版本或其他模块读取）
+        menu0 = dict(self._menus[0] or {})
+        menu0.pop("trigger_condition", None)
+        cfg.update(menu0)
+
         self._dirty = False
         if show_message:
             QMessageBox.information(self, "已保存", "主菜单配置已写入工程，保存工程文件后生效。")
@@ -1348,6 +1556,8 @@ class MainMenuDesigner(QDialog):
             })
 
         return {
+            "trigger_condition": self.trigger_condition_edit.text().strip(),
+            "reset_globals_on_start": bool(self.reset_globals_chk.isChecked()),
             "menu_title": self.title_edit.text(),
             "menu_title_pos": [int(self.title_x.value()), int(self.title_y.value())],
             "menu_title_color": self._hex_to_rgb(self.title_color_edit.text()),

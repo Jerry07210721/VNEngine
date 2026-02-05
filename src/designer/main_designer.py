@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Designer UI main window using PyQt6."""
+import os
 import sys
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication,
     QCommandLinkButton,
@@ -9,10 +11,13 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QCheckBox,
+    QDialogButtonBox,
     QStyle,
     QStatusBar,
     QToolBar,
@@ -23,8 +28,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from pathlib import Path
-from PyQt6.QtGui import QAction, QTextCursor, QIcon, QDesktopServices
-from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QUrl
+from PyQt6.QtGui import QAction, QTextCursor, QIcon, QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QUrl, QSettings, QTimer, QElapsedTimer
 from src.core.project_manager import VNProjectManager
 from src.game.game_runtime import VNGameRuntime
 from src.designer.graph_canvas import GraphView
@@ -33,7 +38,9 @@ from src.designer.properties_panel import PropertiesDock
 from src.designer.ui_designer import UILayoutDesigner
 from src.designer.function_menu_designer import FunctionMenuDesigner
 from src.designer.menu_designer import MainMenuDesigner
+from src.designer.loading_overlay_designer import LoadingOverlayDesigner
 from src.designer.global_vars_dialog import GlobalVarsDialog
+from src.designer.text_style_dialog import GlobalTextStyleDialog
 from src.designer.ai_assist_dialog import AIAssistDialog, APIConfigDialog
 from src.designer.ai_progress_dialog import AIProgressDialog
 from src.ai.core.config_manager import ConfigManager
@@ -51,6 +58,61 @@ from src.designer.ai_worker import AITaskWorker
 from src.designer.ai_project_window import AIProjectWindow
 from src.packager.packager_manager import PackagerManager
 from src.packager.packager_dialog import PackagerDialog
+from src.designer.async_elapsed_runner import AsyncElapsedRunner
+
+
+_SETTINGS_ORG = "VNEngine"
+_SETTINGS_APP = "VNEngineDesigner"
+_SETTINGS_RECENT_PROJECT = "recent_project_path"
+
+
+def _debug_load_enabled() -> bool:
+    return str(os.environ.get("VNENGINE_DEBUG_LOAD", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_load_log(msg: str) -> None:
+    """Temporary debug logger for diagnosing project-load UI freezes.
+
+    Enable via env var: VNENGINE_DEBUG_LOAD=1
+    Output: <repo>/logs/debug/project_load_debug.log
+    """
+
+    if not _debug_load_enabled():
+        return
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        root = Path(__file__).resolve().parents[2]
+        log_dir = root / "logs" / "debug"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        p = log_dir / "project_load_debug.log"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        # never break app for logging
+        return
+
+
+def _get_recent_project_path() -> Path | None:
+    try:
+        s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        val = str(s.value(_SETTINGS_RECENT_PROJECT, "") or "").strip()
+        if not val:
+            return None
+        p = Path(val).expanduser().resolve()
+        return p if p.exists() else None
+    except Exception:
+        return None
+
+
+def _set_recent_project_path(path: Path | str | None) -> None:
+    try:
+        if not path:
+            return
+        p = Path(path).expanduser().resolve()
+        s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        s.setValue(_SETTINGS_RECENT_PROJECT, str(p))
+    except Exception:
+        return
 
 
 def _resolve_app_icon_path() -> Path | None:
@@ -97,6 +159,7 @@ class StartDialog(QDialog):
 
         icon_new = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         icon_open = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton)
+        icon_recent = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton)
         icon_exit = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton)
 
         btn_new = QCommandLinkButton("新建工程", "创建一个新的 VNEngine 工程（.vngproj）")
@@ -108,6 +171,15 @@ class StartDialog(QDialog):
         btn_open.setIcon(icon_open)
         btn_open.clicked.connect(self._choose_open)
 
+        recent_path = _get_recent_project_path()
+        recent_desc = "打开上次打开的工程" if recent_path else "暂无最近工程"
+        if recent_path:
+            recent_desc = f"打开最近工程：{recent_path}"
+        btn_recent = QCommandLinkButton("加载最近工程", recent_desc)
+        btn_recent.setIcon(icon_recent)
+        btn_recent.setEnabled(bool(recent_path))
+        btn_recent.clicked.connect(lambda: self._choose_recent(recent_path))
+
         btn_exit = QCommandLinkButton("退出", "关闭 VNEngine")
         btn_exit.setIcon(icon_exit)
         btn_exit.setProperty("variant", "danger")
@@ -116,6 +188,7 @@ class StartDialog(QDialog):
         layout.addSpacing(6)
         layout.addWidget(btn_new)
         layout.addWidget(btn_open)
+        layout.addWidget(btn_recent)
         layout.addWidget(btn_exit)
         layout.addStretch(1)
 
@@ -129,6 +202,13 @@ class StartDialog(QDialog):
 
     def _choose_open(self):
         self.mode = "open"
+        self.accept()
+
+    def _choose_recent(self, path: Path | None):
+        if not path:
+            return
+        self.mode = "recent"
+        self.project_path = path
         self.accept()
 
 
@@ -192,6 +272,82 @@ class PackagerLogDialog(QDialog):
         self.status_label.setText(text)
 
 
+class FunctionScriptSafetyConfigDialog(QDialog):
+    """Project-level configuration for function-node script safety."""
+
+    def __init__(
+        self,
+        *,
+        allow_unsafe: bool,
+        fs_root: str,
+        project_dir: Path | None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("脚本安全配置")
+        self._project_dir = project_dir
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "功能节点脚本默认运行在安全模式：\n"
+            "- 文件系统访问限制在根目录内（function_script_fs_root）\n"
+            "- 开启不安全脚本将允许更自由的 Python 行为（不推荐）"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        self.chk_allow_unsafe = QCheckBox("允许不安全脚本")
+        self.chk_allow_unsafe.setChecked(bool(allow_unsafe))
+        form.addRow("不安全脚本", self.chk_allow_unsafe)
+
+        self.edit_fs_root = QLineEdit(fs_root or "")
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(6)
+        row_lay.addWidget(self.edit_fs_root, 1)
+        btn_pick = QPushButton("选择目录")
+        btn_pick.clicked.connect(self._pick_dir)
+        row_lay.addWidget(btn_pick)
+        btn_reset = QPushButton("重置为工程目录")
+        btn_reset.clicked.connect(self._reset_to_project_dir)
+        row_lay.addWidget(btn_reset)
+        form.addRow("脚本根目录", row)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _reset_to_project_dir(self):
+        if self._project_dir is None:
+            self.edit_fs_root.setText("")
+            return
+        self.edit_fs_root.setText(str(self._project_dir))
+
+    def _pick_dir(self):
+        start_dir = ""
+        try:
+            if self._project_dir is not None:
+                start_dir = str(self._project_dir)
+        except Exception:
+            start_dir = ""
+        path = QFileDialog.getExistingDirectory(self, "选择脚本根目录", start_dir)
+        if not path:
+            return
+        self.edit_fs_root.setText(path)
+
+    def get_values(self) -> tuple[bool, str]:
+        allow_unsafe = bool(self.chk_allow_unsafe.isChecked())
+        fs_root = str(self.edit_fs_root.text() or "").strip()
+        return allow_unsafe, fs_root
+
+
 class VNDesignerMainWindow(QMainWindow):
     """视觉小说引擎设计界面主窗口"""
 
@@ -209,7 +365,9 @@ class VNDesignerMainWindow(QMainWindow):
         self.packager_log_dialog: "PackagerLogDialog" | None = None
         self.preview_process: QProcess | None = None
         self.preview_output: list[str] = []
+        self._preview_boot_dialog: QProgressDialog | None = None
         self.project_dir: Path | None = None
+        self._io_runner = AsyncElapsedRunner(self)
         
         # AI辅助工程窗口
         self.ai_project_window: AIProjectWindow | None = None
@@ -223,7 +381,7 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.5")
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.6")
         self.setObjectName("VNDesignerMainWindow")
         # 设计模式默认窗口大小：1280x720
         self.setGeometry(100, 100, 1280, 720)
@@ -243,8 +401,42 @@ class VNDesignerMainWindow(QMainWindow):
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.setValue(0)
         dlg.show()
-        QApplication.processEvents()
         return dlg
+
+    def _start_dialog_elapsed_ticker(self, dlg: QProgressDialog, base_text: str, *, tick_ms: int = 300):
+        """Update QProgressDialog label with elapsed seconds.
+
+        This is used for long UI-thread phases (e.g. building many graphics items)
+        where AsyncElapsedRunner's timer can't run if we block.
+        """
+
+        timer = QTimer(dlg)
+        et = QElapsedTimer()
+        et.start()
+
+        def _tick():
+            try:
+                secs = int(et.elapsed() / 1000)
+                dlg.setLabelText(f"{base_text} (已耗时 {secs}s)")
+            except Exception:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        timer.setInterval(int(tick_ms))
+        timer.timeout.connect(_tick)
+        timer.start()
+        _tick()
+
+        def _stop():
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+
+        return _stop
 
     def _find_neighbor_ai_project(self) -> Path | None:
         """在设计模式工程文件同级目录寻找 AI 工程（*.vnai）。
@@ -312,6 +504,10 @@ class VNDesignerMainWindow(QMainWindow):
         global_var_action = QAction("全局变量设置", self)
         global_var_action.triggered.connect(self.open_global_vars)
         data_menu.addAction(global_var_action)
+
+        script_safety_action = QAction("脚本安全配置...", self)
+        script_safety_action.triggered.connect(self.open_function_script_safety_config)
+        data_menu.addAction(script_safety_action)
         self.menuBar().addMenu(data_menu)
 
         ui_menu = QMenu("UI设计(&U)", self)
@@ -325,6 +521,14 @@ class VNDesignerMainWindow(QMainWindow):
         func_menu_action = QAction("功能菜单设计", self)
         func_menu_action.triggered.connect(self.open_function_menu_designer)
         ui_menu.addAction(func_menu_action)
+
+        loading_overlay_action = QAction("加载遮罩样式", self)
+        loading_overlay_action.triggered.connect(self.open_loading_overlay_designer)
+        ui_menu.addAction(loading_overlay_action)
+
+        text_style_action = QAction("全局文本样式...", self)
+        text_style_action.triggered.connect(self.open_global_text_styles)
+        ui_menu.addAction(text_style_action)
         self.menuBar().addMenu(ui_menu)
 
         ai_menu = QMenu("AI 辅助(&A)", self)
@@ -386,6 +590,22 @@ class VNDesignerMainWindow(QMainWindow):
         layout.addWidget(self.graph_view)
         # 当场景选择变化时更新属性面板
         self.graph_view.scene.selectionChanged.connect(self.on_selection_changed)
+
+        # 功能节点绑定变化时刷新属性面板（避免“画布已绑定但面板仍显示未绑定”）
+        try:
+            self.graph_view.functionNodeBindingChanged.connect(self._on_function_node_binding_changed)
+        except Exception:
+            pass
+
+        # 全局快捷键：即使焦点不在画布也可复制/粘贴节点
+        try:
+            self._shortcut_copy = QShortcut(QKeySequence.StandardKey.Copy, self)
+            self._shortcut_copy.activated.connect(self._copy_nodes_from_shortcut)
+            self._shortcut_paste = QShortcut(QKeySequence.StandardKey.Paste, self)
+            self._shortcut_paste.activated.connect(self._paste_nodes_from_shortcut)
+        except Exception:
+            self._shortcut_copy = None
+            self._shortcut_paste = None
 
         # 预览：从指定节点开始（右键节点）
         self.graph_view.previewFromNodeRequested.connect(self.preview_game_from_node)
@@ -659,27 +879,44 @@ class VNDesignerMainWindow(QMainWindow):
             self.current_project_path = file_path
             self._apply_project_dir(Path(file_path).parent)
 
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在保存工程文件，请稍候...")
-            # 同步画布数据到工程数据
-            self.project_manager.project_data["flow_nodes"] = self.graph_view.export_scene()
-            self.project_manager.project_data["resources"] = self.resource_dock.export_data()
-            self.project_manager.save_project(self.current_project_path)
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        # 同步画布数据到工程数据（必须在 UI 线程）
+        self.project_manager.project_data["flow_nodes"] = self.graph_view.export_scene()
+        self.project_manager.project_data["resources"] = self.resource_dock.export_data()
+
+        busy = self._show_busy_dialog("正在保存工程文件，请稍候...")
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.save_project(self.current_project_path)
+
+        def _on_success(_res):
             project_name = self.project_manager.project_data["project_info"]["name"]
-            self.statusBar().showMessage(
-                f"工程已保存：{project_name} - {self.current_project_path}"
-            )
+            self.statusBar().showMessage(f"工程已保存：{project_name} - {self.current_project_path}")
+            _set_recent_project_path(self.current_project_path)
             QMessageBox.information(self, "提示", f"工程「{project_name}」保存成功。")
-        except Exception as exc:
-            QMessageBox.critical(self, "错误", f"保存工程失败：{str(exc)}")
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"保存工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在保存工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
 
     def _load_flow_nodes_from_data(self, data: dict):
         flow_data = data.get("flow_nodes") if isinstance(data, dict) else None
@@ -719,65 +956,231 @@ class VNDesignerMainWindow(QMainWindow):
         dlg = FunctionMenuDesigner(Path(self.project_dir), self.project_manager, self._current_resolution(), self)
         dlg.exec()
 
+    def open_loading_overlay_designer(self):
+        if not self.project_dir:
+            QMessageBox.warning(self, "提示", "请先新建或加载工程后再设计加载遮罩样式。")
+            return
+        dlg = LoadingOverlayDesigner(Path(self.project_dir), self.project_manager, self._current_resolution(), self)
+        dlg.exec()
+
+    def open_global_text_styles(self):
+        if not self.project_manager or not getattr(self.project_manager, "project_data", None):
+            QMessageBox.information(self, "提示", "请先新建或打开工程后再配置全局文本样式。")
+            return
+        dlg = GlobalTextStyleDialog(self.project_manager, self.project_dir, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("全局文本样式已更新（保存工程后生效）")
+
     def open_global_vars(self):
         dlg = GlobalVarsDialog(self.project_manager, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("全局变量已更新")
 
+    def open_function_script_safety_config(self):
+        if not self.project_manager or not getattr(self.project_manager, "project_data", None):
+            QMessageBox.information(self, "提示", "请先新建或打开工程。")
+            return
+
+        cfg = self.project_manager.project_data.setdefault("game_config", {})
+        allow_unsafe = bool(cfg.get("allow_unsafe_function_scripts", False))
+        fs_root = str(cfg.get("function_script_fs_root", "") or "").strip()
+
+        project_dir = None
+        try:
+            if self.current_project_path:
+                project_dir = Path(self.current_project_path).parent
+        except Exception:
+            project_dir = None
+
+        dlg = FunctionScriptSafetyConfigDialog(
+            allow_unsafe=allow_unsafe,
+            fs_root=fs_root,
+            project_dir=project_dir,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_allow_unsafe, new_fs_root = dlg.get_values()
+
+        # Normalize fs_root: if inside project_dir, store as relative for portability.
+        stored_fs_root = new_fs_root
+        try:
+            if project_dir is not None and new_fs_root:
+                p = Path(new_fs_root)
+                if not p.is_absolute():
+                    p = (project_dir / p).resolve()
+                else:
+                    p = p.resolve()
+                try:
+                    rel = p.relative_to(project_dir)
+                    stored_fs_root = str(rel).replace("\\", "/")
+                except Exception:
+                    stored_fs_root = str(p)
+        except Exception:
+            stored_fs_root = new_fs_root
+
+        cfg["allow_unsafe_function_scripts"] = bool(new_allow_unsafe)
+        cfg["function_script_fs_root"] = stored_fs_root
+        self.statusBar().showMessage("脚本安全配置已更新（请保存工程以持久化）")
+
     def _create_project_structure(self, project_dir: Path, project_name: str):
         project_dir.mkdir(parents=True, exist_ok=True)
         res_root = project_dir / "resources"
-        for sub in ["images", "audios", "portraits", "voices", "videos"]:
+        for sub in ["images", "audios", "portraits", "voices", "videos", "fonts"]:
             (res_root / sub).mkdir(parents=True, exist_ok=True)
         (project_dir / "ui").mkdir(parents=True, exist_ok=True)
         (project_dir / "saves").mkdir(parents=True, exist_ok=True)
 
     def _create_or_overwrite_project(self, project_dir: Path, project_name: str, project_file: Path, width: int, height: int):
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在创建/保存工程文件，请稍候...")
-            self.project_manager.new_project(project_name, width, height)
-            self.current_project_path = str(project_file)
-            self._apply_project_dir(project_dir)
-            self.graph_view.clear_scene()
-            self.resource_dock.clear_all()
-            self.properties_dock.bind_node(None)
-            self.project_manager.save_project(self.current_project_path)
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        # UI 线程先完成状态初始化
+        self.project_manager.new_project(project_name, width, height)
+        self.current_project_path = str(project_file)
+        self._apply_project_dir(project_dir)
+        self.graph_view.clear_scene()
+        self.resource_dock.clear_all()
+        self.properties_dock.bind_node(None)
+
+        busy = self._show_busy_dialog("正在创建/保存工程文件，请稍候...")
+
+        def _finally_close():
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+        def _fn():
+            return self.project_manager.save_project(self.current_project_path)
+
+        def _on_success(_res):
             self.statusBar().showMessage(f"已新建工程：{project_name} ({width}x{height}) - {project_file}")
+            _set_recent_project_path(self.current_project_path)
             QMessageBox.information(self, "提示", f"工程「{project_name}」已创建。\n分辨率：{width}x{height}")
-        except Exception as exc:
-            QMessageBox.critical(self, "错误", f"新建工程失败：{str(exc)}")
-        finally:
-            if busy is not None:
-                try:
-                    busy.close()
-                    busy.deleteLater()
-                except Exception:
-                    pass
+
+        def _on_error(err_text: str):
+            QMessageBox.critical(self, "错误", f"新建工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在创建/保存工程文件，请稍候...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=_finally_close,
+            tick_ms=300,
+        )
 
     def _load_project_file(self, path: Path):
-        busy = None
-        try:
-            busy = self._show_busy_dialog("正在打开工程文件，请稍候...")
-            data = self.project_manager.open_project(str(path))
+        if self._io_runner.is_running():
+            QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
+            return
+
+        _debug_load_log(f"load_project: start path={path}")
+        busy = self._show_busy_dialog("正在打开工程文件，请稍候...")
+        stop_ticker = None
+
+        def _close_busy():
+            nonlocal stop_ticker
+            try:
+                if stop_ticker is not None:
+                    stop_ticker()
+                    stop_ticker = None
+            except Exception:
+                pass
+            try:
+                busy.close()
+                busy.deleteLater()
+            except Exception:
+                pass
+
+            _debug_load_log("load_project: busy dialog closed")
+
+        def _fn():
+            _debug_load_log("load_project: background open_project begin")
+            return self.project_manager.open_project(str(path))
+
+        def _on_success(data):
+            # Phase 2: build UI graph incrementally to keep event loop alive.
+            nonlocal stop_ticker
+            try:
+                n_nodes = len((data or {}).get("flow_nodes", {}).get("nodes", []) or []) if isinstance(data, dict) else -1
+                n_conns = len((data or {}).get("flow_nodes", {}).get("connections", []) or []) if isinstance(data, dict) else -1
+            except Exception:
+                n_nodes, n_conns = -1, -1
+            _debug_load_log(f"load_project: background open_project done; nodes={n_nodes} conns={n_conns}")
+
+            stop_ticker = self._start_dialog_elapsed_ticker(busy, "正在加载工程内容...", tick_ms=300)
+            _debug_load_log("load_project: ui ticker started")
+
             self.current_project_path = str(path)
             self._apply_project_dir(path.parent)
-            self._load_flow_nodes_from_data(data)
-            self._load_resources_from_data(data)
+
             self.properties_dock.bind_node(None)
-            project_name = self.project_manager.project_data["project_info"].get("name", path.stem)
-            w, h = self._current_resolution()
-            self.statusBar().showMessage(f"已打开工程：{project_name} ({w}x{h}) - {path}")
-            QMessageBox.information(self, "提示", f"工程「{project_name}」打开成功。")
-        except Exception as exc:
-            QMessageBox.critical(self, "错误", f"打开工程失败：{str(exc)}")
-        finally:
-            if busy is not None:
+
+            flow_data = data.get("flow_nodes") if isinstance(data, dict) else None
+            if not isinstance(flow_data, dict):
+                flow_data = {"nodes": [], "connections": []}
+
+            def _start_graph_load():
+                _debug_load_log("load_project: starting graph_view.load_scene_async")
+
+                def _done():
+                    try:
+                        project_name = self.project_manager.project_data["project_info"].get("name", path.stem)
+                        w, h = self._current_resolution()
+                        self.statusBar().showMessage(f"已打开工程：{project_name} ({w}x{h}) - {path}")
+                        _set_recent_project_path(path)
+                        _debug_load_log("load_project: graph_view.load_scene_async done")
+                    finally:
+                        _close_busy()
+
+                def _err(exc: Exception):
+                    _debug_load_log(f"load_project: graph_view.load_scene_async error: {exc}")
+                    _close_busy()
+                    QMessageBox.critical(self, "错误", f"加载流程图失败：{exc}")
+
+                # Use async chunked loader to avoid freezing QTimer/animations.
+                self.graph_view.load_scene_async(flow_data, batch_size=80, on_done=_done, on_error=_err)
+
+            # Resources can be heavy (e.g. audio duration detection). Load in small UI batches.
+            res_data = data.get("resources") if isinstance(data, dict) else None
+            _debug_load_log("load_project: starting resource_dock.load_from_data_async")
+            try:
+                self.resource_dock.load_from_data_async(
+                    res_data,
+                    on_done=lambda: (_debug_load_log("load_project: resource_dock.load_from_data_async done"), _start_graph_load()),
+                    batch_ms=0,
+                    decor_batch=4,
+                )
+            except Exception as exc:
+                _debug_load_log(f"load_project: resource_dock.load_from_data_async error: {exc}")
+                # Fallback: try sync, then continue.
                 try:
-                    busy.close()
-                    busy.deleteLater()
+                    self._load_resources_from_data(data)
                 except Exception:
                     pass
+                _start_graph_load()
+
+        def _on_error(err_text: str):
+            _close_busy()
+            _debug_load_log(f"load_project: background open_project error: {err_text}")
+            QMessageBox.critical(self, "错误", f"打开工程失败：{err_text}")
+
+        self._io_runner.run_with_setter(
+            set_text=busy.setLabelText,
+            base_text="正在读取工程文件...",
+            fn=_fn,
+            on_success=_on_success,
+            on_error=_on_error,
+            on_finally=None,
+            tick_ms=300,
+        )
+        _debug_load_log("load_project: background task scheduled")
 
     def preview_game(self):
         try:
@@ -799,7 +1202,15 @@ class VNDesignerMainWindow(QMainWindow):
                 warn_msgs.append("\n".join(detail_lines))
             cond_mismatches = analysis.get("condition_mismatch", [])
             if cond_mismatches:
-                detail_lines = [f"条件节点 {nid}：出边数 {out}，应为2 (真/假)" for nid, out in cond_mismatches]
+                detail_lines = []
+                for item in cond_mismatches:
+                    try:
+                        nid = item[0]
+                        out = item[1]
+                        expected = item[2] if len(item) >= 3 else 2
+                    except Exception:
+                        continue
+                    detail_lines.append(f"条件节点 {nid}：出边数 {out}，应为 {expected}（规则数+1，最后为否则分支）")
                 warn_msgs.append("\n".join(detail_lines))
             if warn_msgs:
                 detail = "\n".join(warn_msgs)
@@ -1013,12 +1424,51 @@ class VNDesignerMainWindow(QMainWindow):
         self.preview_process.start()
         self.statusBar().showMessage("预览已启动（独立进程）")
 
+        # Large projects may take a while to boot. Show a cancellable busy dialog.
+        try:
+            if self._preview_boot_dialog is not None:
+                self._preview_boot_dialog.close()
+                self._preview_boot_dialog = None
+            dlg = QProgressDialog("正在启动预览窗口...（大型工程可能需要数秒）", "取消", 0, 0, self)
+            dlg.setWindowTitle("启动预览")
+            dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dlg.setMinimumDuration(0)
+            dlg.setValue(0)
+
+            def _cancel():
+                try:
+                    if self.preview_process and self.preview_process.state() != QProcess.ProcessState.NotRunning:
+                        self.preview_process.kill()
+                except Exception:
+                    pass
+
+            dlg.canceled.connect(_cancel)
+            dlg.show()
+            self._preview_boot_dialog = dlg
+        except Exception:
+            self._preview_boot_dialog = None
+
+    def _maybe_close_preview_boot_dialog(self, new_text: str) -> None:
+        dlg = getattr(self, "_preview_boot_dialog", None)
+        if dlg is None:
+            return
+        if not new_text:
+            return
+        # Preview runner prints this line once the pygame window is created.
+        if "游戏预览窗口已启动" in new_text:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            self._preview_boot_dialog = None
+
     def _on_preview_stdout(self):
         if not self.preview_process:
             return
         text = bytes(self.preview_process.readAllStandardOutput()).decode(errors="ignore")
         if text:
             self.preview_output.append(text)
+            self._maybe_close_preview_boot_dialog(text)
 
     def _on_preview_stderr(self):
         if not self.preview_process:
@@ -1026,8 +1476,15 @@ class VNDesignerMainWindow(QMainWindow):
         text = bytes(self.preview_process.readAllStandardError()).decode(errors="ignore")
         if text:
             self.preview_output.append(text)
+            self._maybe_close_preview_boot_dialog(text)
 
     def _on_preview_finished(self, exit_code, exit_status):
+        try:
+            if self._preview_boot_dialog is not None:
+                self._preview_boot_dialog.close()
+        except Exception:
+            pass
+        self._preview_boot_dialog = None
         if exit_code != 0:
             log_text = "".join(self.preview_output[-20:])
             QMessageBox.warning(self, "预览退出", f"预览进程退出码 {exit_code}\n最近输出：\n{log_text}")
@@ -1035,12 +1492,37 @@ class VNDesignerMainWindow(QMainWindow):
         self.preview_process = None
 
     def on_selection_changed(self):
+        from src.designer.graph_canvas import FlowTextNode, FlowFunctionNode
+
         selected = [item for item in self.graph_view.scene.selectedItems()]
         if not selected:
             self.properties_dock.bind_node(None)
             return
-        node = next((i for i in selected if hasattr(i, "set_title")), None)
+        # Prefer function node if any; otherwise fall back to text nodes.
+        node = next((i for i in selected if isinstance(i, FlowFunctionNode)), None)
+        if node is None:
+            node = next((i for i in selected if isinstance(i, FlowTextNode)), None)
+        if node is None:
+            node = next((i for i in selected if hasattr(i, "set_title")), None)
         self.properties_dock.bind_node(node)
+
+    def _on_function_node_binding_changed(self, fn_node):
+        try:
+            self.properties_dock.refresh_function_binding(fn_node)
+        except Exception:
+            pass
+
+    def _copy_nodes_from_shortcut(self):
+        try:
+            self.graph_view.copy_selected_nodes()
+        except Exception:
+            return
+
+    def _paste_nodes_from_shortcut(self):
+        try:
+            self.graph_view.paste_nodes()
+        except Exception:
+            return
 
     def closeEvent(self, event):  # noqa: N802
         # 关闭前终止预览进程，避免孤儿进程
@@ -1068,9 +1550,15 @@ def run_designer():
         sys.exit(0)
 
     window = VNDesignerMainWindow()
-    if start.mode == "open":
-        window.open_project()
-    elif start.mode == "new":
-        window.new_project()
     window.show()
+
+    # Defer heavy dialogs until event loop is running, otherwise modal progress
+    # dialogs/timers may not animate at startup.
+    if start.mode == "open":
+        QTimer.singleShot(0, window.open_project)
+    elif start.mode == "recent" and start.project_path:
+        QTimer.singleShot(0, lambda p=start.project_path: window._load_project_file(p))
+    elif start.mode == "new":
+        QTimer.singleShot(0, window.new_project)
+
     sys.exit(app.exec())

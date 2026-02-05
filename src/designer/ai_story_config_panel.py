@@ -158,6 +158,7 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         # 仅在开启多分支时可用；默认关闭
         self.enable_choice_check.setChecked(False)
         self.enable_choice_check.stateChanged.connect(self.mark_modified)
+        self.enable_choice_check.stateChanged.connect(self._apply_story_mode_constraints)
         node_layout.addWidget(self.enable_choice_check)
         
         self.enable_condition_check = QCheckBox("启用条件节点（基于变量判断分支）")
@@ -165,6 +166,7 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         self.enable_condition_check.setChecked(False)
         self.enable_condition_check.stateChanged.connect(self.mark_modified)
         self.enable_condition_check.stateChanged.connect(self.on_condition_check_changed)
+        self.enable_condition_check.stateChanged.connect(self._apply_story_mode_constraints)
         node_layout.addWidget(self.enable_condition_check)
 
         self.enable_single_route_check = QCheckBox("启用单线叙事（强制章节线性推进；不生成章节级分支）")
@@ -178,6 +180,12 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         self.enable_multi_branch_check.stateChanged.connect(self._on_multi_branch_changed)
         self.enable_multi_branch_check.stateChanged.connect(self.mark_modified)
         node_layout.addWidget(self.enable_multi_branch_check)
+
+        self.allow_loop_story_check = QCheckBox("允许出现循环剧情（需选择/条件节点用于跳出循环）")
+        self.allow_loop_story_check.setChecked(False)
+        self.allow_loop_story_check.stateChanged.connect(self.mark_modified)
+        self.allow_loop_story_check.stateChanged.connect(self._apply_story_mode_constraints)
+        node_layout.addWidget(self.allow_loop_story_check)
         
         # 条件类型子选项
         condition_type_layout = QHBoxLayout()
@@ -207,6 +215,15 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             "角色设定权重:", 
             self.char_hint_weight_spin
         )
+
+        self.step4_word_boost_spin = QDoubleSpinBox()
+        self.step4_word_boost_spin.setRange(1.0, 3.0)
+        self.step4_word_boost_spin.setValue(1.5)
+        self.step4_word_boost_spin.setSingleStep(0.1)
+        self.step4_word_boost_spin.setDecimals(1)
+        self.step4_word_boost_spin.setToolTip("Step4 逐章详稿写作目标字数放大倍率（用于抵消模型字数偏差）。1.0=不放大；建议 1.3~2.0")
+        self.step4_word_boost_spin.valueChanged.connect(self.mark_modified)
+        advanced_layout.addRow("Step4字数放大倍率:", self.step4_word_boost_spin)
         
         hint_label = QLabel("权重越高，AI越严格遵循用户配置的角色人设；权重越低，AI创作自由度越高")
         hint_label.setStyleSheet("color: #7f8c8d; font-size: 11px;")
@@ -270,8 +287,10 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             self.enable_condition_check,
             self.enable_single_route_check,
             self.enable_multi_branch_check,
+            self.allow_loop_story_check,
             self.condition_type_edit,
             self.char_hint_weight_spin,
+            self.step4_word_boost_spin,
             self.pov_combo,
             self.first_person_name_edit,
             self.fp_has_portrait_check,
@@ -323,8 +342,10 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             self.enable_condition_check.setChecked(story_config.enable_condition_node)
             self.enable_single_route_check.setChecked(bool(getattr(story_config, 'enable_single_route', False)))
             self.enable_multi_branch_check.setChecked(bool(getattr(story_config, 'enable_multi_branch', False)))
+            self.allow_loop_story_check.setChecked(bool(getattr(story_config, 'allow_loop_story', False)))
             self.condition_type_edit.setText(story_config.condition_type)
             self.char_hint_weight_spin.setValue(story_config.character_hint_weight)
+            self.step4_word_boost_spin.setValue(float(getattr(story_config, 'step4_word_boost_factor', 1.5) or 1.5))
 
             # POV
             pov = getattr(story_config, 'narrative_pov', 'third')
@@ -365,9 +386,11 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             enable_choice_node=self.enable_choice_check.isChecked(),
             enable_condition_node=self.enable_condition_check.isChecked(),
             enable_multi_branch=self.enable_multi_branch_check.isChecked(),
+            allow_loop_story=self.allow_loop_story_check.isChecked(),
             enable_single_route=self.enable_single_route_check.isChecked(),
             condition_type=self.condition_type_edit.text().strip(),
             character_hint_weight=self.char_hint_weight_spin.value(),
+            step4_word_boost_factor=float(self.step4_word_boost_spin.value()),
             narrative_pov=self.pov_combo.currentData() or getattr(current, 'narrative_pov', 'third'),
             first_person_name=self.first_person_name_edit.text().strip() or getattr(current, 'first_person_name', '我'),
             first_person_has_portrait=self.fp_has_portrait_check.isChecked(),
@@ -457,3 +480,21 @@ class AIStoryConfigPanel(AIBasePanelWidget):
 
         # 条件类型输入框仅在“条件节点启用”时可编辑
         self.condition_type_edit.setEnabled(multi and bool(self.enable_condition_check.isChecked()))
+
+        # 循环剧情：仅多分支可用，且至少启用 choice/condition 之一。
+        allow_loop_enabled = bool(multi and (self.enable_choice_check.isChecked() or self.enable_condition_check.isChecked()))
+        self.allow_loop_story_check.setEnabled(allow_loop_enabled)
+        if not allow_loop_enabled:
+            try:
+                self.allow_loop_story_check.blockSignals(True)
+                self.allow_loop_story_check.setChecked(False)
+            finally:
+                self.allow_loop_story_check.blockSignals(False)
+        else:
+            # 若用户勾选循环但刚好把两类节点都关掉，自动补回条件节点以保证可跳出循环
+            if self.allow_loop_story_check.isChecked() and (not self.enable_choice_check.isChecked()) and (not self.enable_condition_check.isChecked()):
+                try:
+                    self.enable_condition_check.blockSignals(True)
+                    self.enable_condition_check.setChecked(True)
+                finally:
+                    self.enable_condition_check.blockSignals(False)

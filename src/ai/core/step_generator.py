@@ -7,6 +7,7 @@
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
+import ast
 import json
 import re
 
@@ -78,6 +79,88 @@ class StepGenerator:
         if not text:
             return None
         candidate = text.strip()
+
+        def _escape_unescaped_quotes(payload: str) -> str:
+            """尽量修复 JSON 字符串里的未转义双引号。
+
+            典型坏例："text": "让它"面对"着自己"  （会导致 json.loads 失败）
+            修复策略：在字符串内部遇到未转义的 " 时，如果后续不是 : , ] }，则视为内容引号并转义为 \"。
+            """
+            if not payload or '"' not in payload:
+                return payload
+
+            out = []
+            in_string = False
+            escaping = False
+            length = len(payload)
+
+            def _next_non_ws(idx: int) -> str:
+                while idx < length and payload[idx] in " \t\r\n":
+                    idx += 1
+                return payload[idx] if idx < length else ""
+
+            for i, ch in enumerate(payload):
+                if escaping:
+                    out.append(ch)
+                    escaping = False
+                    continue
+
+                if ch == "\\":
+                    out.append(ch)
+                    escaping = True
+                    continue
+
+                if ch == '"':
+                    if not in_string:
+                        in_string = True
+                        out.append(ch)
+                        continue
+
+                    # in_string 且当前 " 未被转义：可能是字符串结束，也可能是内容引号
+                    nxt = _next_non_ws(i + 1)
+                    if nxt in {":", ",", "}", "]"}:
+                        in_string = False
+                        out.append(ch)
+                    else:
+                        out.append('\\"')
+                    continue
+
+                out.append(ch)
+
+            return "".join(out)
+
+        def _loads_with_repairs(payload: str) -> Optional[Any]:
+            if not isinstance(payload, str):
+                return None
+            s = payload.strip()
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+
+            # 常见修复：删除结尾多余逗号 + 修复字符串内未转义引号
+            repaired = s
+            repaired = repaired.replace("\ufeff", "")
+            repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+            repaired = _escape_unescaped_quotes(repaired)
+            try:
+                return json.loads(repaired)
+            except Exception:
+                pass
+
+            # 兼容“类 Python dict/list 字面量”（常见于 LLM：单引号、None/True/False 等）。
+            # 安全：ast.literal_eval 不执行任意代码；且这里只接受 dict/list。
+            try:
+                obj = ast.literal_eval(repaired)
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except Exception:
+                return None
+
+            return None
+
         try:
             lower = candidate.lower()
 
@@ -95,12 +178,18 @@ class StepGenerator:
                 payload = candidate[pos + len("```json") :]
                 payload = payload.split("```", 1)[0]
                 payload = _strip_fence_payload(payload)
-                return json.loads(payload)
+                parsed = _loads_with_repairs(payload)
+                if parsed is not None:
+                    return parsed
             if candidate.startswith("```"):
                 payload = candidate.split("```", 1)[1].split("```", 1)[0]
                 payload = _strip_fence_payload(payload)
-                return json.loads(payload)
-            return json.loads(candidate)
+                parsed = _loads_with_repairs(payload)
+                if parsed is not None:
+                    return parsed
+            parsed = _loads_with_repairs(candidate)
+            if parsed is not None:
+                return parsed
         except Exception:
             pass
 
@@ -113,10 +202,7 @@ class StepGenerator:
             if start < 0 or end <= start:
                 return None
             snippet = candidate[start : end + 1].strip()
-            try:
-                return json.loads(snippet)
-            except Exception:
-                return None
+            return _loads_with_repairs(snippet)
 
         return _try_span("{", "}") or _try_span("[", "]")
 
@@ -278,10 +364,14 @@ class StepGenerator:
 
         enable_single_route = bool(story_config.get("enable_single_route", False))
         enable_multi_branch = bool(story_config.get("enable_multi_branch", False))
+        allow_loop_story = bool(story_config.get("allow_loop_story", False))
 
         # 互斥纠偏：单线叙事优先
         if enable_single_route and enable_multi_branch:
             enable_multi_branch = False
+
+        if not enable_multi_branch:
+            allow_loop_story = False
 
         # 只有开启多分支，才允许 choice/condition
         enable_choice = bool(story_config.get("enable_choice_node", False))
@@ -289,6 +379,10 @@ class StepGenerator:
         if not enable_multi_branch:
             enable_choice = False
             enable_condition = False
+
+        # 循环剧情必须至少启用 choice/condition 之一作为跳出机制
+        if allow_loop_story and not (enable_choice or enable_condition):
+            enable_condition = True
 
         single_route_note = ""
         if enable_single_route:
@@ -314,6 +408,19 @@ class StepGenerator:
 """
         else:
             node_note = "不要设计选择节点/条件节点，不要引入分支走向"
+
+        loop_note = ""
+        if enable_multi_branch and allow_loop_story:
+            loop_note = """
+
+循环剧情规划要求（非常重要）：
+- 本次允许出现“循环剧情”（某段剧情可根据选择/条件返回到此前节点/章节，形成可重复段落）。
+- 循环必须是“可控循环”：
+    1) 明确循环入口：在哪一章/哪个剧情节点开始进入循环（例如训练/刷好感/解谜回合）。
+    2) 明确循环退出条件：必须使用 condition 或 choice（可配合 var_ops 修改变量）来判断何时脱离循环。
+    3) 必须至少存在一条路径能跳出循环并推进主线/进入结局；严禁无出口死循环。
+- 在大纲末尾的【分支控制计划】中，必须把“循环入口/循环回边/循环退出”作为明确控制节点写出来，并说明用哪个变量判定退出。
+"""
         
         instruction = f"""请根据以下信息，生成故事大纲：
 
@@ -337,6 +444,7 @@ class StepGenerator:
 - 大纲要完整连贯
 - 符合故事风格
 - {node_note}
+{loop_note}
 {single_route_note}
 """
         
@@ -347,6 +455,7 @@ class StepGenerator:
             "enable_condition": enable_condition,
             "enable_multi_branch": enable_multi_branch,
             "enable_single_route": enable_single_route,
+            "allow_loop_story": allow_loop_story,
         }
         
         return instruction, parameters
@@ -400,7 +509,8 @@ class StepGenerator:
     def prepare_chapters_instruction(
         self,
         story_config: Dict[str, Any],
-        outline: Dict[str, Any]
+        outline: Dict[str, Any],
+        character_config: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         准备生成章节列表的指令
@@ -417,16 +527,53 @@ class StepGenerator:
         enable_condition = bool(story_config.get("enable_condition_node", False))
         enable_multi_branch = bool(story_config.get("enable_multi_branch", False))
         enable_single_route = bool(story_config.get("enable_single_route", False))
+        allow_loop_story = bool(story_config.get("allow_loop_story", False))
         text_volume = int(story_config.get("text_volume", 5000) or 5000)
+
+        # 角色命名约束：避免 Step3 产生别名/昵称导致 Step4 speaker 不存在
+        allowed_character_names: List[str] = []
+        try:
+            for c in (character_config or []):
+                if not isinstance(c, dict):
+                    continue
+                name = (c.get("char_name") or c.get("name") or "").strip()
+                if name and name not in allowed_character_names:
+                    allowed_character_names.append(name)
+        except Exception:
+            allowed_character_names = []
+
+        character_name_rules = ""
+        if allowed_character_names:
+            character_name_rules = f"""
+
+角色命名硬约束（非常重要，必须逐条遵守）：
+- 你只能使用以下“角色配置名”（完全一致，禁止改写/缩写/别名/小名/昵称/称呼）：{json.dumps(allowed_character_names, ensure_ascii=False)}
+- chapters[].characters 必须是上述列表的子集；不得输出任何不在列表中的名字。
+- summary/main_scenes 中提到角色时，也必须使用上述“角色配置名”。
+    - 如需昵称/称呼，只能写在对白 text 里，不能出现在 characters 列表，也不能替代 speaker 名字。
+- 不允许在章节列表阶段发明新角色名；若需要无名路人/店员等，只能用“旁白/叙述”描述，不得把路人加入 characters。
+"""
+        else:
+            character_name_rules = """
+
+角色命名提示：当前未提供角色配置名列表。
+- 若你输出了 characters 字段，必须使用全局一致的“正式角色名”，不要使用别名/昵称。
+"""
 
         # 互斥纠偏：单线叙事优先
         if enable_single_route and enable_multi_branch:
             enable_multi_branch = False
 
+        if not enable_multi_branch:
+            allow_loop_story = False
+
         # 只有开启多分支，才允许 choice/condition
         if not enable_multi_branch:
             enable_choice = False
             enable_condition = False
+
+        if allow_loop_story and not (enable_choice or enable_condition):
+            enable_condition = True
 
         branch_note = ""
         if enable_single_route:
@@ -449,6 +596,16 @@ class StepGenerator:
 - 你需要在章节列表阶段就明确“关键选择/条件”会如何影响后续章节走向，并用 branch_plan 明确表达。
 - route 字段用于标记章节归属（common/A/B/ending_A/ending_B...）。
 """
+                if allow_loop_story:
+                    branch_note += """
+
+循环剧情要求（非常重要）：
+- 允许出现可重复章节/可重复段落（循环），但必须在 branch_plan 中明确：
+  - 循环入口在哪一章（at_chapter_id）
+  - 循环回边返回到哪个章节（next_chapter_id 指向已出现的 chapter_id）
+  - 循环退出条件：必须给出 condition 或 choice+var_ops+condition 组合，保证可跳出循环。
+- 禁止无出口死循环：必须存在至少一个分支最终进入新章节/结局，而不是一直回到循环内。
+"""
             else:
                 branch_note = """
 
@@ -468,32 +625,66 @@ class StepGenerator:
 
         branch_plan_rules = """
 
-branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
+branch_plan 字段（分支计划）规则（非常重要，必须严格遵守）：
 
-【choice 节点】
-- 在 at_chapter_id 章末出现选择节点。
-- options[i].text：第 i 个选项显示文本。
-- options[i].var_ops（可选）：该选项被选择后立刻执行的变量运算列表（用于“延迟分支”）。
-  - var_ops 的字段必须是：dest/left/right/op/left_const/right_const
-  - op 支持：= + - * /
+目标：branch_plan 要成为 Step4 写作与 Step5 流程图的“唯一分支真相来源”。
 
-【选项跳转优先级】（从高到低）：
-1) options[i].leads_to：若提供，为路线上的章节 ID 列表。
-   - 进入该选项后，首先进入 leads_to[0]；并且可把 leads_to 内部按顺序理解为线性推进。
-2) options[i].next_chapter_id：若提供，为该选项选择后“立刻进入”的下一章。
-   - 典型用法：两条选项都 next_chapter_id="4"（先合并回共通线继续），但 var_ops 设置不同变量。
-3) options[i].merge_to：该选项分支结束后汇聚回的共通章节（用于路线图说明）。
-4) options[i].ends_to：该选项路线直接结束时进入的结局章节（用于路线图说明）。
+一、完整性硬约束（必须满足）
+- 当启用多分支 +（choice/condition 任一启用）时：branch_plan **必须覆盖每一个 chapter_id**。
+    - 对每个章节，必须给出章末出口类型：linear / choice / condition / end。
+    - 每个 branch_plan[i].at_chapter_id 必须出现在 chapters[].chapter_id 中（禁止发明章节 id）。
 
-一致性要求：
-- 如果同时提供 leads_to 与 next_chapter_id：next_chapter_id 必须等于 leads_to[0]。
-- 至少提供 leads_to 或 next_chapter_id 之一；merge_to/ends_to 可选（用于说明后续汇聚/结局）。
+二、类型定义
+1) linear（线性出口）
+- 结构：{"type":"linear","at_chapter_id":"3","next_chapter_id":"4"}
+- next_chapter_id 必须指向 chapters[].chapter_id 中存在的章节。
 
-【condition 节点】
-- 在 at_chapter_id 章末出现条件判断节点。
-- condition.var/op/value/const：条件表达式。
-- true_leads_to / false_leads_to：分别表示 true/false 分支的路线章节 ID 列表，进入时先进入列表第一个。
-- 如果只想跳到单章，也可以只写一个元素列表，例如 true_leads_to=["6A"].
+2) end（结束出口）
+- 结构：{"type":"end","at_chapter_id":"N"}
+
+3) choice（选择出口，章末）
+- 结构（推荐最小形式）：
+    {
+        "type":"choice",
+        "at_chapter_id":"3",
+        "prompt":"...",
+        "options":[
+            {"text":"...","next_chapter_id":"4A","var_ops":[],"node":{"title":"选项后过渡","directives":{},"dialogues":[]}},
+            {"text":"...","next_chapter_id":"4B","var_ops":[],"node":{"title":"选项后过渡","directives":{},"dialogues":[]}}
+        ]
+    }
+- 每个 option 必须提供 next_chapter_id（目标章节）；不得留空。
+- 每个 option 都必须包含 node（附属文本节点的占位结构），用于保证 Step4/Step5 节点结构稳定。
+
+4) condition（条件出口，章末）
+- 结构（推荐最小形式）：
+    {
+        "type":"condition",
+        "at_chapter_id":"5",
+        "prompt":"...",
+        "condition":{
+            "condition_rules":[
+                {
+                    "name":"走A线",
+                    "logic":"and",
+                    "exprs":["route_flag == 1"],
+                    "next_chapter_id":"6A",
+                    "var_ops":[],
+                    "node":{"title":"规则分支过渡","directives":{},"dialogues":[]}
+                }
+            ],
+            "else_next_chapter_id":"6B",
+            "else_var_ops":[],
+            "else_node":{"title":"否则分支过渡","directives":{},"dialogues":[]}
+        }
+    }
+- condition_rules 为有序列表（按顺序匹配）；必须至少 1 条规则；否则分支必须提供且唯一。
+- condition_rules[].next_chapter_id 与 else_next_chapter_id 必须指向 chapters[].chapter_id 中存在的章节。
+- condition_rules[].node 与 else_node 必须提供（附属文本节点占位结构）。
+
+三、变量操作 var_ops 规则
+- var_ops 的字段必须是：dest/left/right/op/left_const/right_const
+- op 支持：= + - * /
 """
 
         if not (enable_multi_branch and (enable_choice or enable_condition)):
@@ -525,15 +716,23 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
                     {"chapter_id": "6", "title": "第6章-汇聚", "summary": "...", "main_scenes": ["..."], "characters": ["..."], "estimated_words": 900, "route": "common"},
                 ],
                 "branch_plan": [
+                    {"type": "linear", "at_chapter_id": "1", "next_chapter_id": "2"},
+                    {"type": "linear", "at_chapter_id": "2", "next_chapter_id": "3"},
                     {
                         "type": "choice",
                         "at_chapter_id": "3",
                         "prompt": "选择路线",
                         "options": [
-                            {"text": "走A线", "leads_to": ["4A", "5A"], "merge_to": "6"},
-                            {"text": "走B线", "leads_to": ["4B", "5B"], "merge_to": "6"},
+                            {"text": "走A线", "next_chapter_id": "4A", "var_ops": [], "node": {"title": "选择A后的过渡", "directives": {}, "dialogues": []}},
+                            {"text": "走B线", "next_chapter_id": "4B", "var_ops": [], "node": {"title": "选择B后的过渡", "directives": {}, "dialogues": []}},
                         ],
                     }
+                    ,
+                    {"type": "linear", "at_chapter_id": "4A", "next_chapter_id": "5A"},
+                    {"type": "linear", "at_chapter_id": "5A", "next_chapter_id": "6"},
+                    {"type": "linear", "at_chapter_id": "4B", "next_chapter_id": "5B"},
+                    {"type": "linear", "at_chapter_id": "5B", "next_chapter_id": "6"},
+                    {"type": "end", "at_chapter_id": "6"},
                 ],
             },
             ensure_ascii=False,
@@ -552,6 +751,8 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
                     {"chapter_id": "6B", "title": "第6B章", "summary": "B线开始", "main_scenes": ["..."], "characters": ["..."], "estimated_words": 700, "route": "B"},
                 ],
                 "branch_plan": [
+                    {"type": "linear", "at_chapter_id": "1", "next_chapter_id": "2"},
+                    {"type": "linear", "at_chapter_id": "2", "next_chapter_id": "3"},
                     {
                         "type": "choice",
                         "at_chapter_id": "3",
@@ -563,6 +764,7 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
                                 "var_ops": [
                                     {"dest": "route_flag", "op": "=", "right": 1, "right_const": True, "left": 0, "left_const": True}
                                 ],
+                                "node": {"title": "选择A后的过渡", "directives": {}, "dialogues": []},
                             },
                             {
                                 "text": "偏向B",
@@ -570,15 +772,33 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
                                 "var_ops": [
                                     {"dest": "route_flag", "op": "=", "right": 0, "right_const": True, "left": 0, "left_const": True}
                                 ],
+                                "node": {"title": "选择B后的过渡", "directives": {}, "dialogues": []},
                             },
                         ],
                     },
+                    {"type": "linear", "at_chapter_id": "4", "next_chapter_id": "5"},
                     {
                         "type": "condition",
                         "at_chapter_id": "5",
                         "prompt": "根据 route_flag 进入不同路线",
-                        "condition": {"var": "route_flag", "op": "==", "value": 1, "const": True, "true_leads_to": ["6A"], "false_leads_to": ["6B"]},
+                        "condition": {
+                            "condition_rules": [
+                                {
+                                    "name": "走A线",
+                                    "logic": "and",
+                                    "exprs": ["route_flag == 1"],
+                                    "next_chapter_id": "6A",
+                                    "var_ops": [],
+                                    "node": {"title": "规则分支过渡", "directives": {}, "dialogues": []},
+                                }
+                            ],
+                            "else_next_chapter_id": "6B",
+                            "else_var_ops": [],
+                            "else_node": {"title": "否则分支过渡", "directives": {}, "dialogues": []},
+                        },
                     },
+                    {"type": "end", "at_chapter_id": "6A"},
+                    {"type": "end", "at_chapter_id": "6B"},
                 ],
             },
             ensure_ascii=False,
@@ -602,20 +822,31 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
 2) 每个章节包含：
 - chapter_id：字符串（唯一、稳定；线性模式为 "1".."N"；多分支模式允许 4A/4B）
 - title：章节标题
-- summary：章节摘要（150-200字）
+- summary：章节摘要（**必须 300-500 字**；必须是完整段落；这是后续 Step4 逐章详稿的“硬约束来源”，必须足够完整，避免与故事大纲偏差）
 - main_scenes：主要场景（列表）
 - characters：涉及角色（列表）
 - estimated_words：预计字数（整数）
 - route：可选，"common" / "A" / "B" ...（仅多分支模式使用；线性模式请省略）
 {branch_note}
 
+{character_name_rules}
+
+章节摘要（summary）写作硬约束（必须逐条满足，否则视为失败）：
+1) **字数范围**：每章 summary 必须为 **300-500 字**（中文为主；不要用 3~5 句草率概括）。
+2) **完整性**：必须明确写清“本章开端状态 → 关键事件链 → 冲突/转折 → 结果状态 → 下一章钩子/悬念”。
+3) **一致性**：必须严格对齐故事大纲的事件顺序、角色动机与世界观设定；禁止凭空新增大纲未支持的关键设定。
+4) **可执行性**：summary 要具体到可直接据此写 Step4 章节详稿（可提及重要场景、关键人物互动、情绪推进、线索/变量变化或分支触发条件）。
+
 {branch_plan_output_rule}
 
 {branch_plan_rules}
 
+重要：为了后续流程图稳定生成，你的 branch_plan 必须“每章一条出口计划”。
+如果你不确定某章是否需要分支，也必须输出 type=linear 或 type=end 的占位出口。
+
 请严格以结构化 JSON 输出（仅输出 JSON，不要解释文字）。
 
-推荐 JSON Schema：
+推荐 JSON Schema（多分支模式下：branch_plan 必须覆盖每个 chapter_id）：
 {{
     "word_budget": {{
         "total_target": 5000,
@@ -637,38 +868,57 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
         }}
     ],
     "branch_plan": [
+        {{"type": "linear", "at_chapter_id": "1", "next_chapter_id": "2"}},
         {{
-            "type": "choice|condition",
+            "type": "choice",
             "at_chapter_id": "3",
             "prompt": "玩家需要做出关键选择...",
             "options": [
                 {{
                     "text": "选项A...",
-                    "leads_to": ["4A", "5A"],
-                    "merge_to": "6",
-                    "ends_to": "ending_A",
+                    "next_chapter_id": "4A",
                     "var_ops": [
                         {{"dest": "route_flag", "op": "=", "right": 1, "right_const": true, "left": 0, "left_const": true}}
-                    ]
+                    ],
+                    "node": {{"title": "选项A过渡", "directives": {{}}, "dialogues": []}}
                 }},
                 {{
                     "text": "选项B...",
-                    "leads_to": ["4B", "5B"],
-                    "merge_to": "6",
-                    "ends_to": "ending_B",
+                    "next_chapter_id": "4B",
                     "var_ops": [
                         {{"dest": "route_flag", "op": "=", "right": 0, "right_const": true, "left": 0, "left_const": true}}
-                    ]
+                    ],
+                    "node": {{"title": "选项B过渡", "directives": {{}}, "dialogues": []}}
                 }}
-            ],
-            "condition": {{"var": "A", "op": "==", "value": "1", "const": true, "true_leads_to": ["4A"], "false_leads_to": ["4B"], "merge_to": "6", "true_ends_to": "ending_A", "false_ends_to": "ending_B"}}
-        }}
+            ]
+        }},
+        {{
+            "type": "condition",
+            "at_chapter_id": "5",
+            "prompt": "根据变量进入不同路线",
+            "condition": {{
+                "condition_rules": [
+                    {{
+                        "name": "走A线",
+                        "logic": "and",
+                        "exprs": ["route_flag == 1"],
+                        "next_chapter_id": "6A",
+                        "var_ops": [],
+                        "node": {{"title": "规则分支过渡", "directives": {{}}, "dialogues": []}}
+                    }}
+                ],
+                "else_next_chapter_id": "6B",
+                "else_var_ops": [],
+                "else_node": {{"title": "否则分支过渡", "directives": {{}}, "dialogues": []}}
+            }}
+        }},
+        {{"type": "end", "at_chapter_id": "N"}}
     ]
 }}
 
 补充：允许“延迟分支”的常见写法（推荐）：
-- 在较早章节（例如第3章）使用 choice，但两个选项都先回到共通章节（例如 merge_to="4" 或 next_chapter_id="4"），同时每个选项通过 var_ops 设置不同变量值；
-- 在较晚章节（例如第5章）再放置 condition（at_chapter_id="5"），根据上述变量值决定进入 A/B 路线（true_leads_to/false_leads_to）。
+- 在较早章节（例如第3章）使用 choice，但两个选项都先进入同一共通章节（next_chapter_id="4"），同时每个选项通过 var_ops 设置不同变量值；
+- 在较晚章节（例如第5章）再放置 condition（at_chapter_id="5"），根据上述变量值决定进入不同路线（condition_rules + else_next_chapter_id）。
 
 完整示例模板 1（立即分支 + 可汇聚）：
 ```json
@@ -688,6 +938,8 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
             "enable_condition": enable_condition,
             "enable_multi_branch": enable_multi_branch,
             "enable_single_route": enable_single_route,
+            "allow_loop_story": allow_loop_story,
+            "allow_branch_plan": allow_branch_plan,
         }
 
         return instruction, parameters
@@ -728,6 +980,83 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            # 归一化：补全 branch_plan 的“每章出口计划”，减少 Step4/Step5 断链
+            try:
+                allow_bp = bool((parameters or {}).get("allow_branch_plan", False))
+                if allow_bp and isinstance(chapters.get("structured"), dict):
+                    st = chapters.get("structured") or {}
+                    chap_list = st.get("chapters") if isinstance(st.get("chapters"), list) else []
+                    chapter_ids: List[str] = []
+                    route_by_id: Dict[str, str] = {}
+                    for c in chap_list:
+                        if not isinstance(c, dict):
+                            continue
+                        cid = str(c.get("chapter_id") or "").strip()
+                        if not cid:
+                            continue
+                        chapter_ids.append(cid)
+                        route_by_id[cid] = str(c.get("route") or "common").strip() or "common"
+
+                    # 按 route 组织章节顺序，用于默认 next 推断（避免把 A/B 分支串错）
+                    ids_by_route: Dict[str, List[str]] = {}
+                    for cid in chapter_ids:
+                        r = (route_by_id.get(cid) or "common").strip() or "common"
+                        ids_by_route.setdefault(r, []).append(cid)
+                    pos_by_id: Dict[str, int] = {cid: i for i, cid in enumerate(chapter_ids)}
+                    pos_in_route: Dict[tuple[str, str], int] = {}
+                    for r, ids in ids_by_route.items():
+                        for i, cid in enumerate(ids):
+                            pos_in_route[(r, cid)] = i
+
+                    def _default_next_for(chapter_id: str) -> str:
+                        cid = str(chapter_id or "").strip()
+                        if not cid or cid not in pos_by_id:
+                            return ""
+                        r = (route_by_id.get(cid) or "common").strip() or "common"
+                        # common：优先找下一个 common；找不到再退回到列表顺序
+                        if r.lower() == "common":
+                            start_idx = pos_by_id[cid]
+                            for j in range(start_idx + 1, len(chapter_ids)):
+                                cand = chapter_ids[j]
+                                if (route_by_id.get(cand) or "common").strip().lower() == "common":
+                                    return cand
+                            if start_idx < len(chapter_ids) - 1:
+                                return chapter_ids[start_idx + 1]
+                            return ""
+                        # 非 common：只在同 route 内顺序推进；若已到 route 末尾，则默认 end（不猜测汇聚）
+                        ids = ids_by_route.get(r) or []
+                        if not ids:
+                            return ""
+                        p = pos_in_route.get((r, cid))
+                        if p is None:
+                            return ""
+                        if p < len(ids) - 1:
+                            return ids[p + 1]
+                        return ""
+                    bp_list = st.get("branch_plan") if isinstance(st.get("branch_plan"), list) else []
+                    existing_by_at: Dict[str, Dict[str, Any]] = {}
+                    for item in bp_list:
+                        if not isinstance(item, dict):
+                            continue
+                        at = str(item.get("at_chapter_id") or "").strip()
+                        if at and at not in existing_by_at:
+                            existing_by_at[at] = item
+
+                    completed: List[Dict[str, Any]] = []
+                    for idx, cid in enumerate(chapter_ids):
+                        if cid in existing_by_at:
+                            completed.append(existing_by_at[cid])
+                            continue
+                        nxt = _default_next_for(cid)
+                        if nxt and nxt != cid:
+                            completed.append({"type": "linear", "at_chapter_id": cid, "next_chapter_id": nxt})
+                        else:
+                            completed.append({"type": "end", "at_chapter_id": cid})
+                    st["branch_plan"] = completed
+                    chapters["structured"] = st
+            except Exception:
+                pass
             
             self.logger.info("章节列表生成完成")
             return chapters
@@ -745,6 +1074,7 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
         previous_context: Optional[str] = None,
         story_config: Optional[Dict[str, Any]] = None,
         character_config: Optional[List[Dict[str, Any]]] = None,
+        personas_data: Any | None = None,
         chapters_plan: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
@@ -754,6 +1084,10 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
             chapter_index: 章节索引（从0开始）
             chapter_info: 章节信息
             previous_context: 上一章的上下文（可选）
+            story_config: 故事配置（可选）
+            character_config: 角色配置列表（可选）
+            personas_data: 步骤1生成的人设数据（可选，用于让步骤4提示词显式包含人设细节）
+            chapters_plan: 步骤3章节规划（可选）
         
         Returns:
             (指令文本, 参数字典)
@@ -762,13 +1096,37 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
 
         story_cfg = story_config or {}
         enable_multi_branch = bool(story_cfg.get("enable_multi_branch", False))
+        allow_loop_story = bool(story_cfg.get("allow_loop_story", False))
         enable_choice = bool(story_cfg.get("enable_choice_node", False)) if enable_multi_branch else False
         enable_condition = bool(story_cfg.get("enable_condition_node", False)) if enable_multi_branch else False
+
+        if not enable_multi_branch:
+            allow_loop_story = False
+
+        if allow_loop_story and not (enable_choice or enable_condition):
+            enable_condition = True
         target_words = int(
             chapter_info.get("estimated_words")
             or chapter_info.get("target_words")
             or 0
         )
+
+        # 经验修正：LLM 往往低估字数/字符数（常见少 30%~50%），因此在 Step4 提示词里
+        # 对“写作目标”做倍率放大，提升实际输出文本量的可控性。
+        # 倍率可配置：story_config.step4_word_boost_factor（默认 1.5）。
+        boost_factor = 1.5
+        try:
+            boost_factor = float(story_cfg.get("step4_word_boost_factor", 1.5) or 1.5)
+        except Exception:
+            boost_factor = 1.5
+        if boost_factor < 1.0:
+            boost_factor = 1.0
+        if boost_factor > 3.0:
+            boost_factor = 3.0
+
+        boosted_target_words = 0
+        if target_words > 0:
+            boosted_target_words = max(1, int(round(target_words * boost_factor)))
         chars = character_config or []
         pov = (story_cfg.get("narrative_pov") or "third").strip().lower()
         fp_name = story_cfg.get("first_person_name") or "我"
@@ -777,6 +1135,29 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
         fp_cg_presence = bool(story_cfg.get("first_person_cg_presence", True))
         fp_cg_notes = story_cfg.get("first_person_cg_notes") or ""
         cg_count = int(story_cfg.get("cg_count") or 0)
+
+        # Step4：为“非第一人称角色对白 tts_ext 必填”准备可判定集合
+        character_speakers = set()
+        first_person_speakers = set()
+        speaker_to_char_id: Dict[str, str] = {}
+        try:
+            for c in chars:
+                cid = (c.get("char_id") or c.get("id") or "").strip()
+                name = (c.get("char_name") or c.get("name") or "").strip()
+                if name:
+                    character_speakers.add(name)
+                    if cid:
+                        speaker_to_char_id[name] = cid
+                if bool(c.get("is_first_person", False)) and name:
+                    first_person_speakers.add(name)
+                if pov == "first" and bool(c.get("is_player", False)) and name:
+                    first_person_speakers.add(name)
+        except Exception:
+            character_speakers = set()
+            first_person_speakers = set()
+            speaker_to_char_id = {}
+        if pov == "first" and fp_name:
+            first_person_speakers.add(fp_name)
 
         char_lines = []
         for c in chars:
@@ -794,6 +1175,24 @@ branch_plan 字段语义与组合优先级（非常重要，严格遵守）：
             if name or cid:
                 char_lines.append(f"- {name} ({cid}) {role}{tag_text}".strip())
         char_block = "\n".join(char_lines) if char_lines else "(未提供角色列表)"
+
+        # 步骤1 角色人设（用于约束对白/行为一致性）
+        persona_raw = ""
+        try:
+            if isinstance(personas_data, dict):
+                persona_raw = str(personas_data.get("raw_response") or "").strip()
+            elif isinstance(personas_data, str):
+                persona_raw = personas_data.strip()
+        except Exception:
+            persona_raw = ""
+
+        # 文本量：以“中文字符数”作为硬约束（对白/旁白的 text 累加；不计空格/标点/英文/数字）
+        min_cn_chars = 0
+        max_cn_chars = 0
+        if boosted_target_words > 0:
+            tolerance = max(30, int(boosted_target_words * 0.05))
+            min_cn_chars = max(1, boosted_target_words - tolerance)
+            max_cn_chars = boosted_target_words + tolerance
 
         # Step5 需要可稳定解析的结构化输出，以便按媒体状态变化切分/聚合文本节点。
         # 因此这里强制输出 JSON（建议包在 ```json 代码块中），并约定 scenes + directives。
@@ -874,32 +1273,108 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         except Exception:
             chapter_plan_context = ""
 
-        instruction = f"""你正在为 VNEngine 生成“逐章详稿”（将用于后续自动生成 flow_nodes 与 pending_lists）。
+        # 过滤 Step3 章节列表中可能出现的别名/昵称，避免污染 Step4 提示词
+        chapter_info_for_prompt = dict(chapter_info or {})
+        try:
+            if isinstance(chapter_info_for_prompt.get("characters"), list) and character_speakers:
+                filtered_chars = []
+                for x in chapter_info_for_prompt.get("characters") or []:
+                    s = str(x).strip()
+                    if s in character_speakers and s not in filtered_chars:
+                        filtered_chars.append(s)
+                # 若过滤后为空，则干脆移除，避免模型看到不合法名字
+                if filtered_chars:
+                    chapter_info_for_prompt["characters"] = filtered_chars
+                else:
+                    chapter_info_for_prompt.pop("characters", None)
+        except Exception:
+            chapter_info_for_prompt = dict(chapter_info or {})
 
-请严格输出 **仅一个 JSON 对象**（不要输出解释文字），建议放在 ```json 代码块中。
+        instruction = f"""你正在为 VNEngine 生成“逐章详稿”（后续会用于自动生成 flow_nodes 与 pending_lists）。
 
-章节信息：
-{json.dumps(chapter_info, ensure_ascii=False, indent=2)}
+【输出契约（必须遵守，否则视为失败）】
+1) 仅输出 **一个 JSON 对象**（不要输出解释文字）。建议放在 ```json 代码块中。
+2) 字段名必须与下方 Schema 一致；未用字段可省略，但不要随意改名。
+3) chapter_id 必须等于输入章节的 chapter_id；不得改写。
+4) 所有跨章节跳转必须使用章节列表中的 chapter_id（禁止发明/改写 chapter_id）。
+
+【输入（只读）】
+章节信息（必须对齐）：
+{json.dumps(chapter_info_for_prompt, ensure_ascii=False, indent=2)}
 {chapter_plan_context}
 
-故事配置摘要：
+【故事配置摘要（只读）】
 - 故事风格：{story_cfg.get('style', '')}
+- 开启多分支：{enable_multi_branch}
 - 启用选择节点：{enable_choice}
 - 启用条件节点：{enable_condition}
-- 开启多分支：{enable_multi_branch}
-- 本章目标字数：{target_words if target_words > 0 else '（未指定，按章节摘要合理控制）'}（对白+叙述合计；若指定请尽量控制在 ±15%）
+- 允许循环剧情：{allow_loop_story}
+- 本章目标字数（章节计划）：{target_words if target_words > 0 else '（未指定，按章节摘要合理控制）'}
+- 本章写作目标字数（放大 {boost_factor:g} 倍，用于抵消模型计数偏差）：{boosted_target_words if boosted_target_words > 0 else '（同上）'}（按中文字符数计数，见“文本量硬约束”）
 
-角色列表：
+【角色列表（只读，speaker 必须取自此列表；旁白/叙述除外）】
 {char_block}
 
+【步骤1 角色人设（只读）】
+请严格参考，保证对白与行为一致；若与章节规划冲突，以章节规划为准。
+```text
+{persona_raw if persona_raw else '(未提供步骤1人设 raw_response)'}
+```
+
+【文本量硬约束（必须满足，否则视为失败）】
+- 统计口径：只统计 dialogues[].text 中的中文字符（Unicode \u4e00-\u9fff）；不统计空格、标点、英文、数字。
+- 统计范围：包含所有 speaker 的 text（包括“旁白/叙述”）。
+- 目标范围：{f"必须在 {min_cn_chars}~{max_cn_chars} 中文字符之间（该范围已按章节计划字数×{boost_factor:g} 放大，用于抵消模型计数偏差）" if boosted_target_words > 0 else "未指定目标字数时，请让文本量与章节摘要匹配，避免过短/过长"}。
+- 你必须在输出 JSON 的 word_target 字段回填章节计划的目标字数（优先用章节列表的 estimated_words；即未放大的原始值）。
+
+【音频硬约束（必须满足）】
+- 所有 dialogues[].voice 若填写，必须以 .mp3 结尾（建议直接省略 voice，让系统生成默认 .mp3 虚拟路径）。
+- directives.bgm 若填写，必须以 .mp3 结尾（可写 id 或路径，但最终必须是 mp3）。
+
+【对白字段硬约束（必须满足）】
+- 对于“非第一人称角色”的对白：dialogues[].emotion 必填；dialogues[].portrait 必填；dialogues[].tts_ext 必填（即使 voice 省略也必须提供）。
+- 对于“第一人称角色”：若“第一人称配音=无”，则该角色对白可省略 voice/tts_ext；若“第一人称配音=有”，则 tts_ext 也应填写。
+- 旁白/叙述（不在角色列表中的 speaker）不要求 tts_ext。
+- emotion 推荐：happy/angry/sad/afraid/disgusted/melancholic/surprised/calm（与 tts_ext 的 8 维一致）。
+
+【分支一致性硬约束（非常重要）】
+- 若上方 Step3 章节规划提供了 branch_plan_for_this_chapter：你必须输出与其一致的章末 exit。
+    - type、选项数量、next_chapter_id / condition.condition_rules[].next_chapter_id / else_next_chapter_id 必须一致。
+- 章末跨章节跳转必须用顶层 exit 表达（推荐方式）。
+- choice/condition 的结构必须采用“主节点 + 每分支一个附属文本节点”：
+    - choice：options[].node 必须存在（可空，但必须有该对象以承载对白/过渡/var_ops/媒体切换）。
+    - condition：condition_rules[].node 与 else_node 必须存在（可空，但必须有该对象）。
+- 为避免 Step5 生成重复节点：如果你使用了 exit.type=choice/condition，请不要在 scenes 的最后一个 scene 再重复输出同类 choice/condition。
+
+【章节内 scenes 与章末 exit 的职责（工程化约束）】
+- scenes 用于本章内部叙事与（可选）章节内分支结构；默认不要在 scenes 的 choice/condition 里做跨章节跳转。
+- exit 用于章末跨章节跳转（linear/choice/condition/end）。
+    - exit.type=linear：必须提供 next_chapter_id。
+    - exit.type=choice：exit.choice.options[].next_chapter_id 必填（每个选项都必须能跳到目标章节）。
+    - exit.type=condition：condition.condition_rules[].next_chapter_id 与 else_next_chapter_id 必填。
+    - exit.type=end：不提供下一章。
+
+关键约束（用于保证 Step5 节点聚合/切分效果）：
+1) 同一个 scene(type=text) 内的对白将被尽量聚合进同一个文本节点的 sub_dialogues。
+2) 当需要强制切分为新文本节点时，请在新的 scene.directives 中体现变化：background/bgm/stop_bgm/cg/video/ui_file/hide_textbox。
+3) choice/condition scene：该 scene 本体不要在 dialogues 里写多行对白；对白/过渡请放到各分支的附属节点（options[].node / condition_rules[].node / else_node）。
+
+
+循环剧情强约束（仅当“允许循环剧情=true”时适用）：
+- 允许出现循环，但必须提供可达的“跳出循环”出口（condition 或 choice+condition），禁止不可终止的无限循环。
+
+{fp_rules}
+{cg_rules}
+
 {prev}
-输出 JSON Schema（必须遵守字段名，未用字段可为空/省略）：
+
+输出 JSON Schema（必须遵守字段名；未用字段可为空/省略）：
 {{
     "chapter_id": "string (必须，来自章节列表的 chapter_id)",
     "chapter_title": "string",
     "route": "string (可选：common/A/B/...)",
     "summary": "string",
-    "word_target": "int (可选：本章目标字数；建议回填章节列表的 estimated_words)",
+    "word_target": "int (可选：本章目标字数；建议回填章节列表的 estimated_words；注意：实际写作文本量按提示词中的“写作目标字数（×{boost_factor:g}）”控制)",
     "scenes": [
         {{
             "type": "text|choice|condition",
@@ -907,8 +1382,17 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
             "directives": {{
                 "background": "bg_id_or_path (可选，例 bg_001 或 resources/images/bg_001.png)",
+                "background_desc": "string (可选：背景详细画面描述，建议可直接用于出图提示词)",
+                "time_weather": "string (可选：时间/天气，如'傍晚小雨')",
+                "atmosphere": "string (可选：氛围关键词，如'压抑、温暖')",
+
                 "cg": "cg_id_or_path (可选，视为背景切换到 resources/images/cg/...)",
+                "cg_desc": "string (可选：CG 详细画面描述，建议可直接用于出图提示词)",
+
                 "bgm": "bgm_id_or_path (可选，例 bgm_01 或 resources/audios/bgm_01.mp3)",
+                "bgm_desc": "string (可选：BGM 详细描述，建议可用于生成提示)",
+                "mood": "string (可选：BGM 情绪关键词，如'紧张、温柔')",
+                "style": "string (可选：BGM 曲风/乐器关键词，如'钢琴、弦乐')",
                 "stop_bgm": false,
                 "video": "video_id_or_path (可选)",
                 "ui_file": "ui_id_or_path (可选)",
@@ -919,71 +1403,111 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 {{
                     "speaker": "角色名",
                     "text": "对白内容",
-                    "emotion": "情绪(可选)",
-                    "portrait": "可选：若省略，将由引擎按角色+情绪映射到 resources/portraits/...",
+                    "emotion": "必填（非第一人称角色对白）：情绪",
+                    "tts_ext": "必填（非第一人称角色对白）：8维语气参数 ext（仅允许 happy/angry/sad/afraid/disgusted/melancholic/surprised/calm，0-1）",
+                    "portrait": "必填（非第一人称角色对白）：立绘路径（建议 resources/portraits/{{char_id}}_stand_{{expression}}.png）",
                     "voice": "可选：若省略，将由系统生成虚拟路径 resources/voices/...",
                     "hide_textbox": false,
                     "portrait_fade": false,
                     "portrait_fade_out": false
                 }}
             ],
-
-            "options": ["选项1", "选项2"],
-            "condition": {{"var": "favorability_char_001", "op": ">=", "value": 10, "const": true}}
+            "options": [
+                {{
+                    "text": "选项文本（必须）",
+                    "next_chapter_id": "可选：跨章节跳转（不推荐；章末跨章节请优先用 exit）",
+                    "var_ops": [
+                        {{"dest": "route_flag", "left": 0, "left_const": true, "right": 1, "right_const": true, "op": "="}}
+                    ],
+                    "node": {{
+                        "title": "该选项的附属文本节点标题（建议填写）",
+                        "directives": {{"background": "bg_id_or_path", "bgm": "bgm_id_or_path", "stop_bgm": false, "ui_file": "ui_id_or_path", "video": "video_id_or_path", "hide_textbox": false}},
+                        "dialogues": [
+                            {{"speaker": "角色名", "text": "选项后立刻发生的对白/旁白（长度建议 1~5 句；不要写后续章节关键事件）", "emotion": "calm", "tts_ext": {{"happy": 0, "angry": 0, "sad": 0, "afraid": 0, "disgusted": 0, "melancholic": 0, "surprised": 0, "calm": 1}}, "portrait": "resources/portraits/char_id_stand_neutral.png"}}
+                        ],
+                        "hide_textbox": false
+                    }}
+                }}
+            ],
+            "condition": {{
+                "condition_rules": [
+                    {{
+                        "name": "好感>=10",
+                        "logic": "and",
+                        "exprs": ["favorability_char_001 >= 10"],
+                        "next_chapter_id": "可选：跨章节跳转",
+                        "var_ops": [],
+                        "node": {{
+                            "title": "可选：规则分支附属节点标题",
+                            "directives": {{}},
+                            "dialogues": []
+                        }}
+                    }}
+                ],
+                "else_next_chapter_id": "可选：跨章节跳转",
+                "else_var_ops": [],
+                "else_node": {{
+                    "title": "可选：否则分支附属节点标题",
+                    "directives": {{}},
+                    "dialogues": []
+                }}
+            }}
         }}
     ],
     "exit": {{
         "type": "linear|choice|condition|end",
-        "next_chapter_id": "string (当 type=linear)",
+        "next_chapter_id": "string (当 type=linear 必填)",
         "choice": {{
             "prompt": "string",
             "options": [
-                {{"text": "选项文本", "next_chapter_id": "4A"}},
-                {{"text": "选项文本", "next_chapter_id": "4B"}}
+                {{
+                    "text": "选项文本",
+                    "next_chapter_id": "4A (必填)",
+                    "var_ops": [
+                        {{"dest": "route_flag", "left": 0, "left_const": true, "right": 1, "right_const": true, "op": "="}}
+                    ],
+                    "node": {{
+                        "title": "可选：选项后即时反馈",
+                        "directives": {{"background": "bg_id_or_path", "bgm": "bgm_id_or_path", "stop_bgm": false, "ui_file": "ui_id_or_path", "video": "video_id_or_path", "hide_textbox": false}},
+                        "dialogues": [
+                            {{"speaker": "角色名", "text": "选项后立刻发生的对白/旁白（不要写后续章节关键事件）", "emotion": "calm", "tts_ext": {{"happy": 0, "angry": 0, "sad": 0, "afraid": 0, "disgusted": 0, "melancholic": 0, "surprised": 0, "calm": 1}}, "portrait": "resources/portraits/char_id_stand_neutral.png"}}
+                        ],
+                        "hide_textbox": false
+                    }}
+                }},
+                {{"text": "选项文本", "next_chapter_id": "4B (必填)", "var_ops": [], "node": {{"dialogues": []}}}}
             ]
         }},
         "condition": {{
-            "var": "A",
-            "op": "==",
-            "value": "1",
-            "const": true,
-            "true_next_chapter_id": "4A",
-            "false_next_chapter_id": "4B"
+            "condition_rules": [
+                {{
+                    "name": "规则1",
+                    "logic": "and",
+                    "exprs": ["A == 1"],
+                    "next_chapter_id": "4A (必填)",
+                    "var_ops": [],
+                    "node": {{"dialogues": []}}
+                }}
+            ],
+            "else_next_chapter_id": "4B (必填)",
+            "else_var_ops": [],
+            "else_node": {{"dialogues": []}}
         }}
     }}
 }}
 
-关键约束（用于保证 Step5 节点聚合/切分效果）：
-1) **同一个 scene(type=text)** 内的对白将被尽量聚合进同一个文本节点的 sub_dialogues。
-2) 当需要强制切分为新文本节点时，请在新的 scene 的 directives 中体现变化：
-     - background 改变 / bgm 改变 / stop_bgm=true / cg 出现 / video 改变 / ui_file 改变 / hide_textbox 段落变化。
-3) choice/condition scene：不要提供 sub_dialogues 的多行对白；
-     - choice 必须提供 options 数组（>=2）。
-     - condition 必须提供 condition 对象（并隐含 True/False 两条分支）。
-
-分支生成强约束（用于避免“只有占位节点，没有分支剧情”）：
-- 当启用选择/条件节点且该章确实存在关键分支时：
-    - 请优先把“分支跳转关系”写到顶层 exit（type=choice/condition），并为每个选项/真假分支给出 next_chapter_id。
-    - **如果使用了 exit.type=choice/condition：请不要在 scenes 中再重复输出同一个 choice/condition scene（尤其不要作为最后一个 scene）。**
-      - 需要“选择前铺垫/情绪推进”请用 text scene 写在前面。
-    - 分支的具体剧情请放到对应的分支章节（例如 4A/4B）里生成，而不是在本章里写“分支占位”。
-- 如果本章只是共通推进（没有关键分支），exit.type 使用 linear 或 end。
-
-多分支/多结局约束（当开启多分支时必须遵守）：
-- chapter_count 按主线/共通线计数；分支章节（route=A/B/...）通常更短，不需要与共通线平均字数。
-- 允许多结局：分支章节可 exit.type = end（直接结束）或 linear 指向独立结局章节；不要求强制汇聚。
-
-{fp_rules}
-{cg_rules}
-
 内容要求：
 - 对白自然、推进剧情，符合章节摘要与人设。
 - 每个 scene 的 directives 只在需要变化时写；不写表示沿用上一 scene 的状态。
+- 为保证 JSON 可解析：在任何字符串字段（尤其 dialogues[].text）里不要使用英文双引号(\")；如需引用请使用中文引号「」或『』。
 
 输出前自检（必须逐条满足）：
-1) 输出 JSON 的 chapter_id / chapter_title / route 与“章节信息/章节规划”一致。
-2) 本章关键事件必须覆盖 chapter_info.summary 的要点，不要跑题。
-3) 若本章存在关键分支：请用顶层 exit 精确表达跳转；且不要在 scenes 末尾重复输出 choice/condition。
+1) 输出 JSON 的 chapter_id / chapter_title / route 与输入一致。
+2) 本章关键事件覆盖 chapter_info.summary 的要点，不跑题。
+3) 若 Step3 提供 branch_plan_for_this_chapter：exit 与其严格一致。
+4) 文本量硬约束：已按“中文字符数”统计 dialogues[].text 并满足目标范围。
+5) 音频格式硬约束：所有 voice/bgm（如有）均为 .mp3。
+6) 非第一人称角色对白均提供 tts_ext/emotion/portrait。
 """
         
         parameters = {
@@ -992,12 +1516,225 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             "chapter_id": chapter_info.get("chapter_id") or chapter_info.get("id") or str(chapter_index + 1),
             "narrative_pov": pov,
             "first_person_name": fp_name,
+            "first_person_has_voice": fp_has_voice,
+            "enforce_tts_ext_for_non_first_person": True,
+            "enforce_emotion_portrait_for_non_first_person": True,
+            "first_person_speakers": sorted(first_person_speakers),
+            "character_speakers": sorted(character_speakers),
+            "speaker_to_char_id": speaker_to_char_id,
             "cg_count": cg_count,
             "target_words": target_words,
+            "step4_word_boost_factor": boost_factor,
+            "target_words_boosted": boosted_target_words,
+            "cn_char_target": boosted_target_words if boosted_target_words > 0 else target_words,
+            "cn_char_min": min_cn_chars,
+            "cn_char_max": max_cn_chars,
+            "enforce_cn_char_count": bool(target_words > 0),
+            "enforce_audio_mp3": True,
             "has_chapters_plan": bool(isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list)),
+            "allow_loop_story": allow_loop_story,
+            "has_personas_data": bool(personas_data),
         }
         
         return instruction, parameters
+
+    @staticmethod
+    def _count_cn_chars(text: str) -> int:
+        if not isinstance(text, str) or not text:
+            return 0
+        return len(re.findall(r"[\u4e00-\u9fff]", text))
+
+    def _count_cn_chars_in_chapter_struct(self, structured: Any) -> int:
+        """统计章节结构化 JSON 中 dialogues[].text 的中文字符数。"""
+        if not isinstance(structured, dict):
+            return 0
+        total = 0
+        scenes = structured.get("scenes")
+        if isinstance(scenes, list):
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                dialogues = scene.get("dialogues")
+                if not isinstance(dialogues, list):
+                    continue
+                for d in dialogues:
+                    if not isinstance(d, dict):
+                        continue
+                    total += self._count_cn_chars(str(d.get("text") or ""))
+        return total
+
+    def _normalize_audio_paths_mp3_in_chapter_struct(self, structured: Any) -> Any:
+        """把 structured 里的 voice/bgm 归一化为 .mp3（仅对缺扩展名/非 mp3 的情况做温和修正）。"""
+        if not isinstance(structured, dict):
+            return structured
+
+        def _to_mp3(val: Any) -> Any:
+            if not isinstance(val, str):
+                return val
+            s = val.strip()
+            if not s:
+                return val
+            low = s.lower()
+            if low.endswith(".mp3"):
+                return s
+            # 如果没有扩展名，补 .mp3
+            tail = s.split("/")[-1].split("\\")[-1]
+            if "." not in tail:
+                return s + ".mp3"
+            # 有扩展名但不是 mp3：替换为 .mp3
+            return re.sub(r"\.[A-Za-z0-9]+$", ".mp3", s)
+
+        scenes = structured.get("scenes")
+        if isinstance(scenes, list):
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                directives = scene.get("directives")
+                if isinstance(directives, dict) and directives.get("bgm"):
+                    directives["bgm"] = _to_mp3(directives.get("bgm"))
+                dialogues = scene.get("dialogues")
+                if isinstance(dialogues, list):
+                    for d in dialogues:
+                        if not isinstance(d, dict):
+                            continue
+                        if d.get("voice"):
+                            d["voice"] = _to_mp3(d.get("voice"))
+        return structured
+
+    def _ensure_tts_ext_for_non_first_person_dialogues(self, structured: Any, parameters: Dict[str, Any]) -> Any:
+        """确保非第一人称角色对白具备 tts_ext；缺失则根据 emotion 自动补齐，并写入 warnings。"""
+        if not isinstance(structured, dict):
+            return structured
+        enforce_tts_ext = bool(parameters.get("enforce_tts_ext_for_non_first_person", False))
+        enforce_emotion_portrait = bool(parameters.get("enforce_emotion_portrait_for_non_first_person", False))
+        if not (enforce_tts_ext or enforce_emotion_portrait):
+            return structured
+
+        try:
+            first_person_speakers = set(parameters.get("first_person_speakers") or [])
+            character_speakers = set(parameters.get("character_speakers") or [])
+            fp_has_voice = bool(parameters.get("first_person_has_voice", False))
+            speaker_to_char_id = parameters.get("speaker_to_char_id") or {}
+        except Exception:
+            first_person_speakers = set()
+            character_speakers = set()
+            fp_has_voice = False
+            speaker_to_char_id = {}
+
+        # 无角色表时无法可靠区分旁白/叙述，避免误伤。
+        if not character_speakers:
+            return structured
+
+        try:
+            from ..utils.voice_emotion import emotion_to_ext, normalize_ext
+        except Exception:
+            return structured
+
+        def _emotion_to_expr(emotion_text: str) -> str:
+            t = (emotion_text or "").strip().lower()
+            if not t:
+                return "neutral"
+            if t in {"calm"}:
+                return "neutral"
+            if t in {"happy"}:
+                return "happy"
+            if t in {"angry"}:
+                return "angry"
+            if t in {"sad", "melancholic"}:
+                return "sad"
+            if t in {"surprised"}:
+                return "surprised"
+            # afraid/disgusted 等缺少默认立绘集合时，回退 neutral
+            return "neutral"
+
+        warnings_list = structured.get("warnings")
+        if not isinstance(warnings_list, list):
+            warnings_list = []
+            structured["warnings"] = warnings_list
+
+        scenes = structured.get("scenes")
+        if not isinstance(scenes, list):
+            return structured
+
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            dialogues = scene.get("dialogues")
+            if not isinstance(dialogues, list):
+                continue
+            for dlg in dialogues:
+                if not isinstance(dlg, dict):
+                    continue
+                speaker = (dlg.get("speaker") or "").strip()
+                if not speaker:
+                    continue
+                # 只对“角色对白”强制，避免旁白/叙述干扰
+                if speaker not in character_speakers:
+                    continue
+
+                is_fp = speaker in first_person_speakers
+
+                # 第一人称无配音：不要求 tts_ext
+                if is_fp and (not fp_has_voice):
+                    continue
+
+                # 非第一人称角色：emotion/portrait/tts_ext 等字段约束
+                if not is_fp:
+                    if enforce_emotion_portrait:
+                        if not (dlg.get("emotion") or "").strip():
+                            dlg["emotion"] = "calm"
+                            warnings_list.append(
+                                {
+                                    "type": "emotion_autofilled",
+                                    "message": f"对白 speaker={speaker} 缺少 emotion，已自动补齐为 calm。",
+                                    "speaker": speaker,
+                                }
+                            )
+
+                        if not (dlg.get("portrait") or "").strip():
+                            char_id = ""
+                            try:
+                                if isinstance(speaker_to_char_id, dict):
+                                    char_id = (speaker_to_char_id.get(speaker) or "").strip()
+                            except Exception:
+                                char_id = ""
+                            if not char_id:
+                                char_id = "unknown"
+
+                            expr = _emotion_to_expr(str(dlg.get("emotion") or ""))
+                            dlg["portrait"] = f"resources/portraits/{char_id}_stand_{expr}.png"
+                            warnings_list.append(
+                                {
+                                    "type": "portrait_autofilled",
+                                    "message": f"对白 speaker={speaker} 缺少 portrait，已自动补齐。",
+                                    "speaker": speaker,
+                                    "portrait": dlg.get("portrait"),
+                                }
+                            )
+
+                # 非第一人称角色：tts_ext 必填；缺失则自动补齐
+                if enforce_tts_ext and (not is_fp) and (dlg.get("tts_ext") is None):
+                    emotion = (dlg.get("emotion") or "").strip()
+                    try:
+                        dlg["tts_ext"] = normalize_ext(emotion_to_ext(emotion))
+                        warnings_list.append(
+                            {
+                                "type": "tts_ext_autofilled",
+                                "message": f"对白 speaker={speaker} 缺少 tts_ext，已根据 emotion 自动补齐。",
+                                "speaker": speaker,
+                            }
+                        )
+                    except Exception:
+                        # 自动补齐失败也不阻断
+                        warnings_list.append(
+                            {
+                                "type": "tts_ext_missing",
+                                "message": f"对白 speaker={speaker} 缺少 tts_ext，且自动补齐失败。",
+                                "speaker": speaker,
+                            }
+                        )
+
+        return structured
     
     def generate_chapter_detail(
         self,
@@ -1037,6 +1774,69 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            # 归一化：确保 voice/bgm 为 mp3（避免后续流程生成非 mp3）
+            try:
+                detail["structured"] = self._normalize_audio_paths_mp3_in_chapter_struct(detail.get("structured"))
+            except Exception:
+                pass
+
+            # 归一化：确保非第一人称角色对白具备 tts_ext（缺失则按 emotion 自动补齐；不中断）
+            try:
+                detail["structured"] = self._ensure_tts_ext_for_non_first_person_dialogues(
+                    detail.get("structured"),
+                    parameters,
+                )
+            except Exception:
+                pass
+
+            # 校验：中文字符数必须达标（仅在提供 target 时启用）
+            try:
+                enforce_len = bool(parameters.get("enforce_cn_char_count", False))
+                min_cn = int(parameters.get("cn_char_min") or 0)
+                max_cn = int(parameters.get("cn_char_max") or 0)
+                if enforce_len and min_cn > 0 and max_cn > 0 and isinstance(detail.get("structured"), dict):
+                    cn_chars = self._count_cn_chars_in_chapter_struct(detail.get("structured"))
+                    detail.setdefault("metrics", {})
+                    detail["metrics"]["cn_char_count"] = cn_chars
+                    if cn_chars < min_cn or cn_chars > max_cn:
+                        detail.setdefault("warnings", [])
+                        detail["warnings"].append(
+                            {
+                                "type": "cn_char_out_of_range",
+                                "message": f"章节中文字符数不达标：当前 {cn_chars}，目标 {min_cn}~{max_cn}。",
+                                "cn_char_count": cn_chars,
+                                "cn_char_min": min_cn,
+                                "cn_char_max": max_cn,
+                            }
+                        )
+            except Exception:
+                # 统计失败不应阻塞生成流程
+                pass
+
+            # 校验：voice/bgm 必须为 mp3（仅对填写了字段的情况）
+            try:
+                enforce_mp3 = bool(parameters.get("enforce_audio_mp3", False))
+                if enforce_mp3 and isinstance(detail.get("structured"), dict):
+                    violations = []
+                    for scene in (detail["structured"].get("scenes") or []):
+                        if not isinstance(scene, dict):
+                            continue
+                        directives = scene.get("directives")
+                        if isinstance(directives, dict) and directives.get("bgm"):
+                            bgm = str(directives.get("bgm") or "").strip()
+                            if bgm and (not bgm.lower().endswith(".mp3")):
+                                violations.append(f"bgm={bgm}")
+                        for d in (scene.get("dialogues") or []):
+                            if not isinstance(d, dict) or not d.get("voice"):
+                                continue
+                            voice = str(d.get("voice") or "").strip()
+                            if voice and (not voice.lower().endswith(".mp3")):
+                                violations.append(f"voice={voice}")
+                    if violations:
+                        raise ValueError("章节音频格式不达标（必须 .mp3）：" + "; ".join(violations))
+            except Exception:
+                raise
             
             self.logger.info(f"第{chapter_index+1}章详细内容生成完成")
             return detail
@@ -1089,6 +1889,17 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
             # 如果structured缺失，尝试从raw_response里提取简单对话，避免语音统计为0
             if not normalized.get("structured") and isinstance(raw_text, str):
+                # 如果 raw_response 很像 JSON（尤其是 Step4 的 ```json ...```），不要把它误解析成 dialogues。
+                low = raw_text.strip().lower()
+                if (
+                    "```json" in low
+                    or low.startswith("{")
+                    or low.startswith("[")
+                    or '"chapter_id"' in raw_text
+                    or '"scenes"' in raw_text
+                ):
+                    return normalized
+
                 dialogues = []
                 patterns = [
                     # **角色名**（可选舞台说明）：对白
@@ -1148,6 +1959,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         first_person_name = (story_config.get("first_person_name") or "我").strip() or "我"
         first_person_has_portrait = bool(story_config.get("first_person_has_portrait", False))
         first_person_has_voice = bool(story_config.get("first_person_has_voice", False))
+        voice_use_emotion_ext = bool(story_config.get("voice_use_emotion_ext", True))
 
         def _is_first_person_char(char_dict: Dict[str, Any]) -> bool:
             # 只要用户在角色配置中明确标记 is_player/is_first_person，就视为第一人称角色。
@@ -1158,6 +1970,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 name = (char_dict.get("char_name") or char_dict.get("name") or "").strip()
                 return bool(name) and name == first_person_name
             return False
+
+        from ..utils.voice_emotion import emotion_to_ext, normalize_ext
 
         # ---------- 立绘（虚拟路径：resources/portraits/...） ----------
         from ..utils.persona_extract import extract_persona_map
@@ -1335,7 +2149,28 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             )
             return path
 
+        def _pick_str(raw_item: Dict[str, Any], keys: List[str]) -> str:
+            for k in keys:
+                v = raw_item.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        def _pick_desc_from_media_field(media_val: Any) -> str:
+            if isinstance(media_val, dict):
+                for k in ("description", "desc", "prompt", "detail"):
+                    v = media_val.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            return ""
+
         def _make_bg_hint(chapter_title: str, raw_item: Dict[str, Any]) -> str:
+            desc = _pick_desc_from_media_field(raw_item.get("background"))
+            if not desc:
+                desc = _pick_str(raw_item, ["background_desc", "bg_desc", "background_description", "scene_description"])
+            if desc:
+                return desc
+
             parts: List[str] = [chapter_title]
             st = (raw_item.get("_scene_title") or "").strip()
             if st:
@@ -1362,6 +2197,12 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             return " | ".join(parts)
 
         def _make_bgm_hint(chapter_title: str, raw_item: Dict[str, Any]) -> str:
+            desc = _pick_desc_from_media_field(raw_item.get("bgm"))
+            if not desc:
+                desc = _pick_str(raw_item, ["bgm_desc", "music_desc", "bgm_description", "music_description"])
+            if desc:
+                return desc
+
             parts: List[str] = [chapter_title]
             st = (raw_item.get("_scene_title") or "").strip()
             if st:
@@ -1379,6 +2220,12 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             return " | ".join(parts)
 
         def _make_cg_hint(chapter_title: str, raw_item: Dict[str, Any], recent_chars: List[str]) -> str:
+            desc = _pick_desc_from_media_field(raw_item.get("cg"))
+            if not desc:
+                desc = _pick_str(raw_item, ["cg_desc", "cg_description", "scene_description"])
+            if desc:
+                return desc
+
             parts: List[str] = [chapter_title]
             st = (raw_item.get("_scene_title") or "").strip()
             if st:
@@ -1483,6 +2330,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
         # 由 branch_plan 推导“线性下一章”与“章末分支出口”
         forced_next_by_id: Dict[str, str] = {}
+        forced_end_by_id: set[str] = set()
         forced_branch_exits: List[Dict[str, Any]] = []
         if isinstance(plan_structured.get("branch_plan"), list):
             for bp in plan_structured.get("branch_plan") or []:
@@ -1494,6 +2342,14 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 btype = str(bp.get("type") or "").strip().lower()
                 if btype in {"choice", "condition"}:
                     forced_branch_exits.append(bp)
+
+                # 每章出口计划：linear/end
+                if btype == "linear":
+                    nxt = str(bp.get("next_chapter_id") or bp.get("next") or "").strip()
+                    if nxt:
+                        forced_next_by_id.setdefault(at_cid, nxt)
+                if btype in {"end", "finish", "none"}:
+                    forced_end_by_id.add(at_cid)
 
                 # 推导 route 链路：A线/B线各自顺序连接
                 if btype == "choice" and isinstance(bp.get("options"), list):
@@ -1518,25 +2374,62 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
                 if btype == "condition" and isinstance(bp.get("condition"), dict):
                     cnd = bp.get("condition") or {}
-                    for key_leads, key_merge, key_ends in (
-                        ("true_leads_to", "merge_to", "true_ends_to"),
-                        ("false_leads_to", "merge_to", "false_ends_to"),
-                    ):
-                        leads = cnd.get(key_leads)
-                        if isinstance(leads, str):
-                            leads = [leads]
-                        if not isinstance(leads, list):
-                            leads = []
-                        leads = [str(x).strip() for x in leads if str(x).strip()]
-                        for a, b in zip(leads, leads[1:]):
+                    rules_raw = cnd.get("rules")
+                    if isinstance(rules_raw, list) and rules_raw:
+                        for r in rules_raw[:20]:
+                            if not isinstance(r, dict):
+                                continue
+                            leads = r.get("leads_to")
+                            if isinstance(leads, str):
+                                leads = [leads]
+                            if not isinstance(leads, list):
+                                leads = []
+                            leads = [str(x).strip() for x in leads if str(x).strip()]
+                            for a, b in zip(leads, leads[1:]):
+                                forced_next_by_id.setdefault(a, b)
+                            last = leads[-1] if leads else ""
+                            merge_to = str(r.get("merge_to") or "").strip() or str(cnd.get("merge_to") or "").strip()
+                            ends_to = str(r.get("ends_to") or "").strip()
+                            if last and merge_to:
+                                forced_next_by_id.setdefault(last, merge_to)
+                            elif last and ends_to and ends_to != last:
+                                forced_next_by_id.setdefault(last, ends_to)
+
+                        else_leads = cnd.get("else_leads_to")
+                        if isinstance(else_leads, str):
+                            else_leads = [else_leads]
+                        if not isinstance(else_leads, list):
+                            else_leads = []
+                        else_leads = [str(x).strip() for x in else_leads if str(x).strip()]
+                        for a, b in zip(else_leads, else_leads[1:]):
                             forced_next_by_id.setdefault(a, b)
-                        last = leads[-1] if leads else ""
-                        merge_to = str(cnd.get(key_merge) or "").strip()
-                        ends_to = str(cnd.get(key_ends) or "").strip()
+                        last = else_leads[-1] if else_leads else ""
+                        merge_to = str(cnd.get("merge_to") or "").strip()
+                        ends_to = str(cnd.get("else_ends_to") or "").strip()
                         if last and merge_to:
                             forced_next_by_id.setdefault(last, merge_to)
                         elif last and ends_to and ends_to != last:
                             forced_next_by_id.setdefault(last, ends_to)
+                    else:
+                        for key_leads, key_merge, key_ends in (
+                            ("true_leads_to", "merge_to", "true_ends_to"),
+                            ("false_leads_to", "merge_to", "false_ends_to"),
+                        ):
+                            leads = cnd.get(key_leads)
+                            if isinstance(leads, str):
+                                leads = [leads]
+                            if not isinstance(leads, list):
+                                leads = []
+                            leads = [str(x).strip() for x in leads if str(x).strip()]
+                            for a, b in zip(leads, leads[1:]):
+                                forced_next_by_id.setdefault(a, b)
+                            last = leads[-1] if leads else ""
+                            merge_to = str(cnd.get(key_merge) or "").strip()
+                            ends_to = str(cnd.get(key_ends) or "").strip()
+                            if last and merge_to:
+                                forced_next_by_id.setdefault(last, merge_to)
+                            elif last and ends_to and ends_to != last:
+                                forced_next_by_id.setdefault(last, ends_to)
 
         # chapter graph（用于跨章节分支连线）
         chapter_order: List[str] = []
@@ -1544,7 +2437,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         chapter_end_sources_by_id: Dict[str, List[int]] = {}
         chapter_next_by_id: Dict[str, List[str]] = {}
         chapter_explicit_routing: Dict[str, bool] = {}
-        unresolved_edges: List[Tuple[int, str]] = []  # (source_node_id, target_chapter_id)
+        unresolved_edges: List[Tuple[int, str, str]] = []  # (source_node_id, target_chapter_id, source_chapter_id)
 
         seen_connections: set[tuple[int, int]] = set()
 
@@ -1558,6 +2451,24 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 return
             seen_connections.add(key)
             connections.append(ConnectionData(source=int(source), target=int(target)))
+
+        def _fallback_next_chapter_id(source_chapter_id: str) -> str:
+            """当分支目标章节缺失时，尽量选择一个“合理的下一章”作为兜底，避免出现无下游/孤节点。"""
+            src = str(source_chapter_id or "").strip()
+            if not src or src not in chapter_order:
+                return ""
+            idx = chapter_order.index(src)
+            if idx >= len(chapter_order) - 1:
+                return ""
+
+            if bool(story_config.get("enable_multi_branch", False)) and plan_route_by_chapter_id:
+                src_route = (plan_route_by_chapter_id.get(src) or "common").strip().lower()
+                for j in range(idx + 1, len(chapter_order)):
+                    cand = chapter_order[j]
+                    cand_route = (plan_route_by_chapter_id.get(cand) or "common").strip().lower()
+                    if cand_route == src_route:
+                        return cand
+            return chapter_order[idx + 1]
 
         def _append_node_with_linear_links(node: FlowNodeData, *, allow_prev_node_link: bool = True):
             """把 node 加入 flow，并从线性来源连到该 node。
@@ -1604,10 +2515,6 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 video=state.get("video") or "",
                 video_loop=False,
                 options=[],
-                condition_var="",
-                condition_op="==",
-                condition_value="",
-                condition_const=False,
                 sub_dialogues=[],
                 var_ops=[],
                 x=220 * ((node_id - 1) % 5),
@@ -1639,10 +2546,26 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 return True
             return False
 
-        def _add_voice(node_id_for_voice: int, sub_id: int, speaker: str, char_id: str, text: str, emotion: str) -> str:
+        def _add_voice(
+            node_id_for_voice: int,
+            sub_id: int,
+            speaker: str,
+            char_id: str,
+            text: str,
+            emotion: str,
+            tts_ext: Optional[Dict[str, float]] = None,
+            use_emotion_ext: Optional[bool] = None,
+        ) -> str:
             cfg = char_map.get(speaker) or {}
             voice_model_id = cfg.get("voice_model_id")
             voice_id = f"voice_{len(voice_items)+1:05d}"
+            if use_emotion_ext is None:
+                use_emotion_ext = voice_use_emotion_ext
+            if tts_ext is None:
+                # 没有显式 ext 时，用 emotion 映射为 8 维 ext（归一化/裁剪）。
+                tts_ext = normalize_ext(emotion_to_ext(emotion))
+            else:
+                tts_ext = normalize_ext(tts_ext)
             voice_items.append(
                 VoicePendingItem(
                     item_id=f"voice_item_{len(voice_items)+1:05d}",
@@ -1654,11 +2577,237 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     text=text,
                     emotion=emotion,
                     voice_model_id=voice_model_id,
+                    tts_ext=tts_ext,
+                    use_emotion_ext=bool(use_emotion_ext),
                     status="pending",
                     file_path=f"resources/voices/{char_id}/{voice_id}.mp3",
                 )
             )
             return voice_items[-1].file_path
+
+        def _normalize_var_ops_list(ops: Any) -> List[Dict[str, Any]]:
+            if not isinstance(ops, list):
+                return []
+            out: List[Dict[str, Any]] = []
+            for item in ops[:50]:
+                if not isinstance(item, dict):
+                    continue
+                out.append(
+                    {
+                        "dest": item.get("dest", ""),
+                        "left": item.get("left", ""),
+                        "right": item.get("right", ""),
+                        "op": item.get("op", "+"),
+                        "left_const": bool(item.get("left_const", False)),
+                        "right_const": bool(item.get("right_const", False)),
+                    }
+                )
+            return out
+
+        def _normalize_condition_payload(raw_cond: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+            """统一 condition 输入为 (rules, else_branch)。
+
+            只接受新结构：
+            - rules: [{name, logic, exprs, next_chapter_id, node, var_ops}, ...]
+            - else_branch: {next_chapter_id, node, var_ops}
+
+            不再兼容旧 var/op/value + true/false 字段；若检测到旧字段会直接报错。
+            """
+            cond_obj = raw_cond if isinstance(raw_cond, dict) else {}
+
+            legacy_keys = {
+                "var",
+                "op",
+                "value",
+                "const",
+                "condition_var",
+                "condition_op",
+                "condition_value",
+                "condition_const",
+                "true_next_chapter_id",
+                "false_next_chapter_id",
+                "true_next",
+                "false_next",
+                "true_leads_to",
+                "false_leads_to",
+                "true_node",
+                "false_node",
+                "true_branch",
+                "false_branch",
+                "true_ends_to",
+                "false_ends_to",
+            }
+            if any(k in cond_obj for k in legacy_keys):
+                raise ValueError(f"Legacy condition payload is not supported: {sorted([k for k in legacy_keys if k in cond_obj])}")
+
+            rules_raw = cond_obj.get("rules")
+            if rules_raw is None:
+                rules_raw = cond_obj.get("condition_rules")
+
+            rules: List[Dict[str, Any]] = []
+            if isinstance(rules_raw, list):
+                for idx, r in enumerate(rules_raw[:20]):
+                    if not isinstance(r, dict):
+                        continue
+                    name = str(r.get("name") or r.get("title") or f"规则{idx+1}").strip() or f"规则{idx+1}"
+                    logic = str(r.get("logic") or r.get("join") or "and").strip().lower() or "and"
+                    if logic not in {"and", "or"}:
+                        logic = "and"
+
+                    exprs_val = r.get("exprs")
+                    if exprs_val is None:
+                        exprs_val = r.get("expressions")
+                    if exprs_val is None:
+                        exprs_val = r.get("expr")
+                    if exprs_val is None:
+                        exprs_val = r.get("expression")
+
+                    exprs: List[str] = []
+                    if isinstance(exprs_val, str):
+                        exprs = [ln.strip() for ln in exprs_val.splitlines() if ln.strip()]
+                    elif isinstance(exprs_val, list):
+                        exprs = [str(x).strip() for x in exprs_val if str(x).strip()]
+
+                    leads = r.get("leads_to")
+                    if isinstance(leads, str):
+                        leads = [leads]
+                    next_ch = ""
+                    if isinstance(leads, list) and leads:
+                        next_ch = str(leads[0]).strip()
+                    if not next_ch:
+                        next_ch = str(r.get("next_chapter_id") or r.get("next") or "").strip()
+                    if not next_ch:
+                        next_ch = str(r.get("merge_to") or "").strip() or str(r.get("ends_to") or "").strip() or str(cond_obj.get("merge_to") or "").strip()
+
+                    node_obj = r.get("node") if isinstance(r.get("node"), dict) else {}
+                    var_ops = _normalize_var_ops_list(r.get("var_ops"))
+                    rules.append(
+                        {
+                            "name": name,
+                            "logic": logic,
+                            "exprs": exprs,
+                            "next_chapter_id": next_ch,
+                            "node": node_obj,
+                            "var_ops": var_ops,
+                        }
+                    )
+
+            else_leads = cond_obj.get("else_leads_to")
+            if isinstance(else_leads, str):
+                else_leads = [else_leads]
+            else_next = ""
+            if isinstance(else_leads, list) and else_leads:
+                else_next = str(else_leads[0]).strip()
+            if not else_next:
+                else_next = str(cond_obj.get("else_next_chapter_id") or cond_obj.get("else_next") or "").strip()
+            if not else_next:
+                else_next = str(cond_obj.get("merge_to") or "").strip() or str(cond_obj.get("else_ends_to") or "").strip() or str(cond_obj.get("ends_to") or "").strip()
+            else_node_obj = cond_obj.get("else_node") if isinstance(cond_obj.get("else_node"), dict) else {}
+            else_var_ops = _normalize_var_ops_list(cond_obj.get("else_var_ops") or cond_obj.get("else_ops") or [])
+            return rules, {"next_chapter_id": else_next, "node": else_node_obj, "var_ops": else_var_ops}
+
+        def _build_sub_dialogues_from_raw_dialogues(
+            raw_dialogues: Any,
+            *,
+            desired_state: Dict[str, Any],
+            node_id_for_voice: int,
+            recent_char_ids_ref: List[str],
+        ) -> List[Dict[str, Any]]:
+            subs: List[Dict[str, Any]] = []
+            if not isinstance(raw_dialogues, list) or not raw_dialogues:
+                return subs
+            for d in raw_dialogues[:50]:
+                if not isinstance(d, dict):
+                    continue
+                speaker = (d.get("speaker") or d.get("role") or "").strip()
+                text = (d.get("text") or d.get("content") or "").strip()
+                if not speaker and not text:
+                    continue
+                emotion = str(d.get("emotion") or d.get("tone") or "平静")
+
+                narrator_aliases = {"旁白", "叙述", "narrator", "narration", "Narrator", "Narration"}
+                is_narration = (not speaker) or (speaker.strip() in narrator_aliases)
+
+                char_cfg = char_map.get(speaker) or {}
+                if _is_first_person_line(speaker, char_cfg) and not char_cfg:
+                    char_cfg = {"char_id": "player", "char_name": speaker, "is_player": True}
+                char_id = (char_cfg.get("char_id") or char_cfg.get("id") or "unknown")
+                expr = _emotion_to_expr(emotion)
+                is_fp_line = _is_first_person_line(speaker, char_cfg)
+                if is_narration:
+                    portrait_path = ""
+                elif is_fp_line and (not first_person_has_portrait):
+                    portrait_path = ""
+                else:
+                    portrait_path = f"resources/portraits/{char_id}_stand_{expr}.png" if char_id != "unknown" else ""
+
+                explicit_portrait = str(d.get("portrait") or "").strip()
+                if explicit_portrait:
+                    portrait_path = explicit_portrait
+
+                if is_narration:
+                    voice_path = ""
+                elif is_fp_line and (not first_person_has_voice):
+                    voice_path = ""
+                else:
+                    ext_candidate = d.get("tts_ext")
+                    if ext_candidate is None:
+                        ext_candidate = d.get("emotion_ext")
+                    if ext_candidate is None:
+                        ext_candidate = d.get("ext")
+
+                    parsed_ext: Optional[Dict[str, Any]] = None
+                    if isinstance(ext_candidate, dict):
+                        parsed_ext = ext_candidate
+                    elif isinstance(ext_candidate, str) and ext_candidate.strip():
+                        try:
+                            parsed = self._try_parse_json(ext_candidate)
+                            if isinstance(parsed, dict):
+                                parsed_ext = parsed
+                        except Exception:
+                            parsed_ext = None
+
+                    voice_path = _add_voice(
+                        node_id_for_voice=node_id_for_voice,
+                        sub_id=len(subs),
+                        speaker=speaker,
+                        char_id=char_id,
+                        text=text,
+                        emotion=emotion,
+                        tts_ext=parsed_ext if isinstance(parsed_ext, dict) else None,
+                        use_emotion_ext=voice_use_emotion_ext,
+                    )
+
+                hide_tb_val = d.get("hide_textbox")
+                if hide_tb_val is None:
+                    hide_tb_val = desired_state.get("hide_textbox", False)
+
+                line_ops = _normalize_var_ops_list(d.get("var_ops"))
+                subs.append(
+                    {
+                        "speaker": speaker,
+                        "text": text,
+                        "portrait": portrait_path,
+                        "voice": voice_path,
+                        "hide_textbox": bool(hide_tb_val),
+                        "portrait_fade": bool(d.get("portrait_fade", False)),
+                        "portrait_fade_out": bool(d.get("portrait_fade_out", False)),
+                        "var_ops": line_ops,
+                    }
+                )
+
+                if (not is_narration) and char_id and char_id != "unknown":
+                    try:
+                        cid = str(char_id)
+                        if cid in recent_char_ids_ref:
+                            recent_char_ids_ref.remove(cid)
+                        recent_char_ids_ref.append(cid)
+                        if len(recent_char_ids_ref) > 4:
+                            del recent_char_ids_ref[:-4]
+                    except Exception:
+                        pass
+
+            return subs
         for chap_idx, chapter in enumerate(normalized_chapters):
             structured = chapter.get("structured") if isinstance(chapter, dict) else None
             chap_title = f"第{chap_idx+1}章"
@@ -1796,21 +2945,66 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
                         options: List[str] = []
                         targets: List[str] = []
+                        opt_var_ops: List[List[Dict[str, Any]]] = []
+                        opt_nodes: List[Dict[str, Any]] = []
                         for o in raw_options:
                             if isinstance(o, dict):
                                 text_opt = str(o.get("text") or o.get("label") or "").strip()
                                 next_ch = str(o.get("next_chapter_id") or o.get("next") or "").strip()
+                                ops = o.get("var_ops")
+                                if not isinstance(ops, list):
+                                    ops = []
+                                norm_ops: List[Dict[str, Any]] = []
+                                for item in ops[:50]:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    norm_ops.append(
+                                        {
+                                            "dest": item.get("dest", ""),
+                                            "left": item.get("left", ""),
+                                            "right": item.get("right", ""),
+                                            "op": item.get("op", "+"),
+                                            "left_const": bool(item.get("left_const", False)),
+                                            "right_const": bool(item.get("right_const", False)),
+                                        }
+                                    )
+
+                                node_obj = o.get("node") if isinstance(o.get("node"), dict) else None
+                                if node_obj is None and (isinstance(o.get("dialogues"), list) or isinstance(o.get("directives"), dict)):
+                                    node_obj = {
+                                        "title": o.get("title") or "",
+                                        "directives": o.get("directives") if isinstance(o.get("directives"), dict) else {},
+                                        "dialogues": o.get("dialogues") if isinstance(o.get("dialogues"), list) else [],
+                                    }
+                                node_obj = node_obj or {}
+                                node_directives = node_obj.get("directives") if isinstance(node_obj.get("directives"), dict) else {}
+                                node_dialogues = node_obj.get("dialogues") if isinstance(node_obj.get("dialogues"), list) else []
+                                hide_tb_override = node_obj.get("hide_textbox") if ("hide_textbox" in node_obj) else o.get("hide_textbox")
+
                                 if text_opt:
                                     options.append(text_opt)
                                     targets.append(next_ch)
+                                    opt_var_ops.append(norm_ops)
+                                    opt_nodes.append(
+                                        {
+                                            "title": node_obj.get("title") if isinstance(node_obj, dict) else "",
+                                            "directives": node_directives,
+                                            "dialogues": node_dialogues,
+                                            "hide_textbox": hide_tb_override,
+                                        }
+                                    )
                             else:
                                 text_opt = str(o).strip()
                                 if text_opt:
                                     options.append(text_opt)
                                     targets.append("")
+                                    opt_var_ops.append([])
+                                    opt_nodes.append({"title": "", "directives": {}, "dialogues": [], "hide_textbox": None})
                         if not options:
                             options = ["选项 1", "选项 2"]
                             targets = ["", ""]
+                            opt_var_ops = [[], []]
+                            opt_nodes = [{"title": "", "directives": {}, "dialogues": [], "hide_textbox": None} for _ in range(2)]
 
                         choice_node = FlowNodeData(
                             id=node_id,
@@ -1832,10 +3026,6 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                             video=pending_state.get("video") or "",
                             video_loop=False,
                             options=options,
-                            condition_var="",
-                            condition_op="==",
-                            condition_value="",
-                            condition_const=False,
                             sub_dialogues=[],
                             var_ops=[],
                             x=220 * ((node_id - 1) % 5),
@@ -1844,48 +3034,138 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         node_id += 1
                         _append_in_chapter(choice_node)
 
-                        # 若提供 next_chapter_id，则将 choice 作为“章节出口”直接连向目标章节首节点（第二遍解析）
-                        has_targets = any(t.strip() for t in targets)
-                        if has_targets:
-                            chapter_explicit_routing[chap_id] = True
-                            for opt_idx, t in enumerate(targets):
-                                if t and t.strip():
-                                    unresolved_edges.append((choice_node.id, t.strip()))
-                            # choice 作为出口：不再创建占位桩，也避免本章后续节点被自动连上
-                            last_linear_sources = []
-                            continue
+                        # 每个选项都生成一个“附属文本节点”，承载该选项的对白/变量操作；再决定是否继续线性或跨章节跳转。
+                        continuation_sources: List[int] = []
+                        any_cross_chapter = any(bool(str(t or "").strip()) for t in targets)
+                        for opt_idx, (opt_text, tgt, vops, node_obj) in enumerate(zip(options, targets, opt_var_ops, opt_nodes)):
+                            node_directives = node_obj.get("directives") if isinstance(node_obj, dict) else {}
+                            node_dialogues = node_obj.get("dialogues") if isinstance(node_obj, dict) else []
+                            node_title = str((node_obj.get("title") if isinstance(node_obj, dict) else "") or "").strip()
+                            hide_tb_override = node_obj.get("hide_textbox") if isinstance(node_obj, dict) else None
 
-                        # 兼容旧格式：没有目标章节时，继续生成分支占位桩（但跨章节将按默认顺序连线）
-                        branch_sources: List[int] = []
-                        for opt_idx, opt in enumerate(options):
-                            stub = _new_text_node(
-                                title=f"{choice_node.title}-{opt_idx+1}",
-                                state=dict(pending_state),
-                                content_hint=f"分支占位：{opt}",
+                            desired_state = dict(pending_state)
+                            if isinstance(node_directives, dict):
+                                bg_val = node_directives.get("background")
+                                if bg_val:
+                                    desired_state["background"] = _as_path(bg_val, kind="background")
+                                cg_val = node_directives.get("cg")
+                                if cg_val:
+                                    desired_state["background"] = _as_path(cg_val, kind="cg")
+                                video_val = node_directives.get("video")
+                                if video_val:
+                                    desired_state["video"] = _as_path(video_val, kind="video")
+                                ui_val = node_directives.get("ui") or node_directives.get("ui_file")
+                                if ui_val:
+                                    desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+                                if node_directives.get("hide_textbox") is not None:
+                                    desired_state["hide_textbox"] = bool(node_directives.get("hide_textbox"))
+
+                                stop_bgm_val = node_directives.get("stop_bgm")
+                                bgm_val = node_directives.get("bgm")
+                                if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                                    desired_state["stop_bgm"] = True
+                                    desired_state["bgm"] = ""
+                                elif bgm_val:
+                                    desired_state["stop_bgm"] = False
+                                    desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+
+                            if desired_state.get("background"):
+                                if str(desired_state["background"]).startswith("resources/images/cg/"):
+                                    _ensure_cg_item(
+                                        desired_state["background"],
+                                        hint=_make_cg_hint(chap_title, raw, recent_char_ids),
+                                        node_id_hint="0",
+                                        characters=recent_char_ids,
+                                    )
+                                else:
+                                    _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
+                            if desired_state.get("bgm"):
+                                bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
+                                _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+
+                            subs = _build_sub_dialogues_from_raw_dialogues(
+                                node_dialogues,
+                                desired_state=desired_state,
+                                node_id_for_voice=node_id,
+                                recent_char_ids_ref=recent_char_ids,
                             )
-                            _add_connection(choice_node.id, stub.id)
-                            stub.sub_dialogues = []
-                            flow_nodes.append(stub)
-                            node_by_id[stub.id] = stub
-                            branch_sources.append(stub.id)
-                        last_linear_sources = branch_sources
+
+                            node_var_ops = vops or []
+                            if subs and node_var_ops:
+                                first_sub = subs[0] if isinstance(subs[0], dict) else None
+                                if isinstance(first_sub, dict):
+                                    existing = first_sub.get("var_ops")
+                                    if not isinstance(existing, list):
+                                        existing = []
+                                    first_sub["var_ops"] = list(node_var_ops) + list(existing)
+                                    node_var_ops = []
+
+                            opt_node = FlowNodeData(
+                                id=node_id,
+                                node_type="text",
+                                title=node_title or (f"选项：{opt_text}" if opt_text else "选项处理"),
+                                content="",
+                                speaker="",
+                                portrait="",
+                                background=desired_state.get("background") or "",
+                                voice="",
+                                bgm=desired_state.get("bgm") or "",
+                                bgm_loop=True,
+                                stop_bgm=bool(desired_state.get("stop_bgm", False)),
+                                bg_fade_in=False,
+                                portrait_fade=False,
+                                portrait_fade_out=False,
+                                hide_textbox=bool(hide_tb_override) if hide_tb_override is not None else (True if not subs else False),
+                                ui_file=desired_state.get("ui_file") or "",
+                                video=desired_state.get("video") or "",
+                                video_loop=False,
+                                options=[],
+                                sub_dialogues=subs,
+                                var_ops=node_var_ops,
+                                x=float(choice_node.x + 220),
+                                y=float(choice_node.y + (opt_idx * 120)),
+                            )
+                            node_id += 1
+                            flow_nodes.append(opt_node)
+                            node_by_id[opt_node.id] = opt_node
+                            _add_connection(choice_node.id, opt_node.id)
+
+                            tgt = str(tgt or "").strip()
+                            if tgt:
+                                start = chapter_start_node_by_id.get(tgt)
+                                if start is None:
+                                    unresolved_edges.append((opt_node.id, tgt, chap_id))
+                                else:
+                                    _add_connection(opt_node.id, start)
+                            else:
+                                continuation_sources.append(opt_node.id)
+
+                        # 只有“无跨章节跳转”的分支才参与后续线性汇合连线
+                        last_linear_sources = continuation_sources
+                        if any_cross_chapter and not continuation_sources:
+                            # 全部选项都跨章节跳转：视为本章出口，禁止默认线性连线
+                            chapter_explicit_routing[chap_id] = True
+                            last_linear_sources = []
                         continue
 
                     # condition
-                    cond = raw.get("condition") or raw
-                    var_name = (cond.get("var") or cond.get("condition_var") or "").strip() or "favorability"
-                    op = (cond.get("op") or cond.get("condition_op") or ">=").strip() or ">="
-                    value = str(cond.get("value") or cond.get("condition_value") or "0")
-                    is_const = bool(cond.get("const") if "const" in cond else cond.get("condition_const", True))
+                    cond_obj = raw.get("condition") if isinstance(raw.get("condition"), dict) else (raw if isinstance(raw, dict) else {})
+                    rules, else_branch = _normalize_condition_payload(cond_obj)
 
-                    true_next = str(cond.get("true_next_chapter_id") or cond.get("true_next") or "").strip()
-                    false_next = str(cond.get("false_next_chapter_id") or cond.get("false_next") or "").strip()
+                    first_expr = ""
+                    try:
+                        if rules and isinstance(rules[0], dict):
+                            exprs = rules[0].get("exprs")
+                            if isinstance(exprs, list) and exprs:
+                                first_expr = str(exprs[0]).strip()
+                    except Exception:
+                        first_expr = ""
 
                     cond_node = FlowNodeData(
                         id=node_id,
                         node_type="condition",
                         title=raw.get("title") or "条件判断",
-                        content=raw.get("prompt") or raw.get("content") or f"判断：{var_name} {op} {value}",
+                        content=raw.get("prompt") or raw.get("content") or (f"判断：{first_expr}" if first_expr else "条件判断"),
                         speaker="",
                         portrait="",
                         background=pending_state.get("background") or "",
@@ -1901,10 +3181,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         video=pending_state.get("video") or "",
                         video_loop=False,
                         options=[],
-                        condition_var=var_name,
-                        condition_op=op,
-                        condition_value=value,
-                        condition_const=is_const,
+                        condition_rules=[{"name": r.get("name", ""), "logic": r.get("logic", "and"), "exprs": r.get("exprs", [])} for r in (rules or [])],
                         sub_dialogues=[],
                         var_ops=[],
                         x=220 * ((node_id - 1) % 5),
@@ -1913,31 +3190,122 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     node_id += 1
                     _append_in_chapter(cond_node)
 
-                    if true_next or false_next:
-                        chapter_explicit_routing[chap_id] = True
-                        if true_next:
-                            unresolved_edges.append((cond_node.id, true_next))
-                        if false_next:
-                            unresolved_edges.append((cond_node.id, false_next))
-                        last_linear_sources = []
-                        continue
+                    any_cross_chapter = any(bool(str(r.get("next_chapter_id") or "").strip()) for r in (rules or [])) or bool(str((else_branch or {}).get("next_chapter_id") or "").strip())
 
-                    true_stub = _new_text_node(
-                        title=f"{cond_node.title}-True",
-                        state=dict(pending_state),
-                        content_hint="条件为真分支占位",
+                    def _merge_state(base_state: Dict[str, Any], directives_obj: Dict[str, Any]) -> Dict[str, Any]:
+                        desired_state = dict(base_state)
+                        if isinstance(directives_obj, dict):
+                            bg_val = directives_obj.get("background")
+                            if bg_val:
+                                desired_state["background"] = _as_path(bg_val, kind="background")
+                            cg_val = directives_obj.get("cg")
+                            if cg_val:
+                                desired_state["background"] = _as_path(cg_val, kind="cg")
+                            video_val = directives_obj.get("video")
+                            if video_val:
+                                desired_state["video"] = _as_path(video_val, kind="video")
+                            ui_val = directives_obj.get("ui") or directives_obj.get("ui_file")
+                            if ui_val:
+                                desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+                            if directives_obj.get("hide_textbox") is not None:
+                                desired_state["hide_textbox"] = bool(directives_obj.get("hide_textbox"))
+                            stop_bgm_val = directives_obj.get("stop_bgm")
+                            bgm_val = directives_obj.get("bgm")
+                            if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                                desired_state["stop_bgm"] = True
+                                desired_state["bgm"] = ""
+                            elif bgm_val:
+                                desired_state["stop_bgm"] = False
+                                desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+                        return desired_state
+
+                    def _make_branch_node(*, title_default: str, branch: Dict[str, Any], y_offset: float) -> FlowNodeData:
+                        node_obj = branch.get("node") if isinstance(branch.get("node"), dict) else {}
+                        node_directives = node_obj.get("directives") if isinstance(node_obj.get("directives"), dict) else {}
+                        node_dialogues = node_obj.get("dialogues") if isinstance(node_obj.get("dialogues"), list) else []
+                        hide_tb_override = node_obj.get("hide_textbox") if ("hide_textbox" in node_obj) else None
+
+                        desired_state = _merge_state(pending_state, node_directives)
+                        subs = _build_sub_dialogues_from_raw_dialogues(
+                            node_dialogues,
+                            desired_state=desired_state,
+                            node_id_for_voice=node_id,
+                            recent_char_ids_ref=recent_char_ids,
+                        )
+
+                        node_var_ops = branch.get("var_ops") if isinstance(branch.get("var_ops"), list) else []
+                        if subs and node_var_ops:
+                            first_sub = subs[0] if isinstance(subs[0], dict) else None
+                            if isinstance(first_sub, dict):
+                                existing = first_sub.get("var_ops")
+                                if not isinstance(existing, list):
+                                    existing = []
+                                first_sub["var_ops"] = list(node_var_ops) + list(existing)
+                                node_var_ops = []
+
+                        title_override = str(node_obj.get("title") or "").strip()
+                        return FlowNodeData(
+                            id=node_id,
+                            node_type="text",
+                            title=title_override or title_default,
+                            content="",
+                            speaker="",
+                            portrait="",
+                            background=desired_state.get("background") or "",
+                            voice="",
+                            bgm=desired_state.get("bgm") or "",
+                            bgm_loop=True,
+                            stop_bgm=bool(desired_state.get("stop_bgm", False)),
+                            bg_fade_in=False,
+                            portrait_fade=False,
+                            portrait_fade_out=False,
+                            hide_textbox=bool(hide_tb_override) if hide_tb_override is not None else (True if not subs else False),
+                            ui_file=desired_state.get("ui_file") or "",
+                            video=desired_state.get("video") or "",
+                            video_loop=False,
+                            options=[],
+                            sub_dialogues=subs,
+                            var_ops=node_var_ops,
+                            x=float(cond_node.x + 220),
+                            y=float(cond_node.y + y_offset),
+                        )
+
+                    continuation_sources: List[int] = []
+                    for ridx, r in enumerate(rules or []):
+                        default_title = f"{cond_node.title}-Rule{ridx+1}"
+                        branch_node = _make_branch_node(title_default=default_title, branch=r, y_offset=float(ridx * 120))
+                        node_id += 1
+                        flow_nodes.append(branch_node)
+                        node_by_id[branch_node.id] = branch_node
+                        _add_connection(cond_node.id, branch_node.id)
+
+                        nxt = str(r.get("next_chapter_id") or "").strip()
+                        if nxt:
+                            unresolved_edges.append((branch_node.id, nxt, chap_id))
+                        else:
+                            continuation_sources.append(branch_node.id)
+
+                    default_else_title = f"{cond_node.title}-Else"
+                    else_node = _make_branch_node(
+                        title_default=default_else_title,
+                        branch=(else_branch or {}),
+                        y_offset=float(max(len(rules or []), 1) * 120),
                     )
-                    false_stub = _new_text_node(
-                        title=f"{cond_node.title}-False",
-                        state=dict(pending_state),
-                        content_hint="条件为假分支占位",
-                    )
-                    _add_connection(cond_node.id, true_stub.id)
-                    _add_connection(cond_node.id, false_stub.id)
-                    true_stub.sub_dialogues = []
-                    false_stub.sub_dialogues = []
-                    flow_nodes.extend([true_stub, false_stub])
-                    last_linear_sources = [true_stub.id, false_stub.id]
+                    node_id += 1
+                    flow_nodes.append(else_node)
+                    node_by_id[else_node.id] = else_node
+                    _add_connection(cond_node.id, else_node.id)
+
+                    else_next = str((else_branch or {}).get("next_chapter_id") or "").strip()
+                    if else_next:
+                        unresolved_edges.append((else_node.id, else_next, chap_id))
+                    else:
+                        continuation_sources.append(else_node.id)
+
+                    last_linear_sources = continuation_sources
+                    if any_cross_chapter and not continuation_sources:
+                        chapter_explicit_routing[chap_id] = True
+                        last_linear_sources = []
                     continue
 
                 # 普通“对白/指令”项
@@ -2043,12 +3411,56 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 else:
                     portrait_path = f"resources/portraits/{char_id}_stand_{expr}.png" if char_id != "unknown" else ""
 
+                # 第一人称模式：若“我”的立绘被跳过（为空），则在同一文本节点内向上回填最近一次非第一人称立绘。
+                if pov == "first" and (not is_narration) and is_fp_line and (not first_person_has_portrait) and (not portrait_path):
+                    try:
+                        for prev in reversed(current_subs):
+                            prev_speaker = str(prev.get("speaker") or "").strip()
+                            if not prev_speaker:
+                                continue
+                            prev_cfg = char_map.get(prev_speaker) or {}
+                            if _is_first_person_line(prev_speaker, prev_cfg):
+                                continue
+                            prev_portrait = str(prev.get("portrait") or "").strip()
+                            if prev_portrait:
+                                portrait_path = prev_portrait
+                                break
+                    except Exception:
+                        pass
+
                 if is_narration:
                     voice_path = ""
                 elif is_fp_line and (not first_person_has_voice):
                     voice_path = ""
                 else:
-                    voice_path = _add_voice(current_node.id, len(current_subs), speaker, char_id, text, emotion)
+                    # 语音 8 维情绪参数：优先读结构化输出里的 tts_ext/emotion_ext/ext；否则按 emotion 映射。
+                    ext_candidate = raw.get("tts_ext")
+                    if ext_candidate is None:
+                        ext_candidate = raw.get("emotion_ext")
+                    if ext_candidate is None:
+                        ext_candidate = raw.get("ext")
+
+                    parsed_ext: Optional[Dict[str, Any]] = None
+                    if isinstance(ext_candidate, dict):
+                        parsed_ext = ext_candidate
+                    elif isinstance(ext_candidate, str) and ext_candidate.strip():
+                        try:
+                            parsed = self._try_parse_json(ext_candidate)
+                            if isinstance(parsed, dict):
+                                parsed_ext = parsed
+                        except Exception:
+                            parsed_ext = None
+
+                    voice_path = _add_voice(
+                        current_node.id,
+                        len(current_subs),
+                        speaker,
+                        char_id,
+                        text,
+                        emotion,
+                        tts_ext=parsed_ext if isinstance(parsed_ext, dict) else None,
+                        use_emotion_ext=voice_use_emotion_ext,
+                    )
 
                 # 更新“最近角色”缓存，用于后续 CG 角色推断
                 if (not is_narration) and char_id and char_id != "unknown":
@@ -2072,6 +3484,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     )
 
                 # 注意：运行时 hide_textbox 从 sub_dialogues 覆盖 node 本体
+                line_ops = _normalize_var_ops_list(raw.get("var_ops"))
                 current_subs.append(
                     {
                         "speaker": speaker,
@@ -2081,6 +3494,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         "hide_textbox": bool((node_state or desired_state).get("hide_textbox", False)),
                         "portrait_fade": bool(raw.get("portrait_fade", False)),
                         "portrait_fade_out": bool(raw.get("portrait_fade_out", False)),
+                        "var_ops": line_ops,
                     }
                 )
 
@@ -2120,18 +3534,54 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         raw_opts = []
                     opt_texts: List[str] = []
                     opt_targets: List[str] = []
+                    opt_var_ops: List[List[Dict[str, Any]]] = []
+                    opt_nodes: List[Dict[str, Any]] = []
                     for o in raw_opts:
                         if isinstance(o, dict):
                             t = str(o.get("text") or o.get("label") or "").strip()
                             nid = str(o.get("next_chapter_id") or o.get("next") or "").strip()
+                            ops = o.get("var_ops")
+                            if not isinstance(ops, list):
+                                ops = []
+                            norm_ops: List[Dict[str, Any]] = []
+                            for item in ops[:50]:
+                                if not isinstance(item, dict):
+                                    continue
+                                norm_ops.append(
+                                    {
+                                        "dest": item.get("dest", ""),
+                                        "left": item.get("left", ""),
+                                        "right": item.get("right", ""),
+                                        "op": item.get("op", "+"),
+                                        "left_const": bool(item.get("left_const", False)),
+                                        "right_const": bool(item.get("right_const", False)),
+                                    }
+                                )
+
+                            node_obj = o.get("node") if isinstance(o.get("node"), dict) else {}
+                            node_directives = node_obj.get("directives") if isinstance(node_obj.get("directives"), dict) else {}
+                            node_dialogues = node_obj.get("dialogues") if isinstance(node_obj.get("dialogues"), list) else []
+                            hide_tb_override = node_obj.get("hide_textbox") if isinstance(node_obj, dict) and ("hide_textbox" in node_obj) else None
+
                             if t:
                                 opt_texts.append(t)
                                 opt_targets.append(nid)
+                                opt_var_ops.append(norm_ops)
+                                opt_nodes.append(
+                                    {
+                                        "directives": node_directives,
+                                        "dialogues": node_dialogues,
+                                        "hide_textbox": hide_tb_override,
+                                        "title": node_obj.get("title") if isinstance(node_obj, dict) else "",
+                                    }
+                                )
                         else:
                             t = str(o).strip()
                             if t:
                                 opt_texts.append(t)
                                 opt_targets.append("")
+                                opt_var_ops.append([])
+                                opt_nodes.append({"directives": {}, "dialogues": [], "hide_textbox": None, "title": ""})
                     if len(opt_texts) >= 2:
                         chapter_explicit_routing[chap_id] = True
                         choice_node = FlowNodeData(
@@ -2154,10 +3604,6 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                             video=pending_state.get("video") or "",
                             video_loop=False,
                             options=opt_texts,
-                            condition_var="",
-                            condition_op="==",
-                            condition_value="",
-                            condition_const=False,
                             sub_dialogues=[],
                             var_ops=[],
                             x=220 * ((node_id - 1) % 5),
@@ -2165,28 +3611,210 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         )
                         node_id += 1
                         _append_in_chapter(choice_node)
-                        for t in opt_targets:
-                            if t and t.strip():
-                                unresolved_edges.append((choice_node.id, t.strip()))
+
+                        # 每个选项都生成一个附属 text 节点（可承载 var_ops / 过渡对白），再连接到目标章节
+                        for idx, (tgt, vops, opt_text, node_obj) in enumerate(zip(opt_targets, opt_var_ops, opt_texts, opt_nodes)):
+                            node_directives = node_obj.get("directives") if isinstance(node_obj, dict) else {}
+                            node_dialogues = node_obj.get("dialogues") if isinstance(node_obj, dict) else []
+                            node_title = str((node_obj.get("title") if isinstance(node_obj, dict) else "") or "").strip()
+                            hide_tb_override = node_obj.get("hide_textbox") if isinstance(node_obj, dict) else None
+
+                            desired_state = {
+                                "background": pending_state.get("background") or "",
+                                "bgm": pending_state.get("bgm") or "",
+                                "stop_bgm": bool(pending_state.get("stop_bgm", False)),
+                                "video": pending_state.get("video") or "",
+                                "ui_file": pending_state.get("ui_file") or "",
+                                "hide_textbox": bool(pending_state.get("hide_textbox", False)),
+                            }
+
+                            if isinstance(node_directives, dict):
+                                bg_val = node_directives.get("background")
+                                if bg_val:
+                                    desired_state["background"] = _as_path(bg_val, kind="background")
+                                cg_val = node_directives.get("cg")
+                                if cg_val:
+                                    desired_state["background"] = _as_path(cg_val, kind="cg")
+                                video_val = node_directives.get("video")
+                                if video_val:
+                                    desired_state["video"] = _as_path(video_val, kind="video")
+                                ui_val = node_directives.get("ui") or node_directives.get("ui_file")
+                                if ui_val:
+                                    desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+                                if node_directives.get("hide_textbox") is not None:
+                                    desired_state["hide_textbox"] = bool(node_directives.get("hide_textbox"))
+                                stop_bgm_val = node_directives.get("stop_bgm")
+                                bgm_val = node_directives.get("bgm")
+                                if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                                    desired_state["stop_bgm"] = True
+                                    desired_state["bgm"] = ""
+                                elif bgm_val:
+                                    desired_state["stop_bgm"] = False
+                                    desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+
+                            if desired_state.get("background"):
+                                if str(desired_state["background"]).startswith("resources/images/cg/"):
+                                    _ensure_cg_item(
+                                        desired_state["background"],
+                                        hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}",
+                                        node_id_hint="0",
+                                        characters=recent_char_ids,
+                                    )
+                                else:
+                                    _ensure_background_item(desired_state["background"], hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}")
+                            if desired_state.get("bgm"):
+                                _ensure_bgm_item(desired_state["bgm"], hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}")
+
+                            subs: List[Dict[str, Any]] = []
+                            if isinstance(node_dialogues, list) and node_dialogues:
+                                for d in node_dialogues[:50]:
+                                    if not isinstance(d, dict):
+                                        continue
+                                    speaker = (d.get("speaker") or d.get("role") or "").strip()
+                                    text = (d.get("text") or d.get("content") or "").strip()
+                                    if not speaker and not text:
+                                        continue
+                                    emotion = str(d.get("emotion") or d.get("tone") or "平静")
+
+                                    narrator_aliases = {"旁白", "叙述", "narrator", "narration", "Narrator", "Narration"}
+                                    is_narration = (not speaker) or (speaker.strip() in narrator_aliases)
+
+                                    char_cfg = char_map.get(speaker) or {}
+                                    if _is_first_person_line(speaker, char_cfg) and not char_cfg:
+                                        char_cfg = {"char_id": "player", "char_name": speaker, "is_player": True}
+                                    char_id = (char_cfg.get("char_id") or char_cfg.get("id") or "unknown")
+                                    expr = _emotion_to_expr(emotion)
+                                    is_fp_line = _is_first_person_line(speaker, char_cfg)
+                                    if is_narration:
+                                        portrait_path = ""
+                                    elif is_fp_line and (not first_person_has_portrait):
+                                        portrait_path = ""
+                                    else:
+                                        portrait_path = f"resources/portraits/{char_id}_stand_{expr}.png" if char_id != "unknown" else ""
+
+                                    # 若 Step4 显式提供 portrait，则优先使用
+                                    explicit_portrait = str(d.get("portrait") or "").strip()
+                                    if explicit_portrait:
+                                        portrait_path = explicit_portrait
+
+                                    if is_narration:
+                                        voice_path = ""
+                                    elif is_fp_line and (not first_person_has_voice):
+                                        voice_path = ""
+                                    else:
+                                        ext_candidate = d.get("tts_ext")
+                                        if ext_candidate is None:
+                                            ext_candidate = d.get("emotion_ext")
+                                        if ext_candidate is None:
+                                            ext_candidate = d.get("ext")
+
+                                        parsed_ext: Optional[Dict[str, Any]] = None
+                                        if isinstance(ext_candidate, dict):
+                                            parsed_ext = ext_candidate
+                                        elif isinstance(ext_candidate, str) and ext_candidate.strip():
+                                            try:
+                                                parsed = self._try_parse_json(ext_candidate)
+                                                if isinstance(parsed, dict):
+                                                    parsed_ext = parsed
+                                            except Exception:
+                                                parsed_ext = None
+
+                                        voice_path = _add_voice(
+                                            node_id_for_voice=node_id,
+                                            sub_id=len(subs),
+                                            speaker=speaker,
+                                            char_id=char_id,
+                                            text=text,
+                                            emotion=emotion,
+                                            tts_ext=parsed_ext if isinstance(parsed_ext, dict) else None,
+                                            use_emotion_ext=voice_use_emotion_ext,
+                                        )
+
+                                    subs.append(
+                                        {
+                                            "speaker": speaker,
+                                            "text": text,
+                                            "portrait": portrait_path,
+                                            "voice": voice_path,
+                                            "hide_textbox": bool(desired_state.get("hide_textbox", False)),
+                                            "portrait_fade": bool(d.get("portrait_fade", False)),
+                                            "portrait_fade_out": bool(d.get("portrait_fade_out", False)),
+                                            "var_ops": _normalize_var_ops_list(d.get("var_ops")),
+                                        }
+                                    )
+
+                                    if (not is_narration) and char_id and char_id != "unknown":
+                                        try:
+                                            cid = str(char_id)
+                                            if cid in recent_char_ids:
+                                                recent_char_ids.remove(cid)
+                                            recent_char_ids.append(cid)
+                                            if len(recent_char_ids) > 4:
+                                                recent_char_ids = recent_char_ids[-4:]
+                                        except Exception:
+                                            pass
+                            node_var_ops = vops or []
+                            if subs and node_var_ops:
+                                first_sub = subs[0] if isinstance(subs[0], dict) else None
+                                if isinstance(first_sub, dict):
+                                    existing = first_sub.get("var_ops")
+                                    if not isinstance(existing, list):
+                                        existing = []
+                                    first_sub["var_ops"] = list(node_var_ops) + list(existing)
+                                    node_var_ops = []
+
+                            opt_node = FlowNodeData(
+                                id=node_id,
+                                node_type="text",
+                                title=node_title or (f"选项：{opt_text}" if opt_text else "选项处理"),
+                                content="",
+                                speaker="",
+                                portrait="",
+                                background=desired_state.get("background") or "",
+                                voice="",
+                                bgm=desired_state.get("bgm") or "",
+                                bgm_loop=True,
+                                stop_bgm=bool(desired_state.get("stop_bgm", False)),
+                                bg_fade_in=False,
+                                portrait_fade=False,
+                                portrait_fade_out=False,
+                                hide_textbox=bool(hide_tb_override) if hide_tb_override is not None else (True if not subs else False),
+                                ui_file=desired_state.get("ui_file") or "",
+                                video=desired_state.get("video") or "",
+                                video_loop=False,
+                                options=[],
+                                sub_dialogues=subs,
+                                var_ops=node_var_ops,
+                                x=float(choice_node.x + 220),
+                                y=float(choice_node.y + (idx * 120)),
+                            )
+                            node_id += 1
+                            flow_nodes.append(opt_node)
+                            node_by_id[opt_node.id] = opt_node
+                            _add_connection(choice_node.id, opt_node.id)
+
+                            if tgt and tgt.strip():
+                                start = chapter_start_node_by_id.get(tgt.strip())
+                                if start is None:
+                                    unresolved_edges.append((opt_node.id, tgt.strip(), chap_id))
+                                else:
+                                    _add_connection(opt_node.id, start)
                         last_linear_sources = []
                         chapter_end_sources_by_id[chap_id] = []
                         continue
 
                 if exit_type == "condition" and isinstance(exit_obj.get("condition"), dict):
                     cnd = exit_obj.get("condition") or {}
-                    var_name = str(cnd.get("var") or "favorability").strip() or "favorability"
-                    op = str(cnd.get("op") or ">=").strip() or ">="
-                    value = str(cnd.get("value") or "0")
-                    is_const = bool(cnd.get("const", True))
-                    true_next = str(cnd.get("true_next_chapter_id") or cnd.get("true_next") or "").strip()
-                    false_next = str(cnd.get("false_next_chapter_id") or cnd.get("false_next") or "").strip()
-                    if true_next or false_next:
+                    rules, else_branch = _normalize_condition_payload(cnd)
+                    any_cross = any(bool(str(r.get("next_chapter_id") or "").strip()) for r in (rules or [])) or bool(str((else_branch or {}).get("next_chapter_id") or "").strip())
+                    if any_cross:
                         chapter_explicit_routing[chap_id] = True
+
                         cond_node = FlowNodeData(
                             id=node_id,
                             node_type="condition",
                             title=str(exit_obj.get("title") or "条件判断").strip() or "条件判断",
-                            content=str(exit_obj.get("prompt") or f"判断：{var_name} {op} {value}").strip(),
+                            content=str(exit_obj.get("prompt") or exit_obj.get("content") or "条件判断").strip(),
                             speaker="",
                             portrait="",
                             background=pending_state.get("background") or "",
@@ -2202,10 +3830,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                             video=pending_state.get("video") or "",
                             video_loop=False,
                             options=[],
-                            condition_var=var_name,
-                            condition_op=op,
-                            condition_value=value,
-                            condition_const=is_const,
+                            condition_rules=[{"name": r.get("name", ""), "logic": r.get("logic", "and"), "exprs": r.get("exprs", [])} for r in (rules or [])],
                             sub_dialogues=[],
                             var_ops=[],
                             x=220 * ((node_id - 1) % 5),
@@ -2213,10 +3838,107 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         )
                         node_id += 1
                         _append_in_chapter(cond_node)
-                        if true_next:
-                            unresolved_edges.append((cond_node.id, true_next))
-                        if false_next:
-                            unresolved_edges.append((cond_node.id, false_next))
+
+                        def _merge_state(base_state: Dict[str, Any], directives_obj: Dict[str, Any]) -> Dict[str, Any]:
+                            desired_state = dict(base_state)
+                            if isinstance(directives_obj, dict):
+                                bg_val = directives_obj.get("background")
+                                if bg_val:
+                                    desired_state["background"] = _as_path(bg_val, kind="background")
+                                cg_val = directives_obj.get("cg")
+                                if cg_val:
+                                    desired_state["background"] = _as_path(cg_val, kind="cg")
+                                video_val = directives_obj.get("video")
+                                if video_val:
+                                    desired_state["video"] = _as_path(video_val, kind="video")
+                                ui_val = directives_obj.get("ui") or directives_obj.get("ui_file")
+                                if ui_val:
+                                    desired_state["ui_file"] = _as_path(ui_val, kind="ui")
+                                if directives_obj.get("hide_textbox") is not None:
+                                    desired_state["hide_textbox"] = bool(directives_obj.get("hide_textbox"))
+                                stop_bgm_val = directives_obj.get("stop_bgm")
+                                bgm_val = directives_obj.get("bgm")
+                                if stop_bgm_val is True or (isinstance(bgm_val, str) and str(bgm_val).strip().lower() in {"stop", "stop_bgm", "off"}):
+                                    desired_state["stop_bgm"] = True
+                                    desired_state["bgm"] = ""
+                                elif bgm_val:
+                                    desired_state["stop_bgm"] = False
+                                    desired_state["bgm"] = _as_path(bgm_val, kind="bgm")
+                            return desired_state
+
+                        def _make_exit_branch_node(*, title_default: str, branch: Dict[str, Any], y_offset: float) -> FlowNodeData:
+                            node_obj = branch.get("node") if isinstance(branch.get("node"), dict) else {}
+                            node_directives = node_obj.get("directives") if isinstance(node_obj.get("directives"), dict) else {}
+                            node_dialogues = node_obj.get("dialogues") if isinstance(node_obj.get("dialogues"), list) else []
+                            hide_tb_override = node_obj.get("hide_textbox") if ("hide_textbox" in node_obj) else None
+                            desired_state = _merge_state(pending_state, node_directives)
+                            subs = _build_sub_dialogues_from_raw_dialogues(
+                                node_dialogues,
+                                desired_state=desired_state,
+                                node_id_for_voice=node_id,
+                                recent_char_ids_ref=recent_char_ids,
+                            )
+                            node_var_ops = branch.get("var_ops") if isinstance(branch.get("var_ops"), list) else []
+                            if subs and node_var_ops:
+                                first_sub = subs[0] if isinstance(subs[0], dict) else None
+                                if isinstance(first_sub, dict):
+                                    existing = first_sub.get("var_ops")
+                                    if not isinstance(existing, list):
+                                        existing = []
+                                    first_sub["var_ops"] = list(node_var_ops) + list(existing)
+                                    node_var_ops = []
+                            title_override = str(node_obj.get("title") or "").strip()
+                            return FlowNodeData(
+                                id=node_id,
+                                node_type="text",
+                                title=title_override or title_default,
+                                content="",
+                                speaker="",
+                                portrait="",
+                                background=desired_state.get("background") or "",
+                                voice="",
+                                bgm=desired_state.get("bgm") or "",
+                                bgm_loop=True,
+                                stop_bgm=bool(desired_state.get("stop_bgm", False)),
+                                bg_fade_in=False,
+                                portrait_fade=False,
+                                portrait_fade_out=False,
+                                hide_textbox=bool(hide_tb_override) if hide_tb_override is not None else (True if not subs else False),
+                                ui_file=desired_state.get("ui_file") or "",
+                                video=desired_state.get("video") or "",
+                                video_loop=False,
+                                options=[],
+                                sub_dialogues=subs,
+                                var_ops=node_var_ops,
+                                x=float(cond_node.x + 220),
+                                y=float(cond_node.y + y_offset),
+                            )
+
+                        for ridx, r in enumerate(rules or []):
+                            default_title = f"{cond_node.title}-Rule{ridx+1}"
+                            bn = _make_exit_branch_node(title_default=default_title, branch=r, y_offset=float(ridx * 120))
+                            node_id += 1
+                            flow_nodes.append(bn)
+                            node_by_id[bn.id] = bn
+                            _add_connection(cond_node.id, bn.id)
+                            nxt = str(r.get("next_chapter_id") or "").strip()
+                            if nxt:
+                                unresolved_edges.append((bn.id, nxt, chap_id))
+
+                        default_else = f"{cond_node.title}-Else"
+                        en = _make_exit_branch_node(
+                            title_default=default_else,
+                            branch=(else_branch or {}),
+                            y_offset=float(max(len(rules or []), 1) * 120),
+                        )
+                        node_id += 1
+                        flow_nodes.append(en)
+                        node_by_id[en.id] = en
+                        _add_connection(cond_node.id, en.id)
+                        else_next = str((else_branch or {}).get("next_chapter_id") or "").strip()
+                        if else_next:
+                            unresolved_edges.append((en.id, else_next, chap_id))
+
                         last_linear_sources = []
                         chapter_end_sources_by_id[chap_id] = []
                         continue
@@ -2240,6 +3962,9 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         for bp in forced_branch_exits:
             at_cid = str(bp.get("at_chapter_id") or "").strip()
             if not at_cid:
+                continue
+            if at_cid not in chapter_start_node_by_id:
+                # 计划里有但实际章节详情里不存在，跳过以免生成孤立节点
                 continue
             if chapter_explicit_routing.get(at_cid):
                 # Step4 已有显式路由，避免重复出口
@@ -2323,10 +4048,6 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         video=video,
                         video_loop=False,
                         options=opt_texts,
-                        condition_var="",
-                        condition_op="==",
-                        condition_value="",
-                        condition_const=False,
                         sub_dialogues=[],
                         var_ops=[],
                         x=x,
@@ -2339,93 +4060,56 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     for s in end_sources:
                         _add_connection(s, choice_node.id)
 
-                    # 若选项需要执行变量操作，或多选项回到同一目标章，则插入“选项处理节点”以保序/保差异
-                    non_empty_targets = [t for t in opt_targets if t]
-                    need_option_nodes = any(bool(vops) for vops in opt_var_ops) or (
-                        len(non_empty_targets) >= 2 and len(set(non_empty_targets)) < len(non_empty_targets)
-                    )
+                    # 始终生成“选项处理节点”（每个选项一个），避免 choice 的出边语义不稳定
+                    for idx, (tgt, vops, opt_text) in enumerate(zip(opt_targets, opt_var_ops, opt_texts)):
+                        opt_node = FlowNodeData(
+                            id=node_id,
+                            node_type="text",
+                            title=f"选项：{opt_text}" if opt_text else "选项处理",
+                            content="",
+                            speaker="",
+                            portrait="",
+                            background=bg,
+                            voice="",
+                            bgm=bgm,
+                            bgm_loop=True,
+                            stop_bgm=stop_bgm,
+                            bg_fade_in=False,
+                            portrait_fade=False,
+                            portrait_fade_out=False,
+                            hide_textbox=True,
+                            ui_file=ui_file,
+                            video=video,
+                            video_loop=False,
+                            options=[],
+                            sub_dialogues=[],
+                            var_ops=vops or [],
+                            x=x + 220,
+                            y=y + (idx * 120),
+                        )
+                        node_id += 1
+                        flow_nodes.append(opt_node)
+                        node_by_id[opt_node.id] = opt_node
+                        _add_connection(choice_node.id, opt_node.id)
 
-                    if need_option_nodes:
-                        for idx, (tgt, vops, opt_text) in enumerate(zip(opt_targets, opt_var_ops, opt_texts)):
-                            opt_node = FlowNodeData(
-                                id=node_id,
-                                node_type="text",
-                                title=f"选项：{opt_text}" if opt_text else "选项处理",
-                                content="",
-                                speaker="",
-                                portrait="",
-                                background=bg,
-                                voice="",
-                                bgm=bgm,
-                                bgm_loop=True,
-                                stop_bgm=stop_bgm,
-                                bg_fade_in=False,
-                                portrait_fade=False,
-                                portrait_fade_out=False,
-                                hide_textbox=True,
-                                ui_file=ui_file,
-                                video=video,
-                                video_loop=False,
-                                options=[],
-                                condition_var="",
-                                condition_op="==",
-                                condition_value="",
-                                condition_const=False,
-                                sub_dialogues=[],
-                                var_ops=vops or [],
-                                x=x + 220,
-                                y=y + (idx * 120),
-                            )
-                            node_id += 1
-                            flow_nodes.append(opt_node)
-                            node_by_id[opt_node.id] = opt_node
-                            _add_connection(choice_node.id, opt_node.id)
-
-                            if tgt:
-                                start = chapter_start_node_by_id.get(tgt)
-                                if start is None:
-                                    unresolved_edges.append((opt_node.id, tgt))
-                                else:
-                                    _add_connection(opt_node.id, start)
-                    else:
-                        for tgt in opt_targets:
-                            if not tgt:
-                                continue
+                        if tgt:
                             start = chapter_start_node_by_id.get(tgt)
                             if start is None:
-                                unresolved_edges.append((choice_node.id, tgt))
+                                unresolved_edges.append((opt_node.id, tgt, at_cid))
                             else:
-                                _add_connection(choice_node.id, start)
+                                _add_connection(opt_node.id, start)
                     chapter_explicit_routing[at_cid] = True
 
             if btype == "condition" and isinstance(bp.get("condition"), dict):
                 cnd = bp.get("condition") or {}
-                var_name = str(cnd.get("var") or "favorability").strip() or "favorability"
-                op = str(cnd.get("op") or ">=").strip() or ">="
-                value = str(cnd.get("value") or "0")
-                is_const = bool(cnd.get("const", True))
-                true_leads = cnd.get("true_leads_to")
-                false_leads = cnd.get("false_leads_to")
-                true_next = ""
-                false_next = ""
-                if isinstance(true_leads, str):
-                    true_next = true_leads.strip()
-                elif isinstance(true_leads, list) and true_leads:
-                    true_next = str(true_leads[0]).strip()
-                if isinstance(false_leads, str):
-                    false_next = false_leads.strip()
-                elif isinstance(false_leads, list) and false_leads:
-                    false_next = str(false_leads[0]).strip()
-                if not true_next:
-                    true_next = str(cnd.get("true_next_chapter_id") or cnd.get("true_next") or cnd.get("merge_to") or cnd.get("true_ends_to") or "").strip()
-                if not false_next:
-                    false_next = str(cnd.get("false_next_chapter_id") or cnd.get("false_next") or cnd.get("merge_to") or cnd.get("false_ends_to") or "").strip()
-                if true_next or false_next:
+                rules, else_branch = _normalize_condition_payload(cnd)
+                any_cross = any(bool(str(r.get("next_chapter_id") or "").strip()) for r in (rules or [])) or bool(str((else_branch or {}).get("next_chapter_id") or "").strip())
+                if any_cross:
                     cond_node = FlowNodeData(
                         id=node_id,
                         node_type="condition",
                         title="条件判断",
-                        content=str(bp.get("prompt") or f"判断：{var_name} {op} {value}").strip(),
+                        content=str(bp.get("prompt") or "条件判断").strip(),
                         speaker="",
                         portrait="",
                         background=bg,
@@ -2441,10 +4125,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         video=video,
                         video_loop=False,
                         options=[],
-                        condition_var=var_name,
-                        condition_op=op,
-                        condition_value=value,
-                        condition_const=is_const,
+                        condition_rules=[{"name": r.get("name", ""), "logic": r.get("logic", "and"), "exprs": r.get("exprs", [])} for r in (rules or [])],
                         sub_dialogues=[],
                         var_ops=[],
                         x=x,
@@ -2455,11 +4136,85 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     node_by_id[cond_node.id] = cond_node
                     for s in end_sources:
                         _add_connection(s, cond_node.id)
-                    if true_next:
-                        unresolved_edges.append((cond_node.id, true_next))
-                    if false_next:
-                        unresolved_edges.append((cond_node.id, false_next))
+
+                    for ridx, r in enumerate(rules or []):
+                        default_title = f"{cond_node.title}-Rule{ridx+1}"
+                        bn = FlowNodeData(
+                            id=node_id,
+                            node_type="text",
+                            title=default_title,
+                            content="",
+                            speaker="",
+                            portrait="",
+                            background=bg,
+                            voice="",
+                            bgm=bgm,
+                            bgm_loop=True,
+                            stop_bgm=stop_bgm,
+                            bg_fade_in=False,
+                            portrait_fade=False,
+                            portrait_fade_out=False,
+                            hide_textbox=True,
+                            ui_file=ui_file,
+                            video=video,
+                            video_loop=False,
+                            options=[],
+                            sub_dialogues=[],
+                            var_ops=_normalize_var_ops_list(r.get("var_ops")),
+                            x=x + 220,
+                            y=y + (ridx * 120),
+                        )
+                        node_id += 1
+                        flow_nodes.append(bn)
+                        node_by_id[bn.id] = bn
+                        _add_connection(cond_node.id, bn.id)
+                        nxt = str(r.get("next_chapter_id") or "").strip()
+                        if nxt:
+                            unresolved_edges.append((bn.id, nxt, at_cid))
+
+                    default_else = f"{cond_node.title}-Else"
+                    en = FlowNodeData(
+                        id=node_id,
+                        node_type="text",
+                        title=default_else,
+                        content="",
+                        speaker="",
+                        portrait="",
+                        background=bg,
+                        voice="",
+                        bgm=bgm,
+                        bgm_loop=True,
+                        stop_bgm=stop_bgm,
+                        bg_fade_in=False,
+                        portrait_fade=False,
+                        portrait_fade_out=False,
+                        hide_textbox=True,
+                        ui_file=ui_file,
+                        video=video,
+                        video_loop=False,
+                        options=[],
+                        sub_dialogues=[],
+                        var_ops=_normalize_var_ops_list((else_branch or {}).get("var_ops")),
+                        x=x + 220,
+                        y=y + (max(len(rules or []), 1) * 120),
+                    )
+                    node_id += 1
+                    flow_nodes.append(en)
+                    node_by_id[en.id] = en
+                    _add_connection(cond_node.id, en.id)
+                    else_next = str((else_branch or {}).get("next_chapter_id") or "").strip()
+                    if else_next:
+                        unresolved_edges.append((en.id, else_next, at_cid))
+
                     chapter_explicit_routing[at_cid] = True
+
+        # 2.5) 若 Step3 标注了 end，则禁止默认线性串联
+        for end_cid in (forced_end_by_id or set()):
+            if not end_cid:
+                continue
+            if end_cid in chapter_start_node_by_id:
+                chapter_explicit_routing[end_cid] = True
+                chapter_next_by_id[end_cid] = []
 
         # ---------- 跨章节连线：优先显式 next / choice / condition，其次按章节顺序线性连接 ----------
         # 1) 显式 linear next
@@ -2475,11 +4230,17 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     _add_connection(s, start)
 
         # 2) choice/condition unresolved edges
-        for src, target_chap in unresolved_edges:
+        for src, target_chap, src_cid in unresolved_edges:
             start = chapter_start_node_by_id.get(target_chap)
-            if start is None:
+            if start is not None:
+                _add_connection(src, start)
                 continue
-            _add_connection(src, start)
+            # 兜底：目标章节不存在时，尝试连接到“同路线/顺序”的下一章，避免出现无下游节点
+            fallback = _fallback_next_chapter_id(src_cid)
+            if fallback:
+                fb_start = chapter_start_node_by_id.get(fallback)
+                if fb_start is not None:
+                    _add_connection(src, fb_start)
 
         # 3) 默认线性：对“没有显式路由/next”的章节，连接到章节列表中的下一个章节
         for i in range(len(chapter_order) - 1):
