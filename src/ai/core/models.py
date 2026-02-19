@@ -17,7 +17,7 @@ class ProjectConfig(BaseModel):
     project_name: str = Field(..., description="工程名称")
     window_width: int = Field(1280, description="窗口宽度", ge=800, le=3840)
     window_height: int = Field(720, description="窗口高度", ge=600, le=2160)
-    engine_version: str = Field("V2.0-AI", description="引擎版本")
+    engine_version: str = Field("V2.7-AI", description="引擎版本")
 
 
 class StoryConfig(BaseModel):
@@ -45,7 +45,7 @@ class StoryConfig(BaseModel):
 
     # Step4（逐章详稿）文本量控制：经验上 LLM 常低估字数/字符数，允许通过倍率放大写作目标
     step4_word_boost_factor: float = Field(
-        1.5,
+        1.0,
         ge=1.0,
         le=3.0,
         description="Step4 逐章详稿写作目标字数放大倍率（用于抵消模型计数偏差；1.0 表示不放大）",
@@ -241,6 +241,7 @@ class FlowNodeData(BaseModel):
     portrait_bounce: bool = Field(False, description="立绘是否弹跳（进入节点时）")
     portrait2_bounce: bool = Field(False, description="第二立绘是否弹跳（进入节点时）")
     hide_textbox: bool = Field(False, description="是否隐藏文本框")
+    skip_dialogue: bool = Field(False, description="选择/条件节点：进入节点时是否跳过对白展示并直接执行对应逻辑")
     ui_file: str = Field("", description="UI文件路径")
     video: str = Field("", description="视频路径")
     video_loop: bool = Field(False, description="视频是否循环")
@@ -324,12 +325,40 @@ class GenerationHistory(BaseModel):
             "step2": 48000,
             "step3": 48000,
             "step4": 64000,
+            "step5_prompts": 8000,
         },
-        description="各步骤 LLM max_tokens 上限配置（step1..step4）",
+        description="各步骤 LLM max_tokens 上限配置（step1..step5_prompts）",
     )
     step4_chapter_details: Optional[List[Dict[str, Any]]] = Field(None, description="步骤4：章节详细内容")
     step5_full_script: Optional[Dict[str, Any]] = Field(None, description="步骤5：完整剧本")
     step5_flow_nodes: Optional[Dict[str, Any]] = Field(None, description="步骤5：流程节点数据")
+    step5_material_prompts: Optional[Dict[str, Any]] = Field(None, description="步骤5：素材提示词生成结果（背景/CG/BGM prompts）")
+
+    # 多轮上下文对话：
+    # - master_conversation：历史遗留字段，保留以兼容旧工程/调试（通常会被更新为最近一次 step1~step3 的对话）
+    # - master_conversation_after_step{1,2,3}：用于“重新生成某一步时不携带该步历史”的快照字段
+    # - step4_conversations：步骤4 按章节索引保存对话历史（key 为字符串："0"/"1"/...），用于字数补偿续写/可复现
+    # 说明：对话历史体积可能较大，但这是实现“续写补偿/可复现生成”的核心。
+    master_conversation: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="主控面板：兼容字段；最近一次 step1~step3 的 Messages 对话历史（role/content）",
+    )
+    master_conversation_after_step1: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="主控面板：step1 完成后的对话快照（用于 step2 重新生成的上下文起点）",
+    )
+    master_conversation_after_step2: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="主控面板：step2 完成后的对话快照（用于 step3 重新生成的上下文起点）",
+    )
+    master_conversation_after_step3: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="主控面板：step3 完成后的对话快照（用于 step4 重新生成的上下文起点）",
+    )
+    step4_conversations: Dict[str, List[Dict[str, Any]]] = Field(
+        default_factory=dict,
+        description="主控面板：步骤4 按章节索引保存的 Messages 对话历史（key=章节索引字符串）",
+    )
     
     agent_instructions: List[GenerationStep] = Field(default_factory=list, description="所有Agent调用记录")
 

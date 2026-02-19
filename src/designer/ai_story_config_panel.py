@@ -218,7 +218,7 @@ class AIStoryConfigPanel(AIBasePanelWidget):
 
         self.step4_word_boost_spin = QDoubleSpinBox()
         self.step4_word_boost_spin.setRange(1.0, 3.0)
-        self.step4_word_boost_spin.setValue(1.5)
+        self.step4_word_boost_spin.setValue(1.0)
         self.step4_word_boost_spin.setSingleStep(0.1)
         self.step4_word_boost_spin.setDecimals(1)
         self.step4_word_boost_spin.setToolTip("Step4 逐章详稿写作目标字数放大倍率（用于抵消模型字数偏差）。1.0=不放大；建议 1.3~2.0")
@@ -345,7 +345,7 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             self.allow_loop_story_check.setChecked(bool(getattr(story_config, 'allow_loop_story', False)))
             self.condition_type_edit.setText(story_config.condition_type)
             self.char_hint_weight_spin.setValue(story_config.character_hint_weight)
-            self.step4_word_boost_spin.setValue(float(getattr(story_config, 'step4_word_boost_factor', 1.5) or 1.5))
+            self.step4_word_boost_spin.setValue(float(getattr(story_config, 'step4_word_boost_factor', 1.0) or 1.0))
 
             # POV
             pov = getattr(story_config, 'narrative_pov', 'third')

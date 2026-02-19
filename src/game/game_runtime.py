@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import glob
+import re
+from decimal import Decimal, InvalidOperation
 import pygame
 import yaml
 import json
@@ -3271,6 +3273,10 @@ class VNGameRuntime:
         if not entry:
             return
         full_text = entry.get("content") or entry.get("title") or ""
+        try:
+            full_text = self._interpolate_dialogue_template(str(full_text))
+        except Exception:
+            pass
         if self.current_visible_len < len(full_text):
             self.current_visible_len = len(full_text)
             return
@@ -3306,6 +3312,9 @@ class VNGameRuntime:
                         if started_1 or started_2:
                             return
             if node_type == "choice":
+                # If already in choice overlay, do not reopen/reset it.
+                if getattr(self, "_choice_overlay", False):
+                    return
                 self._open_choice_overlay(entry)
                 return
             if node_type == "condition":
@@ -3325,6 +3334,11 @@ class VNGameRuntime:
         dlg_style, name_style, dlg_font, name_font = self._effective_text_style_for_entry(entry)
         speaker = entry.get("speaker") or "角色"
         content = entry.get("content") or entry.get("title") or ""
+        try:
+            speaker = self._interpolate_dialogue_template(str(speaker))
+            content = self._interpolate_dialogue_template(str(content))
+        except Exception:
+            pass
         bg_path = entry.get("background") or ""
         portrait_path = entry.get("portrait") or ""
         portrait2_path = entry.get("portrait2") or ""
@@ -3411,7 +3425,7 @@ class VNGameRuntime:
             self.render_surface.blit(name_surf, (self.name_area.x + left_pad, self.name_area.y + vert_pad))
 
             # render dialogue text with simple wrapping
-            shown_text = content[: self.current_visible_len] if content else ""
+            shown_text = content[: min(self.current_visible_len, len(content))] if content else ""
             self._render_wrapped_text(
                 shown_text,
                 self.text_area,
@@ -3784,6 +3798,10 @@ class VNGameRuntime:
         if not entry:
             return
         content = entry.get("content") or entry.get("title") or ""
+        try:
+            content = self._interpolate_dialogue_template(str(content))
+        except Exception:
+            pass
         if self.fast_skip:
             self.current_visible_len = len(content)
             self.typing_progress = len(content)
@@ -3810,6 +3828,10 @@ class VNGameRuntime:
         if not entry:
             return
         content = entry.get("content") or entry.get("title") or ""
+        try:
+            content = self._interpolate_dialogue_template(str(content))
+        except Exception:
+            pass
         self.current_visible_len = len(content)
         self.typing_progress = len(content)
 
@@ -3834,6 +3856,10 @@ class VNGameRuntime:
         if not entry:
             return
         content = entry.get("content") or entry.get("title") or ""
+        try:
+            content = self._interpolate_dialogue_template(str(content))
+        except Exception:
+            pass
         self.current_visible_len = len(content)
         self.typing_progress = len(content)
 
@@ -3869,6 +3895,10 @@ class VNGameRuntime:
         if self.fast_skip:
             entry = self._current_entry()
             content = (entry.get("content") or entry.get("title") or "") if entry else ""
+            try:
+                content = self._interpolate_dialogue_template(str(content))
+            except Exception:
+                pass
             self.current_visible_len = len(content)
             self.typing_progress = len(content)
 
@@ -3992,6 +4022,21 @@ class VNGameRuntime:
         self._append_history(entry)
         # 预取下一个节点/对白的素材，进一步降低跳转卡顿
         self._prefetch_next_assets()
+
+        # Auto-enter behavior for skip-dialogue choice/condition nodes.
+        # Important: avoid triggering during load/restore where apply_var_ops=False.
+        if apply_var_ops and entry and self.graph_mode:
+            try:
+                ntype = str(entry.get("node_type") or "text").lower()
+            except Exception:
+                ntype = "text"
+            if ntype == "choice" and bool(entry.get("skip_dialogue", False)):
+                if not getattr(self, "_choice_overlay", False):
+                    self._open_choice_overlay(entry)
+                return
+            if ntype == "condition" and bool(entry.get("skip_dialogue", False)):
+                self._resolve_condition_branch(entry)
+                return
 
     def _apply_ui_file(self, ui_file: str):
         if not ui_file:
@@ -4566,6 +4611,25 @@ class VNGameRuntime:
             if self.current_node_id is None:
                 return {}
             node = self.nodes_map.get(self.current_node_id, {}) or {}
+            try:
+                ntype = str(node.get("node_type") or "text").lower()
+            except Exception:
+                ntype = "text"
+            if ntype in {"choice", "condition"} and bool(node.get("skip_dialogue", False)):
+                # Skip dialogue presentation for choice/condition nodes (designer option).
+                masked = dict(node)
+                masked["speaker"] = ""
+                masked["content"] = ""
+                masked["portrait"] = ""
+                masked["portrait2"] = ""
+                masked["voice"] = ""
+                masked["sfx"] = ""
+                masked["hide_textbox"] = True
+                masked["portrait_fade"] = False
+                masked["portrait2_fade"] = False
+                masked["portrait_bounce"] = False
+                masked["portrait2_bounce"] = False
+                return masked
             if node.get("node_type") == "text":
                 subs = node.get("sub_dialogues") or []
                 if subs and 0 <= self._sub_index < len(subs):
@@ -5366,6 +5430,11 @@ class VNGameRuntime:
             return
         if not options:
             options = [f"选项 {i+1}" for i in range(len(targets))]
+        # Allow {$var} placeholders inside option labels.
+        try:
+            options = [self._interpolate_dialogue_template(str(o)) for o in (options or [])]
+        except Exception:
+            pass
         if len(options) > len(targets):
             options = options[: len(targets)]
         else:
@@ -5726,11 +5795,76 @@ class VNGameRuntime:
             return
         speaker = entry.get("speaker") or ""
         content = entry.get("content") or ""
+        try:
+            speaker = self._interpolate_dialogue_template(str(speaker))
+            content = self._interpolate_dialogue_template(str(content))
+        except Exception:
+            pass
         if not content:
             return
         self._history.append({"speaker": speaker, "content": content})
         if len(self._history) > 10:
             self._history = self._history[-10:]
+
+    _DIALOGUE_VAR_TOKEN_RE = re.compile(r"\{\$\s*([^}]+?)\s*\}")
+
+    def _format_var_value_for_dialogue(self, val) -> str:
+        # bool should stay bool-like, not 0/1
+        if isinstance(val, bool):
+            return "True" if val else "False"
+        # normalize numpy scalars
+        try:
+            if hasattr(val, "item") and callable(getattr(val, "item")):
+                val = val.item()
+        except Exception:
+            pass
+        if isinstance(val, int):
+            return str(val)
+        if isinstance(val, float):
+            try:
+                if not math.isfinite(val):
+                    return str(val)
+            except Exception:
+                pass
+            # Use Decimal(str(x)) to reduce float representation noise and trim trailing zeros.
+            try:
+                d = Decimal(str(val))
+                s = format(d, "f")
+            except (InvalidOperation, ValueError):
+                s = str(val)
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s
+        if val is None:
+            return ""
+        return str(val)
+
+    def _interpolate_dialogue_template(self, text: str) -> str:
+        # Fast path: only do regex work when token is present.
+        if not text or "{$" not in text:
+            return text
+
+        def _repl(m: re.Match) -> str:
+            raw = m.group(1) or ""
+            name = str(raw).strip()
+            if not name:
+                return m.group(0)
+            # Allow unicode identifiers (Python style); ignore invalid placeholders.
+            try:
+                if not name.isidentifier():
+                    return m.group(0)
+            except Exception:
+                return m.group(0)
+            try:
+                val = (self.variables or {}).get(name, 0)
+            except Exception:
+                val = 0
+            return self._format_var_value_for_dialogue(val)
+
+        try:
+            return self._DIALOGUE_VAR_TOKEN_RE.sub(_repl, text)
+        except Exception:
+            return text
 
     def _load_font(self, size: int, bold: bool = False, family: str | None = None, font_path: str | None = None):
         # Prefer font file if provided

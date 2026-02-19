@@ -232,6 +232,24 @@ class AIProjectManager:
         else:
             logger.warning(f"无效的步骤键名: {step_key}")
             return False
+
+    def update_generation_history_field(self, field_key: str, value: Any) -> bool:
+        """更新 generation_history 的任意字段（用于保存对话历史等非 stepX 结果字段）。"""
+        if self.current_project is None:
+            return False
+
+        gh = getattr(self.current_project, "generation_history", None)
+        if gh is None:
+            return False
+
+        if hasattr(gh, field_key):
+            setattr(gh, field_key, value)
+            self.current_project.update_modified_time()
+            logger.info(f"更新生成历史字段: {field_key}")
+            return True
+
+        logger.warning(f"无效的生成历史字段: {field_key}")
+        return False
     
     def add_agent_instruction(self, instruction: GenerationStep) -> bool:
         """添加Agent指令记录"""

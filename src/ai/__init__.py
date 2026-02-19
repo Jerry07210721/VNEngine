@@ -4,7 +4,7 @@ VNEngine 多智能体协作系统
 Multi-Agent AI-Assisted GalGame Creation System
 """
 
-__version__ = "2.0.0"
+__version__ = "2.7.0"
 __author__ = "VNEngine Team"
 
 from .core.config_manager import ConfigManager

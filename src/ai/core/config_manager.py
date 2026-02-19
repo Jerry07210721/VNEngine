@@ -156,7 +156,7 @@ class ConfigManager:
             "project_settings": {
                 "default_window_width": 1280,
                 "default_window_height": 720,
-                "engine_version": "V2.0-AI",
+                "engine_version": "V2.7-AI",
                 "auto_save_interval": 300,
                 "resource_root": "output/projects"
             }
@@ -260,7 +260,7 @@ class ConfigManager:
         self.config_data.setdefault("project_settings", {})
         self.config_data["project_settings"].setdefault("default_window_width", 1280)
         self.config_data["project_settings"].setdefault("default_window_height", 720)
-        self.config_data["project_settings"].setdefault("engine_version", "V2.0-AI")
+        self.config_data["project_settings"].setdefault("engine_version", "V2.7-AI")
         self.config_data["project_settings"].setdefault("resource_root", "output/projects")
     
     def save_config(self, config_data: Optional[Dict[str, Any]] = None) -> bool:

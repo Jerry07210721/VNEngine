@@ -128,10 +128,12 @@ def test_step4_prompt_includes_chapter_target_words():
 
     assert "本章目标字数" in instruction
     assert "1200" in instruction
-    assert "1800" in instruction
-    assert "1.5" in instruction or "×1.5" in instruction
     assert params.get("target_words") == 1200
-    assert params.get("target_words_boosted") == 1800
+    assert params.get("target_words_boosted") == 1200
+
+    # 默认 step4_word_boost_factor 已改为 1.0（因此提示词里不会再出现 1.5/1800）
+    assert "1800" not in instruction
+    assert "1.5" not in instruction and "×1.5" not in instruction
 
 
 def test_step4_prompt_includes_personas_raw_response_and_mp3_and_cn_char_rules_when_provided():
