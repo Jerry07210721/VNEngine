@@ -13,8 +13,8 @@ class VNProjectManager:
         self.project_data = {
             "project_info": {
                 "name": "未命名工程",
-                "version": "2.6",
-                "engine_version": "VNEngine V2.6",
+                "version": "2.7",
+                "engine_version": "VNEngine V2.7",
                 "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_modify_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             },

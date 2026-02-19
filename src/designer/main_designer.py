@@ -381,7 +381,7 @@ class VNDesignerMainWindow(QMainWindow):
         self.init_status_bar()
 
     def init_window(self):
-        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.6")
+        self.setWindowTitle("VNEngine - 视觉小说引擎（设计模式）V2.7")
         self.setObjectName("VNDesignerMainWindow")
         # 设计模式默认窗口大小：1280x720
         self.setGeometry(100, 100, 1280, 720)

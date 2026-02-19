@@ -40,7 +40,11 @@ class StepGenerator:
         "step2": 48000,
         "step3": 48000,
         "step4": 64000,
+        "step5_prompts": 8000,
     }
+
+    MASTER_SYSTEM_PROMPT = "你是VNEngine的主控编剧Agent。你必须严格按用户给定的配置与已生成上下文推进，输出必须可解析的结构化JSON。"
+    STEP4_SYSTEM_PROMPT = "你是VNEngine的逐章详稿写作Agent。你必须严格输出可解析JSON，并遵守schema与字数/媒体标注硬约束。"
     
     def __init__(
         self,
@@ -218,6 +222,69 @@ class StepGenerator:
         structured = self._try_parse_json(text)
         return text, structured
 
+    def _call_llm_with_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> Tuple[str, Optional[Any], List[Dict[str, Any]]]:
+        """基于 Messages API 的多轮调用：传入历史 messages（role/content），返回文本、结构化解析与更新后的 messages。"""
+
+        safe_messages: List[Dict[str, Any]] = []
+        for m in (messages or []):
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip()
+            content = m.get("content")
+            if role not in {"user", "assistant"}:
+                continue
+            if content is None:
+                content = ""
+            safe_messages.append({"role": role, "content": str(content)})
+
+        response = self.plot_agent.llm_client.create_message(
+            messages=safe_messages,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = self._extract_text(response)
+        structured = self._try_parse_json(text)
+
+        safe_messages = list(safe_messages)
+        safe_messages.append({"role": "assistant", "content": text})
+        return text, structured, safe_messages
+
+    def _append_user_message(self, conversation: Optional[List[Dict[str, Any]]], instruction: str) -> List[Dict[str, Any]]:
+        conv = list(conversation or [])
+        conv.append({"role": "user", "content": str(instruction or "")})
+        return conv
+
+    def _merge_step4_append_payload(self, base_struct: Any, append_struct: Any) -> Any:
+        """将补写返回的 append_scenes 合并到原 structured 里。"""
+        if not isinstance(base_struct, dict):
+            return base_struct
+        if not isinstance(append_struct, dict):
+            return base_struct
+
+        scenes = base_struct.get("scenes")
+        if not isinstance(scenes, list):
+            scenes = []
+            base_struct["scenes"] = scenes
+
+        append_scenes = append_struct.get("append_scenes")
+        if isinstance(append_scenes, list):
+            for s in append_scenes:
+                if isinstance(s, dict):
+                    scenes.append(s)
+
+        if base_struct.get("exit") is None and isinstance(append_struct.get("append_exit"), dict):
+            base_struct["exit"] = append_struct.get("append_exit")
+
+        return base_struct
+
     def _resolve_max_tokens(self, parameters: Dict[str, Any] | None, *, step_key: str, default: int) -> int:
         """从 parameters 读取 max_tokens，并做类型转换与范围裁剪。"""
         value = default
@@ -271,21 +338,34 @@ class StepGenerator:
             instruction += f"\n   - 人设关键词：{char.get('persona_keywords', '未指定')}"
             if char.get('is_player'):
                 instruction += f"\n   - 特殊标识：玩家角色（第一视角）"
-        
+
         instruction += f"""
 
-请为每个角色生成：
-1. 详细的性格描述（200-300字）
-2. 外貌特征描述（100-150字）
-3. 背景故事（150-200字）
-4. 语言风格特点
-5. 与其他角色的关系
+请为每个角色生成结构化设定，并严格以 JSON 输出（仅输出 JSON，不要解释文字）。
 
-要求：
-- 人设需要符合故事风格和剧情
-- 角色之间要有明确的关系和互动
-- 第一视角角色的人设要符合玩家代入感
-- 人设权重：{story_config.get('character_hint_weight', 0.7)}（越接近1.0越严格遵循用户提供的关键词）
+【输出要求】
+1) 必须输出一个 JSON 对象，字段如下：
+{{
+    "characters": [
+        {{
+            "char_id": "...",
+            "char_name": "...",
+            "role": "...",
+            "persona": "...",        // 性格(200-300字)
+            "appearance": "...",     // 外貌(100-150字)
+            "background": "...",     // 背景(150-200字)
+            "speech_style": "...",   // 语言风格
+            "relationships": [        // 与其他角色关系
+                {{"with": "对方角色名", "relation": "关系描述"}}
+            ]
+        }}
+    ],
+    "notes": "全局补充说明(可选)"
+}}
+2) characters 必须覆盖输入的每个角色，char_id/char_name 必须与输入一致。
+3) 人设需要符合故事风格和剧情；角色之间要有明确的关系和互动。
+4) 第一视角角色的人设要符合玩家代入感。
+5) 人设权重：{story_config.get('character_hint_weight', 0.7)}（越接近1.0越严格遵循用户提供的关键词）。
 """
         
         # 参数
@@ -302,7 +382,9 @@ class StepGenerator:
     def generate_personas(
         self,
         instruction: str,
-        parameters: Dict[str, Any]
+        parameters: Dict[str, Any],
+        *,
+        conversation: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         生成角色人设
@@ -322,12 +404,22 @@ class StepGenerator:
                 step_key="step1",
                 default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step1", 32000)),
             )
-            text, structured = self._call_llm(
-                instruction,
-                system="你是资深的视觉小说角色设定专家，擅长给出结构化、可落地的人设。",
-                max_tokens=max_tokens,
-                temperature=0.7,
-            )
+            if conversation is None:
+                text, structured = self._call_llm(
+                    instruction,
+                    system="你是资深的视觉小说角色设定专家，擅长给出结构化、可落地的人设。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
+                conv_out = None
+            else:
+                conv_in = self._append_user_message(conversation, instruction)
+                text, structured, conv_out = self._call_llm_with_messages(
+                    conv_in,
+                    system="你是资深的视觉小说角色设定专家，擅长给出结构化、可落地的人设。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
 
             personas = {
                 "raw_response": text,
@@ -335,6 +427,9 @@ class StepGenerator:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            if conv_out is not None:
+                personas["conversation"] = conv_out
             
             self.logger.info("角色人设生成完成")
             return personas
@@ -348,7 +443,9 @@ class StepGenerator:
     def prepare_outline_instruction(
         self,
         story_config: Dict[str, Any],
-        personas: Dict[str, Any]
+        personas: Dict[str, Any],
+        *,
+        use_conversation_context: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         准备生成故事大纲的指令
@@ -422,7 +519,11 @@ class StepGenerator:
 - 在大纲末尾的【分支控制计划】中，必须把“循环入口/循环回边/循环退出”作为明确控制节点写出来，并说明用哪个变量判定退出。
 """
         
-        instruction = f"""请根据以下信息，生成故事大纲：
+        personas_block = "（已在上下文中提供角色人设，无需重复粘贴）"
+        if not use_conversation_context:
+            personas_block = personas.get('raw_response', '（已生成）')
+
+        instruction = f"""请根据以下信息，生成故事大纲（严格输出结构化 JSON，仅输出 JSON，不要解释文字）：
 
 故事标题：{story_config.get('title', '未命名')}
 故事风格：{story_config.get('style', '')}
@@ -431,14 +532,26 @@ class StepGenerator:
 章节数量：约{story_config.get('chapter_count', 5)}章
 
 角色人设：
-{personas.get('raw_response', '（已生成）')}
+{personas_block}
 
-请生成：
-1. 完整的故事大纲（包括开端、发展、高潮、结局）
-2. 划分为{story_config.get('chapter_count', 5)}个章节
-3. 每个章节的核心剧情（100-150字）
-4. 关键剧情转折点
-5. 角色成长弧线
+【输出 JSON Schema（示例）】
+{{
+    "title": "{story_config.get('title', '未命名')}",
+    "style": "{story_config.get('style', '')}",
+    "premise": "一句话前提",
+    "outline": {{
+        "opening": "...",
+        "development": "...",
+        "climax": "...",
+        "ending": "..."
+    }},
+    "chapters": [
+        {{"index": 1, "title": "...", "core": "100-150字核心剧情"}}
+    ],
+    "turning_points": ["..."],
+    "character_arcs": [{{"char_name": "...", "arc": "..."}}],
+    "branch_control_plan": "若启用多分支，请按提示词要求输出分支控制计划结构（可嵌入为对象/数组）"
+}}
 
 要求：
 - 大纲要完整连贯
@@ -463,7 +576,9 @@ class StepGenerator:
     def generate_outline(
         self,
         instruction: str,
-        parameters: Dict[str, Any]
+        parameters: Dict[str, Any],
+        *,
+        conversation: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         生成故事大纲
@@ -483,12 +598,22 @@ class StepGenerator:
                 step_key="step2",
                 default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step2", 48000)),
             )
-            text, structured = self._call_llm(
-                instruction,
-                system="你是专业的视觉小说主编，擅长输出清晰的章节大纲。",
-                max_tokens=max_tokens,
-                temperature=0.7,
-            )
+            if conversation is None:
+                text, structured = self._call_llm(
+                    instruction,
+                    system="你是专业的视觉小说主编，擅长输出清晰的章节大纲。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
+                conv_out = None
+            else:
+                conv_in = self._append_user_message(conversation, instruction)
+                text, structured, conv_out = self._call_llm_with_messages(
+                    conv_in,
+                    system="你是专业的视觉小说主编，擅长输出清晰的章节大纲。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
 
             outline = {
                 "raw_response": text,
@@ -496,6 +621,9 @@ class StepGenerator:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            if conv_out is not None:
+                outline["conversation"] = conv_out
             
             self.logger.info("故事大纲生成完成")
             return outline
@@ -511,6 +639,8 @@ class StepGenerator:
         story_config: Dict[str, Any],
         outline: Dict[str, Any],
         character_config: Optional[List[Dict[str, Any]]] = None,
+        *,
+        use_conversation_context: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         准备生成章节列表的指令
@@ -805,10 +935,14 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
             indent=2,
         )
 
+        outline_block = "（已在上下文中提供故事大纲，无需重复粘贴）"
+        if not use_conversation_context:
+            outline_block = outline.get('raw_response', '')
+
         instruction = f"""请根据故事大纲，生成详细的章节列表（用于后续逐章详稿与自动生成流程图）。
 
-故事大纲：
-{outline.get('raw_response', '')}
+    故事大纲：
+    {outline_block}
 
 字数预算要求（非常重要）：
 1) 目标总文本量约为 {text_volume} 字（对白+叙述合计）。
@@ -947,7 +1081,9 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
     def generate_chapters(
         self,
         instruction: str,
-        parameters: Dict[str, Any]
+        parameters: Dict[str, Any],
+        *,
+        conversation: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         生成章节列表
@@ -967,12 +1103,22 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
                 step_key="step3",
                 default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step3", 48000)),
             )
-            text, structured = self._call_llm(
-                instruction,
-                system="你是视觉小说剧本统筹，请输出可直接拆分的章节计划。",
-                max_tokens=max_tokens,
-                temperature=0.7,
-            )
+            if conversation is None:
+                text, structured = self._call_llm(
+                    instruction,
+                    system="你是视觉小说剧本统筹，请输出可直接拆分的章节计划。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
+                conv_out = None
+            else:
+                conv_in = self._append_user_message(conversation, instruction)
+                text, structured, conv_out = self._call_llm_with_messages(
+                    conv_in,
+                    system="你是视觉小说剧本统筹，请输出可直接拆分的章节计划。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
 
             chapters = {
                 "raw_response": text,
@@ -980,6 +1126,9 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            if conv_out is not None:
+                chapters["conversation"] = conv_out
 
             # 归一化：补全 branch_plan 的“每章出口计划”，减少 Step4/Step5 断链
             try:
@@ -1055,6 +1204,12 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
                             completed.append({"type": "end", "at_chapter_id": cid})
                     st["branch_plan"] = completed
                     chapters["structured"] = st
+
+                    # 校验：分支计划图的连通性/断链/孤岛（不中断生成，仅写入 warnings）
+                    try:
+                        self._validate_and_annotate_branch_plan_graph(st)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             
@@ -1064,6 +1219,141 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
         except Exception as e:
             self.logger.error(f"生成章节列表失败: {e}")
             raise
+
+    # ==================== Step3：分支图校验 ====================
+
+    @staticmethod
+    def _bp_targets_from_item(item: Dict[str, Any]) -> List[str]:
+        t = str(item.get("type") or "").strip().lower()
+        targets: List[str] = []
+        if t == "linear":
+            nxt = str(item.get("next_chapter_id") or "").strip()
+            if nxt:
+                targets.append(nxt)
+        elif t == "choice":
+            for opt in (item.get("options") or []):
+                if isinstance(opt, dict):
+                    nxt = str(opt.get("next_chapter_id") or "").strip()
+                    if nxt:
+                        targets.append(nxt)
+        elif t == "condition":
+            cond = item.get("condition")
+            if isinstance(cond, dict):
+                for rule in (cond.get("condition_rules") or []):
+                    if isinstance(rule, dict):
+                        nxt = str(rule.get("next_chapter_id") or "").strip()
+                        if nxt:
+                            targets.append(nxt)
+                enxt = str(cond.get("else_next_chapter_id") or "").strip()
+                if enxt:
+                    targets.append(enxt)
+        return targets
+
+    def _validate_and_annotate_branch_plan_graph(self, plan_structured: Dict[str, Any]) -> None:
+        """校验 Step3 branch_plan 图是否断链/存在入度为0的非开始节点。
+
+        不抛异常、不终止生成，仅写入 plan_structured.warnings，供 UI 提示与后续步骤对齐。
+        """
+
+        if not isinstance(plan_structured, dict):
+            return
+        chapters = plan_structured.get("chapters") if isinstance(plan_structured.get("chapters"), list) else []
+        bp = plan_structured.get("branch_plan") if isinstance(plan_structured.get("branch_plan"), list) else []
+        if not chapters or not bp:
+            return
+
+        chapter_ids: List[str] = []
+        route_by_id: Dict[str, str] = {}
+        for c in chapters:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("chapter_id") or "").strip()
+            if not cid:
+                continue
+            chapter_ids.append(cid)
+            route_by_id[cid] = str(c.get("route") or "common").strip() or "common"
+        if not chapter_ids:
+            return
+
+        # start 节点：优先第一个 common，否则第一章
+        start_id = chapter_ids[0]
+        try:
+            for cid in chapter_ids:
+                if (route_by_id.get(cid) or "common").strip().lower() == "common":
+                    start_id = cid
+                    break
+        except Exception:
+            start_id = chapter_ids[0]
+
+        edges: Dict[str, List[str]] = {cid: [] for cid in chapter_ids}
+        indeg: Dict[str, int] = {cid: 0 for cid in chapter_ids}
+        invalid_refs: List[Dict[str, Any]] = []
+
+        for item in bp:
+            if not isinstance(item, dict):
+                continue
+            at = str(item.get("at_chapter_id") or "").strip()
+            if not at:
+                continue
+            if at not in edges:
+                invalid_refs.append({"type": "invalid_at_chapter_id", "at_chapter_id": at})
+                continue
+
+            targets = self._bp_targets_from_item(item)
+            for nxt in targets:
+                if nxt not in edges:
+                    invalid_refs.append({"type": "invalid_next_chapter_id", "at_chapter_id": at, "next_chapter_id": nxt})
+                    continue
+                if nxt == at:
+                    invalid_refs.append({"type": "self_loop", "at_chapter_id": at, "next_chapter_id": nxt})
+                    continue
+                edges[at].append(nxt)
+                indeg[nxt] = int(indeg.get(nxt, 0) + 1)
+
+        # 可达性（从 start 出发）
+        reachable = set()
+        stack = [start_id]
+        while stack:
+            cur = stack.pop()
+            if cur in reachable:
+                continue
+            reachable.add(cur)
+            for nxt in edges.get(cur) or []:
+                if nxt not in reachable:
+                    stack.append(nxt)
+
+        disconnected = [cid for cid in chapter_ids if cid not in reachable]
+        zero_indeg = [cid for cid in chapter_ids if cid != start_id and int(indeg.get(cid, 0)) == 0]
+
+        warnings_list = plan_structured.get("warnings") if isinstance(plan_structured.get("warnings"), list) else []
+        if invalid_refs:
+            warnings_list.append(
+                {
+                    "type": "branch_plan_invalid_refs",
+                    "message": "branch_plan 存在无效引用（可能导致流程图断链）。",
+                    "details": invalid_refs,
+                }
+            )
+        if disconnected:
+            warnings_list.append(
+                {
+                    "type": "branch_plan_disconnected",
+                    "message": "branch_plan 图存在不可达章节（从开始节点无法到达）。",
+                    "start_chapter_id": start_id,
+                    "unreachable_chapter_ids": disconnected,
+                }
+            )
+        if zero_indeg:
+            warnings_list.append(
+                {
+                    "type": "branch_plan_zero_indegree",
+                    "message": "存在除开始节点外入度为 0 的章节（通常表示断链或孤岛）。",
+                    "start_chapter_id": start_id,
+                    "zero_indegree_chapter_ids": zero_indeg,
+                }
+            )
+        if warnings_list:
+            plan_structured["warnings"] = warnings_list
     
     # ==================== 步骤4：生成章节详细内容 ====================
     
@@ -1076,6 +1366,8 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
         character_config: Optional[List[Dict[str, Any]]] = None,
         personas_data: Any | None = None,
         chapters_plan: Optional[Dict[str, Any]] = None,
+        *,
+        use_conversation_context: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         准备生成单个章节详细内容的指令
@@ -1113,10 +1405,10 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
 
         # 经验修正：LLM 往往低估字数/字符数（常见少 30%~50%），因此在 Step4 提示词里
         # 对“写作目标”做倍率放大，提升实际输出文本量的可控性。
-        # 倍率可配置：story_config.step4_word_boost_factor（默认 1.5）。
+        # 倍率可配置：story_config.step4_word_boost_factor（默认 1.0）。
         boost_factor = 1.5
         try:
-            boost_factor = float(story_cfg.get("step4_word_boost_factor", 1.5) or 1.5)
+            boost_factor = float(story_cfg.get("step4_word_boost_factor", 1.0) or 1.0)
         except Exception:
             boost_factor = 1.5
         if boost_factor < 1.0:
@@ -1178,13 +1470,14 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
 
         # 步骤1 角色人设（用于约束对白/行为一致性）
         persona_raw = ""
-        try:
-            if isinstance(personas_data, dict):
-                persona_raw = str(personas_data.get("raw_response") or "").strip()
-            elif isinstance(personas_data, str):
-                persona_raw = personas_data.strip()
-        except Exception:
-            persona_raw = ""
+        if not use_conversation_context:
+            try:
+                if isinstance(personas_data, dict):
+                    persona_raw = str(personas_data.get("raw_response") or "").strip()
+                elif isinstance(personas_data, str):
+                    persona_raw = personas_data.strip()
+            except Exception:
+                persona_raw = ""
 
         # 文本量：以“中文字符数”作为硬约束（对白/旁白的 text 累加；不计空格/标点/英文/数字）
         min_cn_chars = 0
@@ -1222,47 +1515,63 @@ CG 规则（必须遵守）：
 
         # Step3 章节规划（只读）用于减少模型跑偏：提供全局章节序与本章相关的 branch_plan 片段。
         chapter_plan_context = ""
-        try:
-            if isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list):
-                chap_id = str(
-                    chapter_info.get("chapter_id")
-                    or chapter_info.get("id")
-                    or (chapter_info.get("parameters", {}) or {}).get("chapter_id")
-                    or str(chapter_index + 1)
-                ).strip()
+        branch_plan_for_this_chapter: List[Dict[str, Any]] = []
+        chapters_plan_summary_by_id: Dict[str, str] = {}
+        if use_conversation_context:
+            chapter_plan_context = "\n\nStep3 章节规划：已在对话上下文中提供（无需重复粘贴，但必须严格对齐）。\n"
+        else:
+            try:
+                if isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list):
+                    chap_id = str(
+                        chapter_info.get("chapter_id")
+                        or chapter_info.get("id")
+                        or (chapter_info.get("parameters", {}) or {}).get("chapter_id")
+                        or str(chapter_index + 1)
+                    ).strip()
 
-                compact_chapters = []
-                for c in chapters_plan.get("chapters") or []:
-                    if not isinstance(c, dict):
-                        continue
-                    compact_chapters.append(
-                        {
-                            "chapter_id": c.get("chapter_id"),
-                            "title": c.get("title"),
-                            "route": c.get("route"),
-                            "estimated_words": c.get("estimated_words"),
-                            "summary": (str(c.get("summary") or "")[:220] + "...") if isinstance(c.get("summary"), str) and len(c.get("summary")) > 220 else c.get("summary"),
-                        }
-                    )
-
-                # 只取与本章相关的 branch_plan（at_chapter_id 匹配），降低 token。
-                related_branch_plan = []
-                raw_bp = chapters_plan.get("branch_plan")
-                if isinstance(raw_bp, list) and chap_id:
-                    for item in raw_bp:
-                        if not isinstance(item, dict):
+                    compact_chapters = []
+                    for c in chapters_plan.get("chapters") or []:
+                        if not isinstance(c, dict):
                             continue
-                        if str(item.get("at_chapter_id") or "").strip() == chap_id:
-                            related_branch_plan.append(item)
+                        cid2 = str(c.get("chapter_id") or "").strip()
+                        compact_chapters.append(
+                            {
+                                "chapter_id": c.get("chapter_id"),
+                                "title": c.get("title"),
+                                "route": c.get("route"),
+                                "estimated_words": c.get("estimated_words"),
+                                "summary": (str(c.get("summary") or "")[:220] + "...") if isinstance(c.get("summary"), str) and len(c.get("summary")) > 220 else c.get("summary"),
+                            }
+                        )
+                        if cid2:
+                            try:
+                                s2 = c.get("summary")
+                                if isinstance(s2, str) and s2.strip():
+                                    s2s = s2.strip()
+                                    chapters_plan_summary_by_id[cid2] = (s2s[:260] + "...") if len(s2s) > 260 else s2s
+                            except Exception:
+                                pass
 
-                plan_payload = {
-                    "word_budget": chapters_plan.get("word_budget"),
-                    "chapters": compact_chapters,
-                }
-                if related_branch_plan:
-                    plan_payload["branch_plan_for_this_chapter"] = related_branch_plan
+                    # 只取与本章相关的 branch_plan（at_chapter_id 匹配），降低 token。
+                    related_branch_plan = []
+                    raw_bp = chapters_plan.get("branch_plan")
+                    if isinstance(raw_bp, list) and chap_id:
+                        for item in raw_bp:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("at_chapter_id") or "").strip() == chap_id:
+                                related_branch_plan.append(item)
+                    if related_branch_plan:
+                        branch_plan_for_this_chapter = list(related_branch_plan)
 
-                chapter_plan_context = f"""
+                    plan_payload = {
+                        "word_budget": chapters_plan.get("word_budget"),
+                        "chapters": compact_chapters,
+                    }
+                    if related_branch_plan:
+                        plan_payload["branch_plan_for_this_chapter"] = related_branch_plan
+
+                    chapter_plan_context = f"""
 
 Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）：
 - 当前要生成的章节：chapter_index={chapter_index}，chapter_id={chap_id}
@@ -1270,8 +1579,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
 {json.dumps(plan_payload, ensure_ascii=False, indent=2)}
 """
-        except Exception:
-            chapter_plan_context = ""
+            except Exception:
+                chapter_plan_context = ""
 
         # 过滤 Step3 章节列表中可能出现的别名/昵称，避免污染 Step4 提示词
         chapter_info_for_prompt = dict(chapter_info or {})
@@ -1290,6 +1599,66 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         except Exception:
             chapter_info_for_prompt = dict(chapter_info or {})
 
+        # 当上下文已包含 Step3 章节规划时，提示词里无需重复粘贴完整 chapter_info（可能很长）。
+        # 这里仅保留生成本章必需的关键信息。
+        chapter_info_payload = chapter_info_for_prompt
+        if use_conversation_context and isinstance(chapter_info_for_prompt, dict):
+            allowed_keys = {
+                "chapter_id",
+                "id",
+                "title",
+                "route",
+                "summary",
+                "chapter_summary",
+                "estimated_words",
+                "target_words",
+                "characters",
+                "locations",
+                "tags",
+                "notes",
+                "key_events",
+                "beats",
+            }
+            compact: Dict[str, Any] = {}
+            for k in allowed_keys:
+                if k in chapter_info_for_prompt:
+                    v = chapter_info_for_prompt.get(k)
+                    if v is None or v == "" or v == [] or v == {}:
+                        continue
+                    compact[k] = v
+
+            # 统一 chapter_id 字段，减少歧义
+            if "chapter_id" not in compact:
+                cid = chapter_info_for_prompt.get("chapter_id") or chapter_info_for_prompt.get("id")
+                if cid is not None and str(cid).strip():
+                    compact["chapter_id"] = str(cid).strip()
+
+            # 确保至少带上标题与摘要（若有）
+            if "title" not in compact and isinstance(chapter_info_for_prompt.get("title"), str):
+                t = chapter_info_for_prompt.get("title")
+                if t and t.strip():
+                    compact["title"] = t.strip()
+            if "summary" not in compact:
+                s = chapter_info_for_prompt.get("summary") or chapter_info_for_prompt.get("chapter_summary")
+                if isinstance(s, str) and s.strip():
+                    compact["summary"] = s.strip()
+
+            if compact:
+                chapter_info_payload = compact
+
+        step1_persona_section = ""
+        if use_conversation_context:
+            step1_persona_section = "\n\n【步骤1 角色人设（只读）】\n已在对话上下文中提供（无需重复粘贴，但必须保持一致）。\n"
+        else:
+            step1_persona_section = f"""
+
+【步骤1 角色人设（只读）】
+请严格参考，保证对白与行为一致；若与章节规划冲突，以章节规划为准。
+```text
+{persona_raw if persona_raw else '(未提供步骤1人设 raw_response)'}
+```
+"""
+
         instruction = f"""你正在为 VNEngine 生成“逐章详稿”（后续会用于自动生成 flow_nodes 与 pending_lists）。
 
 【输出契约（必须遵守，否则视为失败）】
@@ -1300,7 +1669,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
 【输入（只读）】
 章节信息（必须对齐）：
-{json.dumps(chapter_info_for_prompt, ensure_ascii=False, indent=2)}
+{json.dumps(chapter_info_payload, ensure_ascii=False, indent=2)}
 {chapter_plan_context}
 
 【故事配置摘要（只读）】
@@ -1315,11 +1684,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 【角色列表（只读，speaker 必须取自此列表；旁白/叙述除外）】
 {char_block}
 
-【步骤1 角色人设（只读）】
-请严格参考，保证对白与行为一致；若与章节规划冲突，以章节规划为准。
-```text
-{persona_raw if persona_raw else '(未提供步骤1人设 raw_response)'}
-```
+{step1_persona_section}
 
 【文本量硬约束（必须满足，否则视为失败）】
 - 统计口径：只统计 dialogues[].text 中的中文字符（Unicode \u4e00-\u9fff）；不统计空格、标点、英文、数字。
@@ -1330,6 +1695,13 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 【音频硬约束（必须满足）】
 - 所有 dialogues[].voice 若填写，必须以 .mp3 结尾（建议直接省略 voice，让系统生成默认 .mp3 虚拟路径）。
 - directives.bgm 若填写，必须以 .mp3 结尾（可写 id 或路径，但最终必须是 mp3）。
+
+【素材描述硬约束（必须满足）】
+- 只要在 directives 中使用了 background/cg/bgm（发生进入/切换/设置），就必须同时提供对应的详细描述字段：
+    - background -> background_desc（必须能直接用于出图提示词，包含主体画面元素、构图/镜头、光照、氛围、时代/地点细节等）
+    - cg -> cg_desc（同上，且若有人物出镜需描述动作/表情/关系/机位）
+    - bgm -> bgm_desc（必须描述情绪、速度/节奏、主要乐器/曲风、场景用途；用于后续生成统一风格BGM提示词）
+- 若某 scene 的 directives 未写 background/cg/bgm，表示沿用上一 scene，无需重复写 desc。
 
 【对白字段硬约束（必须满足）】
 - 对于“非第一人称角色”的对白：dialogues[].emotion 必填；dialogues[].portrait 必填；dialogues[].tts_ext 必填（即使 voice 省略也必须提供）。
@@ -1345,6 +1717,17 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
     - choice：options[].node 必须存在（可空，但必须有该对象以承载对白/过渡/var_ops/媒体切换）。
     - condition：condition_rules[].node 与 else_node 必须存在（可空，但必须有该对象）。
 - 为避免 Step5 生成重复节点：如果你使用了 exit.type=choice/condition，请不要在 scenes 的最后一个 scene 再重复输出同类 choice/condition。
+
+【选择节点与附属文本节点（必须严格遵守，否则会导致流程图重复/断链）】
+当 exit.type=choice 或 exit.type=condition 时：
+1) 章末出口只用 exit 表达；不要在 scenes 末尾再写 choice/condition。
+2) 每个分支的附属文本节点只写“即时反馈”（建议 1~2 句，且 <= 80 个中文字符）：
+    - 只能写本章收束时的情绪反应/一句话回应/镜头停留。
+    - 禁止写下游章节的关键事件链（例如“已经到达某地/接下来发生了…”）。
+    - 禁止复述下游章节 summary 中的句子与段落；宁可短，不要长。
+3) 附属文本节点的 directives 默认应为空对象 {{}}（继承上一 scene 状态）。
+    - 不要在附属节点里重复设置 background/cg/bgm。
+    - 若确实必须设置媒体切换，则凡写 background/cg/bgm 必须同时补齐对应 *_desc 字段。
 
 【章节内 scenes 与章末 exit 的职责（工程化约束）】
 - scenes 用于本章内部叙事与（可选）章节内分支结构；默认不要在 scenes 的 choice/condition 里做跨章节跳转。
@@ -1382,15 +1765,15 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
             "directives": {{
                 "background": "bg_id_or_path (可选，例 bg_001 或 resources/images/bg_001.png)",
-                "background_desc": "string (可选：背景详细画面描述，建议可直接用于出图提示词)",
+                "background_desc": "string (当设置/切换 background 时必填：背景详细画面描述)",
                 "time_weather": "string (可选：时间/天气，如'傍晚小雨')",
                 "atmosphere": "string (可选：氛围关键词，如'压抑、温暖')",
 
                 "cg": "cg_id_or_path (可选，视为背景切换到 resources/images/cg/...)",
-                "cg_desc": "string (可选：CG 详细画面描述，建议可直接用于出图提示词)",
+                "cg_desc": "string (当设置/切换 cg 时必填：CG 详细画面描述)",
 
                 "bgm": "bgm_id_or_path (可选，例 bgm_01 或 resources/audios/bgm_01.mp3)",
-                "bgm_desc": "string (可选：BGM 详细描述，建议可用于生成提示)",
+                "bgm_desc": "string (当设置/切换 bgm 时必填：BGM 详细描述)",
                 "mood": "string (可选：BGM 情绪关键词，如'紧张、温柔')",
                 "style": "string (可选：BGM 曲风/乐器关键词，如'钢琴、弦乐')",
                 "stop_bgm": false,
@@ -1468,7 +1851,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     ],
                     "node": {{
                         "title": "可选：选项后即时反馈",
-                        "directives": {{"background": "bg_id_or_path", "bgm": "bgm_id_or_path", "stop_bgm": false, "ui_file": "ui_id_or_path", "video": "video_id_or_path", "hide_textbox": false}},
+                        "directives": {{}},
                         "dialogues": [
                             {{"speaker": "角色名", "text": "选项后立刻发生的对白/旁白（不要写后续章节关键事件）", "emotion": "calm", "tts_ext": {{"happy": 0, "angry": 0, "sad": 0, "afraid": 0, "disgusted": 0, "melancholic": 0, "surprised": 0, "calm": 1}}, "portrait": "resources/portraits/char_id_stand_neutral.png"}}
                         ],
@@ -1532,6 +1915,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             "enforce_cn_char_count": bool(target_words > 0),
             "enforce_audio_mp3": True,
             "has_chapters_plan": bool(isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list)),
+            "branch_plan_for_this_chapter": branch_plan_for_this_chapter,
+            "chapters_plan_summary_by_id": chapters_plan_summary_by_id,
             "allow_loop_story": allow_loop_story,
             "has_personas_data": bool(personas_data),
         }
@@ -1548,20 +1933,29 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         """统计章节结构化 JSON 中 dialogues[].text 的中文字符数。"""
         if not isinstance(structured, dict):
             return 0
+
         total = 0
-        scenes = structured.get("scenes")
-        if isinstance(scenes, list):
-            for scene in scenes:
-                if not isinstance(scene, dict):
-                    continue
-                dialogues = scene.get("dialogues")
-                if not isinstance(dialogues, list):
-                    continue
-                for d in dialogues:
-                    if not isinstance(d, dict):
-                        continue
-                    total += self._count_cn_chars(str(d.get("text") or ""))
-        return total
+
+        def _walk(obj: Any, depth: int = 0) -> None:
+            nonlocal total
+            if depth > 12:
+                return
+            if isinstance(obj, dict):
+                dgs = obj.get("dialogues")
+                if isinstance(dgs, list):
+                    for d in dgs:
+                        if isinstance(d, dict):
+                            total += self._count_cn_chars(str(d.get("text") or ""))
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for it in obj:
+                    if isinstance(it, (dict, list)):
+                        _walk(it, depth + 1)
+
+        _walk(structured)
+        return int(total)
 
     def _normalize_audio_paths_mp3_in_chapter_struct(self, structured: Any) -> Any:
         """把 structured 里的 voice/bgm 归一化为 .mp3（仅对缺扩展名/非 mp3 的情况做温和修正）。"""
@@ -1584,21 +1978,378 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
             # 有扩展名但不是 mp3：替换为 .mp3
             return re.sub(r"\.[A-Za-z0-9]+$", ".mp3", s)
 
-        scenes = structured.get("scenes")
-        if isinstance(scenes, list):
-            for scene in scenes:
-                if not isinstance(scene, dict):
-                    continue
-                directives = scene.get("directives")
+        def _walk(obj: Any, depth: int = 0) -> None:
+            if depth > 12:
+                return
+            if isinstance(obj, dict):
+                directives = obj.get("directives")
                 if isinstance(directives, dict) and directives.get("bgm"):
                     directives["bgm"] = _to_mp3(directives.get("bgm"))
-                dialogues = scene.get("dialogues")
+                dialogues = obj.get("dialogues")
                 if isinstance(dialogues, list):
                     for d in dialogues:
                         if not isinstance(d, dict):
                             continue
                         if d.get("voice"):
                             d["voice"] = _to_mp3(d.get("voice"))
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        _walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for it in obj:
+                    if isinstance(it, (dict, list)):
+                        _walk(it, depth + 1)
+
+        _walk(structured)
+        return structured
+
+    # ==================== Step4：exit/附属节点一致性与去重 ====================
+
+    def _structured_append_warning(self, structured: Dict[str, Any], warn: Dict[str, Any]) -> None:
+        if not isinstance(structured, dict) or not isinstance(warn, dict):
+            return
+        if not isinstance(structured.get("warnings"), list):
+            structured["warnings"] = []
+        structured["warnings"].append(warn)
+
+    @staticmethod
+    def _cn_only(text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        return "".join(re.findall(r"[\u4e00-\u9fff]", text))
+
+    def _sanitize_node_directives_missing_desc(
+        self,
+        structured: Dict[str, Any],
+        directives: Any,
+        *,
+        where: str,
+    ) -> Dict[str, Any]:
+        if not isinstance(directives, dict):
+            return {}
+
+        changed = False
+
+        if directives.get("background") and not directives.get("background_desc"):
+            directives.pop("background", None)
+            directives.pop("background_desc", None)
+            changed = True
+        if directives.get("cg") and not directives.get("cg_desc"):
+            directives.pop("cg", None)
+            directives.pop("cg_desc", None)
+            changed = True
+        if directives.get("bgm") and not directives.get("bgm_desc"):
+            directives.pop("bgm", None)
+            directives.pop("bgm_desc", None)
+            # mood/style 也通常与 bgm 配对，避免残留
+            directives.pop("mood", None)
+            directives.pop("style", None)
+            changed = True
+
+        if changed:
+            self._structured_append_warning(
+                structured,
+                {
+                    "type": "node_directives_stripped_missing_desc",
+                    "message": f"{where} 的 directives 含媒体字段但缺少对应 desc，已自动移除媒体字段以继承上一 scene。",
+                },
+            )
+        return directives
+
+    def _truncate_dialogues_cn(
+        self,
+        structured: Dict[str, Any],
+        dialogues: Any,
+        *,
+        max_cn_chars: int,
+        where: str,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(dialogues, list):
+            return []
+        if max_cn_chars <= 0:
+            return [d for d in dialogues if isinstance(d, dict)]
+
+        total_before = 0
+        try:
+            for d in dialogues:
+                if isinstance(d, dict):
+                    total_before += self._count_cn_chars(str(d.get("text") or ""))
+        except Exception:
+            total_before = 0
+
+        cur = 0
+        out: List[Dict[str, Any]] = []
+        for d in dialogues:
+            if not isinstance(d, dict):
+                continue
+            txt = str(d.get("text") or "")
+            cn = self._count_cn_chars(txt)
+            if cn <= 0:
+                out.append(d)
+                continue
+            if cur >= max_cn_chars:
+                break
+            remain = max_cn_chars - cur
+            if cn <= remain:
+                out.append(d)
+                cur += cn
+                continue
+            # 截断当前条
+            if remain < 10:
+                break
+            kept_chars: List[str] = []
+            cnt = 0
+            for ch in txt:
+                kept_chars.append(ch)
+                if re.match(r"[\u4e00-\u9fff]", ch):
+                    cnt += 1
+                if cnt >= remain:
+                    break
+            d2 = dict(d)
+            d2["text"] = "".join(kept_chars).rstrip("，。！？…") + "…"
+            out.append(d2)
+            cur += remain
+            break
+
+        if total_before > max_cn_chars:
+            self._structured_append_warning(
+                structured,
+                {
+                    "type": "node_dialogues_truncated",
+                    "message": f"{where} 的附属节点对白过长（{total_before} 中文字符），已截断到 <= {max_cn_chars}。",
+                    "before_cn": total_before,
+                    "after_cn": self._count_cn_chars_in_chapter_struct({"dialogues": out}),
+                },
+            )
+
+        return out
+
+    def _validate_and_sanitize_step4_exit_and_nodes(self, structured: Any, parameters: Dict[str, Any]) -> Any:
+        """Step4 输出后处理：
+
+        - 若 parameters 提供 branch_plan_for_this_chapter：强制 exit 的 type/跳转与其一致；
+        - 清理 choice/condition 附属节点：缺 desc 的媒体 directives 自动剔除；对白过长截断；
+        - 简易检测附属节点与下游章节 summary 的重复倾向并压缩。
+        """
+
+        if not isinstance(structured, dict):
+            return structured
+
+        chapter_id = str(structured.get("chapter_id") or parameters.get("chapter_id") or "").strip()
+        plan_items = parameters.get("branch_plan_for_this_chapter")
+        plan_item = None
+        if isinstance(plan_items, list) and plan_items:
+            for it in plan_items:
+                if isinstance(it, dict) and str(it.get("at_chapter_id") or "").strip() == chapter_id:
+                    plan_item = it
+                    break
+            if plan_item is None and isinstance(plan_items[0], dict):
+                # 有些场景 parameters 只塞了一个 item
+                plan_item = plan_items[0]
+
+        if not isinstance(structured.get("exit"), dict):
+            structured["exit"] = {}
+        exit_obj: Dict[str, Any] = structured.get("exit") or {}
+
+        # --- 对齐 exit 与 plan ---
+        if isinstance(plan_item, dict) and plan_item:
+            ptype = str(plan_item.get("type") or "").strip().lower()
+            etype = str(exit_obj.get("type") or "").strip().lower()
+
+            if ptype and etype and ptype != etype:
+                self._structured_append_warning(
+                    structured,
+                    {
+                        "type": "exit_type_mismatch",
+                        "message": f"exit.type={etype} 与 Step3 branch_plan.type={ptype} 不一致，已按 branch_plan 纠正。",
+                        "chapter_id": chapter_id,
+                    },
+                )
+            if ptype:
+                exit_obj["type"] = ptype
+
+            if ptype == "linear":
+                nxt = str(plan_item.get("next_chapter_id") or "").strip()
+                if nxt:
+                    exit_obj["next_chapter_id"] = nxt
+                exit_obj.pop("choice", None)
+                exit_obj.pop("condition", None)
+            elif ptype == "end":
+                exit_obj.pop("next_chapter_id", None)
+                exit_obj.pop("choice", None)
+                exit_obj.pop("condition", None)
+            elif ptype == "choice":
+                # 以 plan 的 next_chapter_id/var_ops 为准；尽量复用现有 node（保留对白）
+                existing_choice = exit_obj.get("choice") if isinstance(exit_obj.get("choice"), dict) else {}
+                existing_opts = existing_choice.get("options") if isinstance(existing_choice.get("options"), list) else []
+                existing_by_next: Dict[str, Dict[str, Any]] = {}
+                for o in existing_opts:
+                    if isinstance(o, dict):
+                        k = str(o.get("next_chapter_id") or "").strip()
+                        if k and k not in existing_by_next:
+                            existing_by_next[k] = o
+
+                new_choice: Dict[str, Any] = dict(existing_choice)
+                if str(plan_item.get("prompt") or "").strip():
+                    new_choice["prompt"] = str(plan_item.get("prompt") or "").strip()
+                plan_opts = plan_item.get("options") if isinstance(plan_item.get("options"), list) else []
+                rebuilt: List[Dict[str, Any]] = []
+                for i, po in enumerate(plan_opts):
+                    if not isinstance(po, dict):
+                        continue
+                    nxt = str(po.get("next_chapter_id") or "").strip()
+                    base = dict(po)
+                    if not isinstance(base.get("var_ops"), list):
+                        base["var_ops"] = []
+                    # 复用现有 node
+                    ex = existing_by_next.get(nxt) if nxt else None
+                    node = None
+                    if isinstance(ex, dict) and isinstance(ex.get("node"), dict):
+                        node = dict(ex.get("node") or {})
+                    elif isinstance(base.get("node"), dict):
+                        node = dict(base.get("node") or {})
+                    else:
+                        node = {}
+                    if not isinstance(node.get("directives"), dict):
+                        node["directives"] = {}
+                    if not isinstance(node.get("dialogues"), list):
+                        node["dialogues"] = []
+                    base["node"] = node
+                    rebuilt.append(base)
+                new_choice["options"] = rebuilt
+                exit_obj["choice"] = new_choice
+                exit_obj.pop("next_chapter_id", None)
+                exit_obj.pop("condition", None)
+            elif ptype == "condition":
+                existing_cond = exit_obj.get("condition") if isinstance(exit_obj.get("condition"), dict) else {}
+                plan_cond = plan_item.get("condition") if isinstance(plan_item.get("condition"), dict) else {}
+                ex_rules = existing_cond.get("condition_rules") if isinstance(existing_cond.get("condition_rules"), list) else []
+                ex_by_next: Dict[str, Dict[str, Any]] = {}
+                for r in ex_rules:
+                    if isinstance(r, dict):
+                        k = str(r.get("next_chapter_id") or "").strip()
+                        if k and k not in ex_by_next:
+                            ex_by_next[k] = r
+
+                merged: Dict[str, Any] = dict(existing_cond)
+                # prompt 在 exit 顶层已有约束，这里不强制写入
+                plan_rules = plan_cond.get("condition_rules") if isinstance(plan_cond.get("condition_rules"), list) else []
+                rebuilt_rules: List[Dict[str, Any]] = []
+                for pr in plan_rules:
+                    if not isinstance(pr, dict):
+                        continue
+                    nxt = str(pr.get("next_chapter_id") or "").strip()
+                    base = dict(pr)
+                    if not isinstance(base.get("var_ops"), list):
+                        base["var_ops"] = []
+                    node = None
+                    exr = ex_by_next.get(nxt) if nxt else None
+                    if isinstance(exr, dict) and isinstance(exr.get("node"), dict):
+                        node = dict(exr.get("node") or {})
+                    elif isinstance(base.get("node"), dict):
+                        node = dict(base.get("node") or {})
+                    else:
+                        node = {}
+                    if not isinstance(node.get("directives"), dict):
+                        node["directives"] = {}
+                    if not isinstance(node.get("dialogues"), list):
+                        node["dialogues"] = []
+                    base["node"] = node
+                    rebuilt_rules.append(base)
+                merged["condition_rules"] = rebuilt_rules
+                enxt = str(plan_cond.get("else_next_chapter_id") or "").strip()
+                if enxt:
+                    merged["else_next_chapter_id"] = enxt
+                if not isinstance(merged.get("else_var_ops"), list):
+                    merged["else_var_ops"] = plan_cond.get("else_var_ops") if isinstance(plan_cond.get("else_var_ops"), list) else []
+                else_node = None
+                if isinstance(existing_cond.get("else_node"), dict):
+                    else_node = dict(existing_cond.get("else_node") or {})
+                elif isinstance(plan_cond.get("else_node"), dict):
+                    else_node = dict(plan_cond.get("else_node") or {})
+                else:
+                    else_node = {}
+                if not isinstance(else_node.get("directives"), dict):
+                    else_node["directives"] = {}
+                if not isinstance(else_node.get("dialogues"), list):
+                    else_node["dialogues"] = []
+                merged["else_node"] = else_node
+                exit_obj["condition"] = merged
+                exit_obj.pop("next_chapter_id", None)
+                exit_obj.pop("choice", None)
+
+        # --- 清理附属节点：choice/condition node ---
+        summary_by_id = parameters.get("chapters_plan_summary_by_id") if isinstance(parameters.get("chapters_plan_summary_by_id"), dict) else {}
+        etype2 = str(exit_obj.get("type") or "").strip().lower()
+
+        def _maybe_dedupe_and_shorten(node: Dict[str, Any], *, next_chapter_id: str, where: str) -> None:
+            node["directives"] = self._sanitize_node_directives_missing_desc(structured, node.get("directives"), where=where)
+            node["dialogues"] = self._truncate_dialogues_cn(structured, node.get("dialogues"), max_cn_chars=90, where=where)
+
+            try:
+                nxt_sum = str(summary_by_id.get(next_chapter_id) or "").strip()
+                if not nxt_sum:
+                    return
+                node_text = "".join(
+                    [str(d.get("text") or "") for d in (node.get("dialogues") or []) if isinstance(d, dict)]
+                )
+                a = self._cn_only(node_text)
+                b = self._cn_only(nxt_sum)
+                if not a or not b or len(a) < 20 or len(b) < 80:
+                    return
+                a3 = {a[i : i + 3] for i in range(0, max(0, len(a) - 2))}
+                b3 = {b[i : i + 3] for i in range(0, max(0, len(b) - 2))}
+                if not a3 or not b3:
+                    return
+                jac = len(a3 & b3) / float(len(a3 | b3))
+                if jac >= 0.30:
+                    self._structured_append_warning(
+                        structured,
+                        {
+                            "type": "node_possible_duplicate_with_next_chapter",
+                            "message": f"{where} 的内容与下游章节 {next_chapter_id} 的 summary 相似度较高（Jaccard≈{jac:.2f}），已进一步压缩为更短的即时反馈。",
+                            "next_chapter_id": next_chapter_id,
+                            "similarity": round(jac, 3),
+                        },
+                    )
+                    node["dialogues"] = self._truncate_dialogues_cn(structured, node.get("dialogues"), max_cn_chars=60, where=where)
+            except Exception:
+                return
+
+        if etype2 == "choice":
+            choice_obj = exit_obj.get("choice") if isinstance(exit_obj.get("choice"), dict) else None
+            if isinstance(choice_obj, dict):
+                opts = choice_obj.get("options") if isinstance(choice_obj.get("options"), list) else []
+                for i, opt in enumerate(opts):
+                    if not isinstance(opt, dict):
+                        continue
+                    nxt = str(opt.get("next_chapter_id") or "").strip()
+                    node = opt.get("node") if isinstance(opt.get("node"), dict) else {}
+                    _maybe_dedupe_and_shorten(node, next_chapter_id=nxt, where=f"exit.choice.options[{i}].node")
+                    opt["node"] = node
+                choice_obj["options"] = opts
+                exit_obj["choice"] = choice_obj
+
+        if etype2 == "condition":
+            cond_obj = exit_obj.get("condition") if isinstance(exit_obj.get("condition"), dict) else None
+            if isinstance(cond_obj, dict):
+                rules = cond_obj.get("condition_rules") if isinstance(cond_obj.get("condition_rules"), list) else []
+                for i, r in enumerate(rules):
+                    if not isinstance(r, dict):
+                        continue
+                    nxt = str(r.get("next_chapter_id") or "").strip()
+                    node = r.get("node") if isinstance(r.get("node"), dict) else {}
+                    _maybe_dedupe_and_shorten(node, next_chapter_id=nxt, where=f"exit.condition.condition_rules[{i}].node")
+                    r["node"] = node
+                cond_obj["condition_rules"] = rules
+
+                enxt = str(cond_obj.get("else_next_chapter_id") or "").strip()
+                else_node = cond_obj.get("else_node") if isinstance(cond_obj.get("else_node"), dict) else {}
+                _maybe_dedupe_and_shorten(else_node, next_chapter_id=enxt, where="exit.condition.else_node")
+                cond_obj["else_node"] = else_node
+                exit_obj["condition"] = cond_obj
+
+        structured["exit"] = exit_obj
         return structured
 
     def _ensure_tts_ext_for_non_first_person_dialogues(self, structured: Any, parameters: Dict[str, Any]) -> Any:
@@ -1739,7 +2490,9 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
     def generate_chapter_detail(
         self,
         instruction: str,
-        parameters: Dict[str, Any]
+        parameters: Dict[str, Any],
+        *,
+        conversation: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         生成单个章节的详细内容
@@ -1760,12 +2513,22 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 step_key="step4",
                 default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step4", 64000)),
             )
-            text, structured = self._call_llm(
-                instruction,
-                system="你是GalGame剧本作者，请输出包含对白与资源标注的章节文本。",
-                max_tokens=max_tokens,
-                temperature=0.7,
-            )
+            if conversation is None:
+                text, structured = self._call_llm(
+                    instruction,
+                    system="你是GalGame剧本作者，请输出包含对白与资源标注的章节文本。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
+                conv = None
+            else:
+                conv = self._append_user_message(conversation, instruction)
+                text, structured, conv = self._call_llm_with_messages(
+                    conv,
+                    system="你是GalGame剧本作者，请输出包含对白与资源标注的章节文本。",
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
 
             detail = {
                 "chapter_index": chapter_index,
@@ -1774,6 +2537,9 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "parameters": parameters,
             }
+
+            if conv is not None:
+                detail["conversation"] = conv
 
             # 归一化：确保 voice/bgm 为 mp3（避免后续流程生成非 mp3）
             try:
@@ -1787,6 +2553,12 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     detail.get("structured"),
                     parameters,
                 )
+            except Exception:
+                pass
+
+            # 校验/修正：exit 与 Step3 branch_plan 对齐；清理附属节点过长/缺 desc 的 directives，降低 Step5 重复节点概率
+            try:
+                detail["structured"] = self._validate_and_sanitize_step4_exit_and_nodes(detail.get("structured"), parameters)
             except Exception:
                 pass
 
@@ -1819,20 +2591,33 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 enforce_mp3 = bool(parameters.get("enforce_audio_mp3", False))
                 if enforce_mp3 and isinstance(detail.get("structured"), dict):
                     violations = []
-                    for scene in (detail["structured"].get("scenes") or []):
-                        if not isinstance(scene, dict):
-                            continue
-                        directives = scene.get("directives")
-                        if isinstance(directives, dict) and directives.get("bgm"):
-                            bgm = str(directives.get("bgm") or "").strip()
-                            if bgm and (not bgm.lower().endswith(".mp3")):
-                                violations.append(f"bgm={bgm}")
-                        for d in (scene.get("dialogues") or []):
-                            if not isinstance(d, dict) or not d.get("voice"):
-                                continue
-                            voice = str(d.get("voice") or "").strip()
-                            if voice and (not voice.lower().endswith(".mp3")):
-                                violations.append(f"voice={voice}")
+
+                    def _walk(obj: Any, depth: int = 0) -> None:
+                        if depth > 12:
+                            return
+                        if isinstance(obj, dict):
+                            directives = obj.get("directives")
+                            if isinstance(directives, dict) and directives.get("bgm"):
+                                bgm = str(directives.get("bgm") or "").strip()
+                                if bgm and (not bgm.lower().endswith(".mp3")):
+                                    violations.append(f"bgm={bgm}")
+                            dgs = obj.get("dialogues")
+                            if isinstance(dgs, list):
+                                for d in dgs:
+                                    if not isinstance(d, dict) or not d.get("voice"):
+                                        continue
+                                    voice = str(d.get("voice") or "").strip()
+                                    if voice and (not voice.lower().endswith(".mp3")):
+                                        violations.append(f"voice={voice}")
+                            for v in obj.values():
+                                if isinstance(v, (dict, list)):
+                                    _walk(v, depth + 1)
+                        elif isinstance(obj, list):
+                            for it in obj:
+                                if isinstance(it, (dict, list)):
+                                    _walk(it, depth + 1)
+
+                    _walk(detail["structured"])
                     if violations:
                         raise ValueError("章节音频格式不达标（必须 .mp3）：" + "; ".join(violations))
             except Exception:
@@ -1844,6 +2629,286 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         except Exception as e:
             self.logger.error(f"生成第{chapter_index+1}章详细内容失败: {e}")
             raise
+
+    def continue_chapter_detail_word_compensation(
+        self,
+        chapter_detail: Dict[str, Any],
+        parameters: Dict[str, Any],
+        *,
+        conversation: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """字数补偿续写：在同一对话上下文中请求 append_scenes 并合并回章节 structured。"""
+
+        if not isinstance(chapter_detail, dict):
+            return chapter_detail
+        structured = chapter_detail.get("structured")
+        if not isinstance(structured, dict):
+            return chapter_detail
+
+        try:
+            max_tokens = self._resolve_max_tokens(
+                parameters,
+                step_key="step4",
+                default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step4", 64000)),
+            )
+        except Exception:
+            max_tokens = int(self.DEFAULT_STEP_MAX_TOKENS.get("step4", 64000))
+
+        min_cn = 0
+        max_cn = 0
+        try:
+            min_cn = int((parameters or {}).get("cn_char_min") or 0)
+            max_cn = int((parameters or {}).get("cn_char_max") or 0)
+        except Exception:
+            min_cn, max_cn = 0, 0
+
+        cn_chars = self._count_cn_chars_in_chapter_struct(structured)
+        chapter_detail.setdefault("metrics", {})
+        if isinstance(chapter_detail.get("metrics"), dict):
+            chapter_detail["metrics"]["cn_char_count"] = cn_chars
+
+        if min_cn <= 0 or cn_chars >= min_cn:
+            return chapter_detail
+
+        remain = max(1, min_cn - cn_chars)
+        follow = (
+            "你上一条输出的章节详稿中文字符数不足。"
+            f"当前 cn_char_count={cn_chars}，目标范围={min_cn}~{max_cn}。\n"
+            "请在【不重复已有对白/旁白】且【不改变既有 exit 规划】的前提下，继续补写本章内容，"
+            f"至少补足约 {remain} 个中文字符（允许略超，但不要超过上限）。\n\n"
+            "【输出契约】\n"
+            "- 仅输出一个 JSON 对象（不要解释文字）。\n"
+            "- 结构为：{\"append_scenes\": [...]}\n"
+            "- append_scenes 内的 scene 结构必须与原 Schema 的 scenes[] 完全一致。\n"
+        )
+
+        conv = self._append_user_message(conversation, follow)
+        cont_text, cont_struct, conv = self._call_llm_with_messages(
+            conv,
+            system="你是GalGame剧本作者，请输出包含对白与资源标注的章节文本。",
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
+
+        merged = self._merge_step4_append_payload(structured, cont_struct)
+        try:
+            merged = self._normalize_audio_paths_mp3_in_chapter_struct(merged)
+        except Exception:
+            pass
+        try:
+            merged = self._ensure_tts_ext_for_non_first_person_dialogues(merged, parameters)
+        except Exception:
+            pass
+
+        chapter_detail["structured"] = merged
+        chapter_detail.setdefault("continuations", [])
+        if isinstance(chapter_detail.get("continuations"), list):
+            chapter_detail["continuations"].append({"raw_response": cont_text, "structured": cont_struct})
+        chapter_detail["conversation"] = conv
+
+        # 更新计数与警告
+        cn_chars2 = self._count_cn_chars_in_chapter_struct(merged)
+        if isinstance(chapter_detail.get("metrics"), dict):
+            chapter_detail["metrics"]["cn_char_count"] = cn_chars2
+        if min_cn > 0 and max_cn > 0 and (cn_chars2 < min_cn or cn_chars2 > max_cn):
+            chapter_detail.setdefault("warnings", [])
+            if isinstance(chapter_detail.get("warnings"), list):
+                chapter_detail["warnings"].append(
+                    {
+                        "type": "cn_char_out_of_range",
+                        "message": f"章节中文字符数不达标：当前 {cn_chars2}，目标 {min_cn}~{max_cn}。",
+                        "cn_char_count": cn_chars2,
+                        "cn_char_min": min_cn,
+                        "cn_char_max": max_cn,
+                    }
+                )
+
+        return chapter_detail
+
+    # ==================== LLM：统一生成资源提示词（背景/CG/BGM） ====================
+
+    def generate_material_prompts(
+        self,
+        pending_lists: PendingLists,
+        story_config: Optional[Dict[str, Any]] = None,
+        personas_data: Any = None,
+        outline_data: Any = None,
+        chapters_plan: Optional[Dict[str, Any]] = None,
+        *,
+        max_tokens: int = 8000,
+        temperature: float = 0.4,
+    ) -> Dict[str, Any]:
+        """用 LLM 为待生成列表生成统一风格 prompts（仅 backgrounds/cgs/bgms）。"""
+
+        instruction, params = self.prepare_material_prompts_instruction(
+            pending_lists,
+            story_config=story_config,
+            personas_data=personas_data,
+            outline_data=outline_data,
+            chapters_plan=chapters_plan,
+        )
+        params = dict(params or {})
+        params["max_tokens"] = int(max_tokens or params.get("max_tokens") or 8000)
+        params["temperature"] = float(temperature)
+        return self.generate_material_prompts_from_instruction(
+            instruction,
+            params,
+            pending_lists=pending_lists,
+            temperature=float(temperature),
+        )
+
+    def prepare_material_prompts_instruction(
+        self,
+        pending_lists: PendingLists,
+        story_config: Optional[Dict[str, Any]] = None,
+        personas_data: Any = None,
+        outline_data: Any = None,
+        chapters_plan: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """准备 Step5（背景/CG/BGM）素材 prompts 生成指令（可供 UI 保存/编辑后发送）。"""
+
+        story_cfg = story_config or {}
+        style = str(story_cfg.get("style", "") or "").strip()
+
+        bgs = [
+            {
+                "item_id": it.item_id,
+                "bg_id": it.bg_id,
+                "description": it.description,
+                "atmosphere": it.atmosphere,
+                "time_weather": it.time_weather,
+            }
+            for it in (pending_lists.backgrounds or [])
+        ]
+        cgs = [
+            {
+                "item_id": it.item_id,
+                "cg_id": it.cg_id,
+                "description": it.description,
+                "characters": it.characters,
+                "atmosphere": it.atmosphere,
+            }
+            for it in (pending_lists.cgs or [])
+        ]
+        bgms = [
+            {
+                "item_id": it.item_id,
+                "bgm_id": it.bgm_id,
+                "description": it.description,
+                "mood": it.mood,
+                "style": it.style,
+            }
+            for it in (pending_lists.bgms or [])
+        ]
+
+        context = {
+            "story_style": style,
+            "step1_personas": (personas_data or {}).get("structured") if isinstance(personas_data, dict) else None,
+            "step2_outline": (outline_data or {}).get("structured") if isinstance(outline_data, dict) else None,
+            "step3_chapters": (chapters_plan or {}).get("structured") if isinstance(chapters_plan, dict) else None,
+        }
+
+        instruction = f"""你是提示词工程师。请为视觉小说资源生成统一风格的英文提示词（prompt），用于：
+- 背景图（background）
+- 事件CG（cg）
+- BGM（bgm）
+
+风格基调（仅供参考）：{style or '未指定'}
+
+【硬约束】
+1) 仅输出一个 JSON 对象（不要解释文字）。
+2) 输出格式：
+{{
+  \"backgrounds\": [{{\"item_id\": \"...\", \"prompt\": \"...\"}}],
+  \"cgs\": [{{\"item_id\": \"...\", \"prompt\": \"...\"}}],
+  \"bgms\": [{{\"item_id\": \"...\", \"prompt\": \"...\"}}]
+}}
+3) item_id 必须与输入完全一致；每个输入条目都要输出对应 prompt。
+4) prompt 模板要求：
+   - background: 以 \"visual novel background (establishing shot), ...\" 开头；必须包含 \"anime style\"；必须包含 \"no characters, no subtitles, no text, no watermark, no logo\"。
+   - cg: 以 \"visual novel event CG, anime style\" 开头；必须包含 \"cinematic lighting\" 与 \"no subtitles, no on-screen text, no watermark, no logo\"。
+   - bgm: 输出一句英文描述即可，并包含 \"instrumental only\" 与 \"loop friendly\"。
+5) prompts 必须保持全局一致的“用词习惯/结构”，不要每条风格漂移。
+
+【上下文（可选，结构化）】
+{json.dumps(context, ensure_ascii=False, indent=2)}
+
+【输入条目】
+{json.dumps({'backgrounds': bgs, 'cgs': cgs, 'bgms': bgms}, ensure_ascii=False, indent=2)}
+"""
+
+        parameters = {
+            "step": "step5_prompts",
+            "backgrounds": len(bgs),
+            "cgs": len(cgs),
+            "bgms": len(bgms),
+        }
+        return instruction, parameters
+
+    def generate_material_prompts_from_instruction(
+        self,
+        instruction: str,
+        parameters: Dict[str, Any],
+        *,
+        pending_lists: PendingLists,
+        temperature: float = 0.4,
+    ) -> Dict[str, Any]:
+        """按给定指令调用 LLM 生成 prompts，并回填到 pending_lists。"""
+
+        max_tokens = self._resolve_max_tokens(
+            parameters,
+            step_key="step5_prompts",
+            default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step5_prompts", 8000)),
+        )
+        text, structured = self._call_llm(
+            instruction,
+            system="你是严格的JSON输出助手。",
+            max_tokens=max_tokens,
+            temperature=float(temperature),
+        )
+
+        try:
+            if isinstance(structured, dict):
+                bg_map = {
+                    x.get("item_id"): x.get("prompt")
+                    for x in (structured.get("backgrounds") or [])
+                    if isinstance(x, dict)
+                }
+                cg_map = {
+                    x.get("item_id"): x.get("prompt")
+                    for x in (structured.get("cgs") or [])
+                    if isinstance(x, dict)
+                }
+                bgm_map = {
+                    x.get("item_id"): x.get("prompt")
+                    for x in (structured.get("bgms") or [])
+                    if isinstance(x, dict)
+                }
+
+                for it in pending_lists.backgrounds or []:
+                    p = bg_map.get(it.item_id)
+                    if isinstance(p, str) and p.strip():
+                        it.prompt = p.strip()
+
+                for it in pending_lists.cgs or []:
+                    p = cg_map.get(it.item_id)
+                    if isinstance(p, str) and p.strip():
+                        it.prompt = p.strip()
+
+                for it in pending_lists.bgms or []:
+                    p = bgm_map.get(it.item_id)
+                    if isinstance(p, str) and p.strip():
+                        it.prompt = p.strip()
+        except Exception:
+            pass
+
+        return {
+            "pending_lists": pending_lists,
+            "raw_response": text,
+            "structured": structured,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "parameters": parameters or {},
+        }
 
     def _normalize_chapter_detail(self, chapter: Any) -> Dict[str, Any]:
         """防止章节详情被重复json序列化，尽量还原为标准dict。"""

@@ -86,7 +86,7 @@ class AIAssistDialog(QDialog):
         path_row.addWidget(browse_btn)
         self.window_w = QSpinBox(); self.window_w.setRange(320, 4096)
         self.window_h = QSpinBox(); self.window_h.setRange(240, 4096)
-        self.engine_ver = QLineEdit("V2.0-AI")
+        self.engine_ver = QLineEdit("V2.7-AI")
         form.addRow("工程名称", self.project_name)
         form.addRow("工程路径", path_row)
         form.addRow("窗口宽度", self.window_w)
@@ -545,7 +545,7 @@ class AIAssistDialog(QDialog):
         self.project_path.setText(proj.get("resource_root", "output/projects"))
         self.window_w.setValue(int(proj.get("default_window_width", 1280)))
         self.window_h.setValue(int(proj.get("default_window_height", 720)))
-        self.engine_ver.setText(proj.get("engine_version", "V2.0-AI"))
+        self.engine_ver.setText(proj.get("engine_version", "V2.7-AI"))
 
         self.story_title.setText(story_cfg.get("title", ""))
         self.story_style.setText(story_cfg.get("style", ""))
@@ -640,7 +640,7 @@ class AIAssistDialog(QDialog):
             "resource_root": self.project_path.text().strip() or "output/projects",
             "default_window_width": int(self.window_w.value()),
             "default_window_height": int(self.window_h.value()),
-            "engine_version": self.engine_ver.text().strip() or "V2.0-AI",
+            "engine_version": self.engine_ver.text().strip() or "V2.7-AI",
         })
 
         cfg["story_config"].update({

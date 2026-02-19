@@ -126,7 +126,8 @@ class PropertiesDock(QDockWidget):
         form.addRow("标题", self.title_edit)
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["文本", "选择", "条件", "功能"])
+        # 通用节点类型（不包含功能节点；功能节点是独立类型，不可在此下拉中选择）
+        self.type_combo.addItems(["文本", "选择", "条件"])
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         form.addRow("节点类型", self.type_combo)
         section.setContentLayout(form)
@@ -412,6 +413,11 @@ class PropertiesDock(QDockWidget):
         self.choice_hide_chk.stateChanged.connect(self._on_choice_info_changed)
         info_form.addRow("", self.choice_hide_chk)
 
+        self.choice_skip_dialogue_chk = QCheckBox("跳过本节点对白（进入节点时直接弹出选项）")
+        self.choice_skip_dialogue_chk.setToolTip("勾选后，从上游进入该节点时将跳过文本/语音/立绘等展示，直接进入选项界面")
+        self.choice_skip_dialogue_chk.stateChanged.connect(self._on_choice_info_changed)
+        info_form.addRow("", self.choice_skip_dialogue_chk)
+
         self.choice_portrait_fade_chk = QCheckBox("立绘淡入")
         self.choice_portrait_fade_chk.stateChanged.connect(self._on_choice_info_changed)
         info_form.addRow("", self.choice_portrait_fade_chk)
@@ -602,6 +608,11 @@ class PropertiesDock(QDockWidget):
         self.cond_hide_chk = QCheckBox("隐藏文本框")
         self.cond_hide_chk.stateChanged.connect(self._on_cond_info_changed)
         info_form.addRow("", self.cond_hide_chk)
+
+        self.cond_skip_dialogue_chk = QCheckBox("跳过本节点对白（进入节点时直接判定并跳转）")
+        self.cond_skip_dialogue_chk.setToolTip("勾选后，从上游进入该节点时将跳过文本/语音/立绘等展示，直接进行条件判断并走对应分支")
+        self.cond_skip_dialogue_chk.stateChanged.connect(self._on_cond_info_changed)
+        info_form.addRow("", self.cond_skip_dialogue_chk)
 
         self.cond_portrait_fade_chk = QCheckBox("立绘淡入")
         self.cond_portrait_fade_chk.stateChanged.connect(self._on_cond_info_changed)
@@ -906,13 +917,29 @@ class PropertiesDock(QDockWidget):
         self._set_enabled(True)
         self.title_edit.setText(getattr(node, "_title", ""))
         node_type = getattr(node, "node_type", "text")
-        self._set_type_index(node_type)
-
         is_function = str(node_type or "").lower() == "function"
+        # 功能节点：类型固定，不允许在下拉里切换；但仍可进入功能节点编辑页
         try:
-            self.type_combo.setEnabled(not is_function)
+            self.type_combo.blockSignals(True)
+            if is_function:
+                self.type_combo.clear()
+                self.type_combo.addItems(["功能"])
+                self.type_combo.setCurrentIndex(0)
+                self.type_combo.setEnabled(False)
+            else:
+                # 恢复通用节点类型下拉
+                if self.type_combo.count() != 3 or self.type_combo.itemText(0) != "文本":
+                    self.type_combo.clear()
+                    self.type_combo.addItems(["文本", "选择", "条件"])
+                self.type_combo.setEnabled(True)
+                self._set_type_index(node_type)
         except Exception:
             pass
+        finally:
+            try:
+                self.type_combo.blockSignals(False)
+            except Exception:
+                pass
 
         # 功能节点不需要媒体/UI 面板（依赖宿主节点渲染配置）
         try:
@@ -978,6 +1005,8 @@ class PropertiesDock(QDockWidget):
         self.choice_portrait_edit.setText(getattr(node, "portrait", ""))
         self.choice_portrait2_edit.setText(getattr(node, "portrait2", ""))
         self.choice_hide_chk.setChecked(bool(getattr(node, "hide_textbox", False)))
+        if hasattr(self, "choice_skip_dialogue_chk"):
+            self.choice_skip_dialogue_chk.setChecked(bool(getattr(node, "skip_dialogue", False)))
         self.choice_portrait_fade_chk.setChecked(bool(getattr(node, "portrait_fade", False)))
         self.choice_portrait2_fade_chk.setChecked(bool(getattr(node, "portrait2_fade", False)))
         if hasattr(self, "choice_text_style_enable_chk"):
@@ -991,6 +1020,8 @@ class PropertiesDock(QDockWidget):
         self.cond_portrait_edit.setText(getattr(node, "portrait", ""))
         self.cond_portrait2_edit.setText(getattr(node, "portrait2", ""))
         self.cond_hide_chk.setChecked(bool(getattr(node, "hide_textbox", False)))
+        if hasattr(self, "cond_skip_dialogue_chk"):
+            self.cond_skip_dialogue_chk.setChecked(bool(getattr(node, "skip_dialogue", False)))
         self.cond_portrait_fade_chk.setChecked(bool(getattr(node, "portrait_fade", False)))
         self.cond_portrait2_fade_chk.setChecked(bool(getattr(node, "portrait2_fade", False)))
         if hasattr(self, "cond_text_style_enable_chk"):
@@ -1091,6 +1122,8 @@ class PropertiesDock(QDockWidget):
         self.choice_portrait_edit.setText("")
         self.choice_portrait2_edit.setText("")
         self.choice_hide_chk.setChecked(False)
+        if hasattr(self, "choice_skip_dialogue_chk"):
+            self.choice_skip_dialogue_chk.setChecked(False)
         self.choice_portrait_fade_chk.setChecked(False)
         self.choice_portrait2_fade_chk.setChecked(False)
         self.cond_speaker_edit.setText("")
@@ -1103,6 +1136,8 @@ class PropertiesDock(QDockWidget):
         self.cond_portrait_edit.setText("")
         self.cond_portrait2_edit.setText("")
         self.cond_hide_chk.setChecked(False)
+        if hasattr(self, "cond_skip_dialogue_chk"):
+            self.cond_skip_dialogue_chk.setChecked(False)
         self.cond_portrait_fade_chk.setChecked(False)
         self.cond_portrait2_fade_chk.setChecked(False)
         try:
@@ -2298,14 +2333,18 @@ class PropertiesDock(QDockWidget):
             self._update_content_stack()
             return
         idx = self.type_combo.currentIndex()
-        node_type = {0: "text", 1: "choice", 2: "condition", 3: "function"}.get(idx, "text")
+        node_type = {0: "text", 1: "choice", 2: "condition"}.get(idx, "text")
         if hasattr(self._current_node, "set_node_type"):
             self._current_node.set_node_type(node_type)
         self._update_content_stack()
 
     def _update_content_stack(self):
+        # 通用节点页：0=text/1=choice/2=condition；功能节点页固定为 index=3
+        if self._current_node is not None and str(getattr(self._current_node, "node_type", "") or "").lower() == "function":
+            self.content_stack.setCurrentIndex(3)
+            return
         idx = self.type_combo.currentIndex()
-        self.content_stack.setCurrentIndex(idx)
+        self.content_stack.setCurrentIndex(max(0, min(2, int(idx))))
 
     def _on_options_changed(self):
         # legacy handler (no-op with new list UI)
@@ -2328,6 +2367,11 @@ class PropertiesDock(QDockWidget):
             self._current_node.set_portrait2(self.choice_portrait2_edit.text())
         if hasattr(self._current_node, "set_hide_textbox"):
             self._current_node.set_hide_textbox(bool(self.choice_hide_chk.isChecked()))
+        if hasattr(self, "choice_skip_dialogue_chk"):
+            if hasattr(self._current_node, "set_skip_dialogue"):
+                self._current_node.set_skip_dialogue(bool(self.choice_skip_dialogue_chk.isChecked()))
+            else:
+                self._current_node.skip_dialogue = bool(self.choice_skip_dialogue_chk.isChecked())
         if hasattr(self._current_node, "set_portrait_fade"):
             self._current_node.set_portrait_fade(bool(self.choice_portrait_fade_chk.isChecked()))
         if hasattr(self._current_node, "set_portrait2_fade"):
@@ -2354,6 +2398,11 @@ class PropertiesDock(QDockWidget):
             self._current_node.set_portrait2(self.cond_portrait2_edit.text())
         if hasattr(self._current_node, "set_hide_textbox"):
             self._current_node.set_hide_textbox(bool(self.cond_hide_chk.isChecked()))
+        if hasattr(self, "cond_skip_dialogue_chk"):
+            if hasattr(self._current_node, "set_skip_dialogue"):
+                self._current_node.set_skip_dialogue(bool(self.cond_skip_dialogue_chk.isChecked()))
+            else:
+                self._current_node.skip_dialogue = bool(self.cond_skip_dialogue_chk.isChecked())
         if hasattr(self._current_node, "set_portrait_fade"):
             self._current_node.set_portrait_fade(bool(self.cond_portrait_fade_chk.isChecked()))
         if hasattr(self._current_node, "set_portrait2_fade"):
@@ -2568,8 +2617,11 @@ class PropertiesDock(QDockWidget):
             self._current_node.set_bg_fade_duration(float(self.bg_fade_duration_spin.value()))
 
     def _set_type_index(self, node_type: str):
-        idx = {"text": 0, "choice": 1, "condition": 2, "function": 3}.get(node_type, 0)
-        self.type_combo.setCurrentIndex(idx)
+        idx = {"text": 0, "choice": 1, "condition": 2}.get(str(node_type or "text").lower(), 0)
+        try:
+            self.type_combo.setCurrentIndex(int(idx))
+        except Exception:
+            self.type_combo.setCurrentIndex(0)
 
     # ------- 功能节点：规则编辑 -------
     def _sync_function_binding(self, node):

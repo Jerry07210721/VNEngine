@@ -146,6 +146,8 @@ class FlowTextNode(QGraphicsRectItem):
         self.video_loop = video_loop
         self.var_ops = self._normalize_var_ops(var_ops or [])
         self.hide_textbox = False
+        # choice/condition: if True, entering this node will skip dialogue presentation (designer/runtime feature)
+        self.skip_dialogue = False
         self.portrait_fade = False
         self.portrait_fade_out = False
         self.portrait2_fade = False
@@ -267,6 +269,9 @@ class FlowTextNode(QGraphicsRectItem):
 
     def set_hide_textbox(self, hide: bool):
         self.hide_textbox = bool(hide)
+
+    def set_skip_dialogue(self, skip: bool):
+        self.skip_dialogue = bool(skip)
 
     def set_portrait_fade(self, fade: bool):
         self.portrait_fade = bool(fade)
@@ -911,9 +916,9 @@ class GraphView(QGraphicsView):
 
     def contextMenuEvent(self, event):  # noqa: N802
         menu = QMenu(self)
-        add_text_action = QAction("添加文本节点", self)
+        add_text_action = QAction("添加通用节点", self)
         scene_pos = self.mapToScene(event.pos())
-        add_text_action.triggered.connect(lambda: self.add_text_node(scene_pos))
+        add_text_action.triggered.connect(lambda: self.add_generic_node(scene_pos))
         menu.addAction(add_text_action)
 
         add_func_action = QAction("添加功能节点", self)
@@ -980,6 +985,11 @@ class GraphView(QGraphicsView):
         self.scene.addItem(node)
         self._ensure_scene_contains_rect(node.sceneBoundingRect())
         return node
+
+    def add_generic_node(self, pos: QPointF):
+        """添加通用节点（默认文本节点）。"""
+
+        return self.add_text_node(pos)
 
     def add_function_node(self, pos: QPointF):
         node_id = self._node_counter
@@ -1073,6 +1083,7 @@ class GraphView(QGraphicsView):
                     "bg_fade_in": getattr(item, "bg_fade_in", False),
                     "bg_fade_duration": getattr(item, "bg_fade_duration", 0.45),
                     "hide_textbox": getattr(item, "hide_textbox", False),
+                    "skip_dialogue": getattr(item, "skip_dialogue", False),
                     "portrait_fade": getattr(item, "portrait_fade", False),
                     "portrait_fade_out": getattr(item, "portrait_fade_out", False),
                     "portrait2_fade": getattr(item, "portrait2_fade", False),
@@ -1180,6 +1191,7 @@ class GraphView(QGraphicsView):
                 on_position_changed=self.on_node_moved,
             )
             node.hide_textbox = bool(node_data.get("hide_textbox", False))
+            node.skip_dialogue = bool(node_data.get("skip_dialogue", False))
             node.portrait_fade = bool(node_data.get("portrait_fade", False))
             node.portrait_fade_out = bool(node_data.get("portrait_fade_out", False))
             node.portrait2_fade = bool(node_data.get("portrait2_fade", False))
@@ -1332,6 +1344,7 @@ class GraphView(QGraphicsView):
                         on_position_changed=self.on_node_moved,
                     )
                     node.hide_textbox = bool(node_data.get("hide_textbox", False))
+                    node.skip_dialogue = bool(node_data.get("skip_dialogue", False))
                     node.portrait_fade = bool(node_data.get("portrait_fade", False))
                     node.portrait_fade_out = bool(node_data.get("portrait_fade_out", False))
                     node.portrait2_fade = bool(node_data.get("portrait2_fade", False))
@@ -1533,6 +1546,7 @@ class GraphView(QGraphicsView):
                 on_position_changed=self.on_node_moved,
             )
             node.hide_textbox = bool(item.get("hide_textbox", False))
+            node.skip_dialogue = bool(item.get("skip_dialogue", False))
             node.portrait_fade = bool(item.get("portrait_fade", False))
             node.portrait_fade_out = bool(item.get("portrait_fade_out", False))
             node.portrait2_fade = bool(item.get("portrait2_fade", False))

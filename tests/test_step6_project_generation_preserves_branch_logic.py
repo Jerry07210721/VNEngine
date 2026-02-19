@@ -31,7 +31,7 @@ def test_step6_integrate_from_data_preserves_var_ops_and_condition_nodes():
                 project_name="TestProject",
                 window_width=1280,
                 window_height=720,
-                engine_version="V2.0-AI",
+                engine_version="V2.7-AI",
             ),
             story_config=StoryConfig(
                 title="测试故事",
