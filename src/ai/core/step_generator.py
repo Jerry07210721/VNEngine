@@ -1727,7 +1727,9 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
     - 禁止复述下游章节 summary 中的句子与段落；宁可短，不要长。
 3) 附属文本节点的 directives 默认应为空对象 {{}}（继承上一 scene 状态）。
     - 不要在附属节点里重复设置 background/cg/bgm。
-    - 若确实必须设置媒体切换，则凡写 background/cg/bgm 必须同时补齐对应 *_desc 字段。
+    - 若确实必须设置媒体切换：
+        - background/cg：凡写 background/cg 必须同时补齐对应 *_desc 字段。
+        - bgm：凡写 bgm 必须同时补齐 bgm_desc 与 bgm_tags（用于 Suno 纯音乐 tags）。
 
 【章节内 scenes 与章末 exit 的职责（工程化约束）】
 - scenes 用于本章内部叙事与（可选）章节内分支结构；默认不要在 scenes 的 choice/condition 里做跨章节跳转。
@@ -1774,6 +1776,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
                 "bgm": "bgm_id_or_path (可选，例 bgm_01 或 resources/audios/bgm_01.mp3)",
                 "bgm_desc": "string (当设置/切换 bgm 时必填：BGM 详细描述)",
+                "bgm_tags": "string (当设置/切换 bgm 时必填：Suno 纯音乐 tags；英文短词逗号分隔，3~8个，如 'ambient, cinematic, piano, strings, slow, instrumental')",
                 "mood": "string (可选：BGM 情绪关键词，如'紧张、温柔')",
                 "style": "string (可选：BGM 曲风/乐器关键词，如'钢琴、弦乐')",
                 "stop_bgm": false,
@@ -2041,10 +2044,21 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
         if directives.get("bgm") and not directives.get("bgm_desc"):
             directives.pop("bgm", None)
             directives.pop("bgm_desc", None)
+            directives.pop("bgm_tags", None)
             # mood/style 也通常与 bgm 配对，避免残留
             directives.pop("mood", None)
             directives.pop("style", None)
             changed = True
+
+        # bgm_tags 缺失时不强制移除 bgm（保持兼容），但给出 warning 方便用户/后续步骤感知
+        if directives.get("bgm") and directives.get("bgm_desc") and (not directives.get("bgm_tags")):
+            self._structured_append_warning(
+                structured,
+                {
+                    "type": "bgm_missing_tags",
+                    "message": f"{where} 的 directives 设置了 bgm 但缺少 bgm_tags（Suno tags）。建议补齐：英文短词逗号分隔的风格/情绪/乐器/节奏等标签。",
+                },
+            )
 
         if changed:
             self._structured_append_warning(
@@ -3229,6 +3243,43 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         return v.strip()
             return ""
 
+        def _normalize_tags(tags: str) -> str:
+            if not isinstance(tags, str):
+                return ""
+            s = tags.strip()
+            if not s:
+                return ""
+            # 常见分隔符归一化为逗号
+            for sep in ("，", "；", ";", "、", "|", "\n", "\t"):
+                s = s.replace(sep, ",")
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            # 去重（保序）
+            seen = set()
+            uniq: List[str] = []
+            for p in parts:
+                key = p.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(p)
+            return ", ".join(uniq[:12])
+
+        def _pick_tags_from_media_field(media_val: Any) -> str:
+            if isinstance(media_val, dict):
+                for k in ("tags", "tag", "style_tags"):
+                    v = media_val.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return _normalize_tags(v)
+            return ""
+
+        def _pick_bgm_tags(raw_item: Dict[str, Any], directives: Dict[str, Any] | None = None) -> str:
+            tags = _pick_tags_from_media_field(raw_item.get("bgm"))
+            if not tags:
+                tags = _pick_str(raw_item, ["bgm_tags", "music_tags", "bgm_tag", "music_tag"])
+            if (not tags) and isinstance(directives, dict):
+                tags = _pick_str(directives, ["bgm_tags", "music_tags", "bgm_tag", "music_tag"])
+            return _normalize_tags(tags)
+
         def _make_bg_hint(chapter_title: str, raw_item: Dict[str, Any]) -> str:
             desc = _pick_desc_from_media_field(raw_item.get("background"))
             if not desc:
@@ -3306,7 +3357,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 parts.append(f"{speaker}:{snippet}")
             return " | ".join(parts)
 
-        def _ensure_bgm_item(path: str, *, hint: str, mood: str = "") -> str:
+        def _ensure_bgm_item(path: str, *, hint: str, mood: str = "", tags: str = "") -> str:
             if not path:
                 return path
             if path in bgm_by_path:
@@ -3316,6 +3367,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         it.description = hint
                     if mood and (not it.mood):
                         it.mood = mood
+                    if tags and (not it.tags):
+                        it.tags = tags
                 except Exception:
                     pass
                 return path
@@ -3330,6 +3383,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                 duration=120,
                 loop=True,
                 status="pending",
+                tags=(tags or ""),
                 file_path=path,
             )
             return path
@@ -3991,7 +4045,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                             _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
                     if desired_state.get("bgm"):
                         bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
-                        _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+                        bgm_tags = _pick_bgm_tags(raw, directives)
+                        _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood, tags=bgm_tags)
 
                     pending_state = desired_state
                     _flush_text_node()
@@ -4146,7 +4201,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                                     _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
                             if desired_state.get("bgm"):
                                 bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
-                                _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+                                bgm_tags = _pick_bgm_tags(raw, node_directives)
+                                _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood, tags=bgm_tags)
 
                             subs = _build_sub_dialogues_from_raw_dialogues(
                                 node_dialogues,
@@ -4423,7 +4479,8 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                         _ensure_background_item(desired_state["background"], hint=_make_bg_hint(chap_title, raw))
                 if desired_state.get("bgm"):
                     bgm_mood = str(raw.get("emotion") or raw.get("tone") or "").strip()
-                    _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood)
+                    bgm_tags = _pick_bgm_tags(raw, directives)
+                    _ensure_bgm_item(desired_state["bgm"], hint=_make_bgm_hint(chap_title, raw), mood=bgm_mood, tags=bgm_tags)
 
                 speaker = (raw.get("speaker") or raw.get("role") or "").strip()
                 text = (raw.get("text") or raw.get("content") or "").strip()
@@ -4728,7 +4785,12 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                                 else:
                                     _ensure_background_item(desired_state["background"], hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}")
                             if desired_state.get("bgm"):
-                                _ensure_bgm_item(desired_state["bgm"], hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}")
+                                bgm_tags = _pick_bgm_tags(node_directives, node_directives)
+                                _ensure_bgm_item(
+                                    desired_state["bgm"],
+                                    hint=f"{structured.get('chapter_title') or chap_id} | 选项：{opt_text}",
+                                    tags=bgm_tags,
+                                )
 
                             subs: List[Dict[str, Any]] = []
                             if isinstance(node_dialogues, list) and node_dialogues:

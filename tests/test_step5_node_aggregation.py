@@ -22,7 +22,12 @@ def test_step5_text_node_aggregation_and_split_rules():
                 "chapter_title": "第1章",
                 "summary": "测试聚合",
                 "dialogues": [
-                    {"background": "bg_room", "bgm": "bgm_calm"},
+                    {
+                        "background": "bg_room",
+                        "bgm": "bgm_calm",
+                        "bgm_desc": "舒缓的室内氛围钢琴配乐，柔和不抢戏",
+                        "bgm_tags": "ambient, calm, piano, soft, slow, instrumental",
+                    },
                     {"speaker": "Alice", "text": "第一句"},
                     {"speaker": "Alice", "text": "第二句"},
                     {"background": "bg_street"},
@@ -69,6 +74,10 @@ def test_step5_text_node_aggregation_and_split_rules():
     assert len(pending.backgrounds) >= 2
     # bgm：bgm_calm + 章节默认bgm(兜底) 可能存在 >=1
     assert len(pending.bgms) >= 1
+
+    bgm_calm = next((b for b in pending.bgms if str(b.file_path or "").endswith("bgm_calm.mp3")), None)
+    assert bgm_calm is not None
+    assert "piano" in (bgm_calm.tags or "")
 
 
 def test_step5_sub_dialogue_var_ops_are_preserved_per_line():
