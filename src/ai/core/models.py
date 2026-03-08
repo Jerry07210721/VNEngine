@@ -287,6 +287,10 @@ class AIProjectInfo(BaseModel):
     last_modified_time: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     vng_project_path: Optional[str] = Field(None, description="关联的VNG工程文件路径")
     description: str = Field("", description="工程描述")
+    project_mode: Literal["generate", "import"] = Field(
+        "generate",
+        description="AI主控模式：generate=故事生成模式；import=完整故事导入模式（创建后不可修改）",
+    )
 
 
 class GenerationStep(BaseModel):
@@ -333,6 +337,13 @@ class GenerationHistory(BaseModel):
     step5_full_script: Optional[Dict[str, Any]] = Field(None, description="步骤5：完整剧本")
     step5_flow_nodes: Optional[Dict[str, Any]] = Field(None, description="步骤5：流程节点数据")
     step5_material_prompts: Optional[Dict[str, Any]] = Field(None, description="步骤5：素材提示词生成结果（背景/CG/BGM prompts）")
+
+    # 导入模式：章节“完整剧情”来源（文本/关联文件）
+    # key: chapter_id（字符串）；value: {"source": "text"|"file", "text": "...", "file_path": "..."}
+    import_chapter_sources: Dict[str, Dict[str, str]] = Field(
+        default_factory=dict,
+        description="导入模式：每章完整剧情来源（文本或关联txt文件）",
+    )
 
     # 多轮上下文对话：
     # - master_conversation：历史遗留字段，保留以兼容旧工程/调试（通常会被更新为最近一次 step1~step3 的对话）

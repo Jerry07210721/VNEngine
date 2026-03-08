@@ -39,7 +39,8 @@ class AIProjectManager:
         project_name: str,
         save_path: str,
         story_title: str = "",
-        description: str = ""
+        description: str = "",
+        project_mode: str = "generate",
     ) -> AIProject:
         """
         创建新的AI辅助工程
@@ -60,10 +61,15 @@ class AIProjectManager:
             save_path = save_path + self.EXTENSION
         
         # 创建工程数据
+        mode = str(project_mode or "generate").strip().lower()
+        if mode not in {"generate", "import"}:
+            mode = "generate"
+
         project_info = AIProjectInfo(
             name=project_name,
             description=description,
-            vng_project_path=None
+            vng_project_path=None,
+            project_mode=mode,
         )
         
         # 初始化故事配置（使用默认值）
@@ -71,7 +77,12 @@ class AIProjectManager:
             title=story_title or project_name,
             style="日系校园",
             plot_outline="",
-            text_volume=5000
+            text_volume=5000,
+            enable_single_route=True if mode == "import" else False,
+            enable_multi_branch=False,
+            enable_choice_node=False,
+            enable_condition_node=False,
+            allow_loop_story=False,
         )
         
         # 创建AI工程对象
@@ -174,6 +185,19 @@ class AIProjectManager:
         """更新剧情配置"""
         if self.current_project is None:
             return False
+
+        # 导入模式：强制单线叙事（防止 UI/其它入口绕过约束）
+        try:
+            mode = getattr(self.current_project.ai_project_info, "project_mode", "generate")
+            mode = str(mode or "generate").strip().lower()
+            if mode == "import":
+                story_config.enable_single_route = True
+                story_config.enable_multi_branch = False
+                story_config.enable_choice_node = False
+                story_config.enable_condition_node = False
+                story_config.allow_loop_story = False
+        except Exception:
+            pass
         
         self.current_project.story_config = story_config
         self.current_project.update_modified_time()

@@ -36,7 +36,7 @@ from src.designer.ai_assist_dialog import APIConfigDialog
 # 导入子界面（占位）
 from src.designer.ai_story_config_panel import AIStoryConfigPanel
 from src.designer.ai_character_config_panel import AICharacterConfigPanel
-from src.designer.ai_master_control_panel import AIMasterControlPanel
+from src.designer.ai_master_control_host_panel import AIMasterControlHostPanel
 from src.designer.ai_portrait_panel import AIPortraitPanel
 from src.designer.ai_cg_panel import AICGPanel
 from src.designer.ai_background_panel import AIBackgroundPanel
@@ -245,7 +245,7 @@ class AIProjectWindow(QMainWindow):
         # 各子界面
         self.story_panel = AIStoryConfigPanel(self.project_manager, self)
         self.character_panel = AICharacterConfigPanel(self.project_manager, self.config_manager, self)
-        self.master_panel = AIMasterControlPanel(self.project_manager, self.config_manager, self)
+        self.master_panel = AIMasterControlHostPanel(self.project_manager, self.config_manager, self)
         self.portrait_panel = AIPortraitPanel(self.project_manager, self.config_manager, self)
         self.cg_panel = AICGPanel(self.project_manager, self.config_manager, self)
         self.background_panel = AIBackgroundPanel(self.project_manager, self.config_manager, self)
@@ -415,6 +415,22 @@ class AIProjectWindow(QMainWindow):
         
         # 获取工程名称
         project_name = Path(file_path).stem
+
+        # 选择工程模式（创建后不可修改）
+        mode_box = QMessageBox(self)
+        mode_box.setWindowTitle("选择模式")
+        mode_box.setIcon(QMessageBox.Icon.Question)
+        mode_box.setText("请选择 AI 主控模式（创建后不可修改）：")
+        btn_generate = mode_box.addButton("生成模式（当前逻辑）", QMessageBox.ButtonRole.AcceptRole)
+        btn_import = mode_box.addButton("导入模式（完整故事转视觉小说）", QMessageBox.ButtonRole.ActionRole)
+        mode_box.addButton(QMessageBox.StandardButton.Cancel)
+        mode_box.setDefaultButton(btn_generate)
+        mode_box.exec()
+
+        clicked = mode_box.clickedButton()
+        if clicked is None or clicked == mode_box.button(QMessageBox.StandardButton.Cancel):
+            return
+        project_mode = "import" if clicked == btn_import else "generate"
         
         if self._io_runner.is_running():
             QMessageBox.information(self, "提示", "正在执行文件操作，请稍候...")
@@ -434,6 +450,7 @@ class AIProjectWindow(QMainWindow):
                 project_name=project_name,
                 save_path=file_path,
                 story_title=project_name,
+                project_mode=project_mode,
             )
 
         def _on_success(project):

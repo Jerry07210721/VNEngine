@@ -361,6 +361,9 @@ class AIStoryConfigPanel(AIBasePanelWidget):
 
             # 刷新后同步“单线/多分支/节点开关”约束
             self._apply_story_mode_constraints()
+
+            # 导入模式：锁定为单线叙事（创建后不可修改类型；此处禁用多分支相关控件）
+            self._apply_import_mode_lock()
             
             self._set_form_signals_blocked(False)
     
@@ -375,6 +378,8 @@ class AIStoryConfigPanel(AIBasePanelWidget):
 
         current = self.project_manager.current_project.story_config
         
+        mode = self._get_project_mode()
+
         # 创建新的故事配置
         story_config = StoryConfig(
             title=self.title_edit.text().strip(),
@@ -383,11 +388,11 @@ class AIStoryConfigPanel(AIBasePanelWidget):
             text_volume=self.text_volume_spin.value(),
             chapter_count=self.chapter_count_spin.value(),
             cg_count=self.cg_count_spin.value(),
-            enable_choice_node=self.enable_choice_check.isChecked(),
-            enable_condition_node=self.enable_condition_check.isChecked(),
-            enable_multi_branch=self.enable_multi_branch_check.isChecked(),
-            allow_loop_story=self.allow_loop_story_check.isChecked(),
-            enable_single_route=self.enable_single_route_check.isChecked(),
+            enable_choice_node=False if mode == "import" else self.enable_choice_check.isChecked(),
+            enable_condition_node=False if mode == "import" else self.enable_condition_check.isChecked(),
+            enable_multi_branch=False if mode == "import" else self.enable_multi_branch_check.isChecked(),
+            allow_loop_story=False if mode == "import" else self.allow_loop_story_check.isChecked(),
+            enable_single_route=True if mode == "import" else self.enable_single_route_check.isChecked(),
             condition_type=self.condition_type_edit.text().strip(),
             character_hint_weight=self.char_hint_weight_spin.value(),
             step4_word_boost_factor=float(self.step4_word_boost_spin.value()),
@@ -409,6 +414,70 @@ class AIStoryConfigPanel(AIBasePanelWidget):
         
         # 触发修改信号（通知主窗口）
         self.mark_modified()
+
+        # 保存后再同步一次 UI（确保 import 模式下控件状态不被用户误操作带偏）
+        try:
+            self._apply_story_mode_constraints()
+            self._apply_import_mode_lock()
+        except Exception:
+            pass
+
+    def _get_project_mode(self) -> str:
+        project = getattr(self.project_manager, "current_project", None)
+        if not project:
+            return "generate"
+        info = getattr(project, "ai_project_info", None)
+        mode = getattr(info, "project_mode", "generate") if info else "generate"
+        mode = str(mode or "generate").strip().lower()
+        return mode if mode in {"generate", "import"} else "generate"
+
+    def _apply_import_mode_lock(self):
+        """导入模式：强制单线叙事，并禁用多分支/循环/选择/条件相关控件。"""
+        if self._get_project_mode() != "import":
+            return
+
+        # 注意：不要调用 mark_modified（仅 UI 约束），避免刷新时反复触发“未保存”状态。
+        widgets = [
+            self.enable_choice_check,
+            self.enable_condition_check,
+            self.enable_multi_branch_check,
+            self.allow_loop_story_check,
+            self.condition_type_edit,
+        ]
+        for w in widgets:
+            try:
+                w.setEnabled(False)
+            except Exception:
+                pass
+
+        # 单线必须为 True，且锁定不可改
+        try:
+            self.enable_single_route_check.blockSignals(True)
+            self.enable_single_route_check.setChecked(True)
+        finally:
+            self.enable_single_route_check.blockSignals(False)
+        try:
+            self.enable_single_route_check.setEnabled(False)
+        except Exception:
+            pass
+
+        # 其余开关强制回落为 False（并禁用）
+        try:
+            self.enable_multi_branch_check.blockSignals(True)
+            self.enable_multi_branch_check.setChecked(False)
+        finally:
+            self.enable_multi_branch_check.blockSignals(False)
+        try:
+            self.enable_choice_check.blockSignals(True)
+            self.enable_condition_check.blockSignals(True)
+            self.allow_loop_story_check.blockSignals(True)
+            self.enable_choice_check.setChecked(False)
+            self.enable_condition_check.setChecked(False)
+            self.allow_loop_story_check.setChecked(False)
+        finally:
+            self.enable_choice_check.blockSignals(False)
+            self.enable_condition_check.blockSignals(False)
+            self.allow_loop_story_check.blockSignals(False)
 
     def _on_single_route_changed(self, *_):
         enabled = bool(self.enable_single_route_check.isChecked())

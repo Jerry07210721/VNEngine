@@ -5,8 +5,10 @@
 """
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from PyQt6.QtWidgets import (
     QVBoxLayout,
@@ -24,8 +26,13 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QSizePolicy,
     QProgressDialog,
+    QToolButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QElapsedTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QElapsedTimer, QObject
 
 from src.designer.async_elapsed_runner import AsyncElapsedRunner
 
@@ -99,6 +106,21 @@ class AIMasterControlPanel(QWidget):
         # UI 侧缓存：用于判断“是否已保存最新编辑的指令”
         self._saved_instruction_cache: dict[str, str] = {}
         self._saved_step4_instruction_cache: dict[int, str] = {}
+
+        # Step4 批量生成（并行）
+        self._step4_batch_executor: ThreadPoolExecutor | None = None
+        self._step4_batch_running: bool = False
+        self._step4_batch_stop_requested: bool = False
+        self._step4_batch_task_meta: dict[int, dict] = {}
+        self._step4_batch_row_by_idx: dict[int, int] = {}
+        self._step4_batch_total: int = 0
+        self._step4_batch_update_timer = QTimer(self)
+        self._step4_batch_update_timer.setInterval(500)
+        self._step4_batch_update_timer.timeout.connect(self._update_step4_batch_elapsed_cells)
+        self._step4_batch_signals = self._Step4BatchSignals()
+        self._step4_batch_signals.started.connect(self._on_step4_batch_task_started)
+        self._step4_batch_signals.finished.connect(self._on_step4_batch_task_finished)
+        self._step4_batch_signals.failed.connect(self._on_step4_batch_task_failed)
 
         self.init_ui()
         self.refresh()
@@ -264,6 +286,11 @@ class AIMasterControlPanel(QWidget):
 
     # ==================== UI ====================
 
+    class _Step4BatchSignals(QObject):
+        started = pyqtSignal(int)
+        finished = pyqtSignal(int, object, float)
+        failed = pyqtSignal(int, str)
+
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -377,6 +404,9 @@ class AIMasterControlPanel(QWidget):
         selector_row.addWidget(self.step4_max_tokens_label)
         selector_row.addWidget(self.step4_max_tokens_spin)
         step4_layout.addLayout(selector_row)
+
+        # Step4 批量生成控制栏（可折叠）
+        self._build_step4_batch_panel(step4_layout)
 
         step4_splitter = QSplitter(Qt.Orientation.Horizontal)
         step4_splitter.setChildrenCollapsible(False)
@@ -659,6 +689,37 @@ class AIMasterControlPanel(QWidget):
         edit.setMinimumHeight(min_h)
         edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
+    @staticmethod
+    def _set_table_min_rows(table: QTableWidget, min_rows: int) -> None:
+        """按行数设置 QTableWidget 最小高度，提升可读性。"""
+
+        try:
+            min_rows = max(1, int(min_rows))
+        except Exception:
+            min_rows = 8
+
+        try:
+            row_h = int(table.verticalHeader().defaultSectionSize() or 0)
+        except Exception:
+            row_h = 0
+        if row_h <= 0:
+            try:
+                row_h = int(table.fontMetrics().lineSpacing() + 10)
+            except Exception:
+                row_h = 24
+
+        try:
+            header_h = int(table.horizontalHeader().height() or 0)
+        except Exception:
+            header_h = 28
+        if header_h <= 0:
+            header_h = 28
+
+        # 经验值：额外边距 + 横向滚动条余量
+        min_h = int(header_h + row_h * min_rows + 22)
+        table.setMinimumHeight(min_h)
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
     # ==================== 对话上下文拼装（去重追加最新 raw_response） ====================
 
     @staticmethod
@@ -821,6 +882,20 @@ class AIMasterControlPanel(QWidget):
         # 清空 UI 缓存（避免切工程残留）
         self._saved_instruction_cache = {}
         self._saved_step4_instruction_cache = {}
+
+        # step4 batch
+        try:
+            self.stop_step4_batch_generation(silent=True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "step4_batch_table") and self.step4_batch_table:
+                self.step4_batch_table.clearContents()
+                self.step4_batch_table.setRowCount(0)
+            if hasattr(self, "step4_batch_status") and self.step4_batch_status:
+                self.step4_batch_status.setText("批量：未开始")
+        except Exception:
+            pass
 
         # step5
         try:
@@ -1249,6 +1324,12 @@ class AIMasterControlPanel(QWidget):
             self.chapter_selector.addItem("尚未生成章节列表")
         self.chapter_selector.blockSignals(False)
 
+        # 同步刷新批量任务清单
+        try:
+            self._refresh_step4_batch_task_table(preserve_checks=True)
+        except Exception:
+            pass
+
     def on_chapter_changed(self, idx: int):
         self._load_chapter_detail(idx)
 
@@ -1580,6 +1661,10 @@ class AIMasterControlPanel(QWidget):
 
     def compensate_chapter_word_count(self):
         """字数补偿：在当前章节的对话上下文中继续补写 append_scenes。"""
+
+        if getattr(self, "_step4_batch_running", False):
+            QMessageBox.information(self, "提示", "批量生成进行中，请等待完成或先停止批量任务。")
+            return
 
         if not self._ensure_project():
             return
@@ -2116,6 +2201,9 @@ class AIMasterControlPanel(QWidget):
     # ==================== 步骤4：章节详细内容 ====================
 
     def prepare_chapter_detail(self):
+        if getattr(self, "_step4_batch_running", False):
+            QMessageBox.information(self, "提示", "批量生成进行中，请等待完成或先停止批量任务。")
+            return
         if not self._ensure_project():
             return
         if not self._ensure_step_gen():
@@ -2178,6 +2266,9 @@ class AIMasterControlPanel(QWidget):
         self.modified.emit()
 
     def send_chapter_detail(self):
+        if getattr(self, "_step4_batch_running", False):
+            QMessageBox.information(self, "提示", "批量生成进行中，请等待完成或先停止批量任务。")
+            return
         if not self._ensure_project():
             return
         if not self._ensure_step_gen():
@@ -2332,6 +2423,466 @@ class AIMasterControlPanel(QWidget):
             "success",
         )
         self.modified.emit()
+
+    # ==================== Step4：批量生成（并行） ====================
+
+    def _build_step4_batch_panel(self, parent_layout: QVBoxLayout) -> None:
+        header_row = QHBoxLayout()
+
+        self.step4_batch_toggle = QToolButton()
+        self.step4_batch_toggle.setText("批量生成")
+        self.step4_batch_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.step4_batch_toggle.setCheckable(True)
+        self.step4_batch_toggle.setChecked(False)
+        self.step4_batch_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.step4_batch_toggle.toggled.connect(self._toggle_step4_batch_panel)
+        header_row.addWidget(self.step4_batch_toggle)
+
+        self.step4_batch_status = QLabel("批量：未开始")
+        self.step4_batch_status.setProperty("pill", "true")
+        header_row.addWidget(self.step4_batch_status)
+
+        header_row.addStretch(1)
+        parent_layout.addLayout(header_row)
+
+        self.step4_batch_panel = QFrame()
+        self.step4_batch_panel.setProperty("card", "true")
+        self.step4_batch_panel.setVisible(False)
+        panel_layout = QVBoxLayout(self.step4_batch_panel)
+        panel_layout.setContentsMargins(12, 10, 12, 10)
+        panel_layout.setSpacing(8)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("最大并行数："))
+        self.step4_batch_parallel_spin = QSpinBox()
+        self.step4_batch_parallel_spin.setRange(1, 32)
+        self.step4_batch_parallel_spin.setValue(3)
+        self.step4_batch_parallel_spin.setToolTip("批量生成时同时并行的章节数")
+        ctrl_row.addWidget(self.step4_batch_parallel_spin)
+
+        self.step4_batch_refresh_btn = QPushButton("刷新清单")
+        self.step4_batch_refresh_btn.clicked.connect(lambda: self._refresh_step4_batch_task_table(preserve_checks=True))
+        ctrl_row.addWidget(self.step4_batch_refresh_btn)
+
+        self.step4_batch_start_btn = QPushButton("开始批量生成")
+        self.step4_batch_start_btn.clicked.connect(self.start_step4_batch_generation)
+        ctrl_row.addWidget(self.step4_batch_start_btn)
+
+        self.step4_batch_stop_btn = QPushButton("停止批量")
+        self.step4_batch_stop_btn.clicked.connect(self.stop_step4_batch_generation)
+        ctrl_row.addWidget(self.step4_batch_stop_btn)
+
+        ctrl_row.addStretch(1)
+        panel_layout.addLayout(ctrl_row)
+
+        self.step4_batch_table = QTableWidget(0, 3)
+        self.step4_batch_table.setHorizontalHeaderLabels(["章节", "状态", "已耗时(s)"])
+        self.step4_batch_table.verticalHeader().setVisible(False)
+        try:
+            self.step4_batch_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.step4_batch_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            self.step4_batch_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        except Exception:
+            pass
+        self.step4_batch_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.step4_batch_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.step4_batch_table.setWordWrap(False)
+        # 列表高度调大一些：默认至少显示 12 行
+        self._set_table_min_rows(self.step4_batch_table, 12)
+        panel_layout.addWidget(self.step4_batch_table)
+
+        parent_layout.addWidget(self.step4_batch_panel)
+
+        # 初次构建时尝试填充
+        self._refresh_step4_batch_task_table(preserve_checks=False)
+
+    def _toggle_step4_batch_panel(self, expanded: bool) -> None:
+        try:
+            self.step4_batch_panel.setVisible(bool(expanded))
+            self.step4_batch_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        except Exception:
+            return
+
+    def _refresh_step4_batch_task_table(self, *, preserve_checks: bool) -> None:
+        chapters = self._chapter_list()
+        if not isinstance(chapters, list) or not chapters:
+            self._step4_batch_row_by_idx = {}
+            try:
+                self.step4_batch_table.setRowCount(0)
+            except Exception:
+                pass
+            return
+
+        prev_checks: dict[int, bool] = {}
+        if preserve_checks and self._step4_batch_row_by_idx:
+            try:
+                for idx, row in (self._step4_batch_row_by_idx or {}).items():
+                    it = self.step4_batch_table.item(int(row), 0)
+                    if it is not None:
+                        prev_checks[int(idx)] = it.checkState() == Qt.CheckState.Checked
+            except Exception:
+                prev_checks = {}
+
+        self.step4_batch_table.setRowCount(len(chapters))
+        self._step4_batch_row_by_idx = {}
+        for idx, ch in enumerate(chapters):
+            title = ch.get("chapter_title") or ch.get("title") or f"第{idx+1}章"
+
+            first = QTableWidgetItem(f"{idx+1}. {title}")
+            first.setData(Qt.ItemDataRole.UserRole, int(idx))
+            first.setFlags(first.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            first.setCheckState(Qt.CheckState.Checked if prev_checks.get(int(idx), True) else Qt.CheckState.Unchecked)
+
+            status = QTableWidgetItem("待生成")
+            elapsed = QTableWidgetItem("-")
+
+            self.step4_batch_table.setItem(idx, 0, first)
+            self.step4_batch_table.setItem(idx, 1, status)
+            self.step4_batch_table.setItem(idx, 2, elapsed)
+            self._step4_batch_row_by_idx[int(idx)] = int(idx)
+
+        try:
+            self.step4_batch_table.resizeRowsToContents()
+        except Exception:
+            pass
+
+    def _selected_step4_batch_indices(self) -> list[int]:
+        selected: list[int] = []
+        try:
+            for row in range(self.step4_batch_table.rowCount()):
+                it = self.step4_batch_table.item(row, 0)
+                if it is None:
+                    continue
+                if it.checkState() != Qt.CheckState.Checked:
+                    continue
+                idx = it.data(Qt.ItemDataRole.UserRole)
+                try:
+                    selected.append(int(idx))
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        return sorted(set(selected))
+
+    def start_step4_batch_generation(self) -> None:
+        if not self._ensure_project():
+            return
+        if not self._ensure_step_gen():
+            return
+        if self._active_worker:
+            QMessageBox.information(self, "提示", "当前有单章任务进行中，请先等待完成或停止。")
+            return
+        if self._step4_batch_running:
+            QMessageBox.information(self, "提示", "批量生成已在运行中。")
+            return
+
+        self._sync_project_configs()
+
+        chapters_struct = self._chapter_list()
+        if not chapters_struct:
+            QMessageBox.warning(self, "提示", "请先完成步骤3并确保章节列表为结构化JSON。")
+            return
+
+        selected = self._selected_step4_batch_indices()
+        if not selected:
+            QMessageBox.information(self, "提示", "请先在任务清单中勾选要生成的章节。")
+            return
+
+        max_workers = int(self.step4_batch_parallel_spin.value() or 1)
+        if max_workers <= 0:
+            max_workers = 1
+
+        story_cfg = self._story_dict()
+        characters = self._characters_dict()
+        personas = self.personas_data or (self.project_manager.current_project.generation_history.step1_personas if self.project_manager.current_project else None)
+
+        chapters_plan = None
+        try:
+            if isinstance(self.chapters_data, dict):
+                s = self.chapters_data.get("structured")
+                if isinstance(s, dict) and isinstance(s.get("chapters"), list):
+                    chapters_plan = s
+                elif isinstance(s, list):
+                    chapters_plan = {"chapters": s}
+        except Exception:
+            chapters_plan = None
+
+        # 基础对话上下文（与 send_chapter_detail 口径一致）
+        conv_seed: list[dict] = []
+        try:
+            gh = self.project_manager.current_project.generation_history if self.project_manager.current_project else None
+            if gh and isinstance(getattr(gh, "master_conversation_after_step3", None), list) and gh.master_conversation_after_step3:
+                conv_seed = list(gh.master_conversation_after_step3)
+            else:
+                seed: list[dict] = []
+                step1 = getattr(gh, "step1_personas", None) if gh else None
+                raw1 = (step1 or {}).get("raw_response") if isinstance(step1, dict) else None
+                if isinstance(raw1, str) and raw1.strip():
+                    seed.append({"role": "user", "content": "以下是已生成的角色人设，请记住并在后续章节写作中保持一致：\n" + raw1.strip()})
+                step2 = getattr(gh, "step2_outline", None) if gh else None
+                raw2 = (step2 or {}).get("raw_response") if isinstance(step2, dict) else None
+                if isinstance(raw2, str) and raw2.strip():
+                    seed.append({"role": "user", "content": "以下是已生成的故事大纲，请严格对齐：\n" + raw2.strip()})
+                step3 = getattr(gh, "step3_chapters", None) if gh else None
+                raw3 = (step3 or {}).get("raw_response") if isinstance(step3, dict) else None
+                if isinstance(raw3, str) and raw3.strip():
+                    seed.append({"role": "user", "content": "以下是已生成的章节规划/分支计划，请严格遵守：\n" + raw3.strip()})
+                conv_seed = seed
+
+            step1_latest = getattr(gh, "step1_personas", None) if gh else None
+            raw1_latest = (step1_latest or {}).get("raw_response") if isinstance(step1_latest, dict) else None
+            self._append_latest_raw_response_to_conv(conv_seed, raw1_latest, title="人设（用于生成章节详稿）")
+            step2_latest = getattr(gh, "step2_outline", None) if gh else None
+            raw2_latest = (step2_latest or {}).get("raw_response") if isinstance(step2_latest, dict) else None
+            self._append_latest_raw_response_to_conv(conv_seed, raw2_latest, title="大纲（用于生成章节详稿）")
+            step3_latest = getattr(gh, "step3_chapters", None) if gh else None
+            raw3_latest = (step3_latest or {}).get("raw_response") if isinstance(step3_latest, dict) else None
+            self._append_latest_raw_response_to_conv(conv_seed, raw3_latest, title="章节规划/分支计划（用于生成章节详稿）")
+        except Exception:
+            conv_seed = []
+
+        # 为每章准备 instruction/params（params 始终来自 prepare；instruction 优先使用已保存版本）
+        prepared: dict[int, tuple[str, dict]] = {}
+        for idx in selected:
+            if idx < 0 or idx >= len(chapters_struct):
+                continue
+            chapter_info = chapters_struct[idx]
+            prev_context = None
+            if idx > 0:
+                prev = chapters_struct[idx - 1]
+                prev_context = prev.get("summary") or prev.get("chapter_summary")
+
+            instruction_new, params = self.step_generator.prepare_chapter_detail_instruction(
+                idx,
+                chapter_info,
+                prev_context,
+                story_cfg,
+                characters,
+                personas,
+                chapters_plan,
+                use_conversation_context=bool(conv_seed),
+            )
+            params = dict(params or {})
+            params["max_tokens"] = self._get_step_max_tokens("step4")
+
+            saved = self._saved_instruction_for_step4(idx)
+            if not saved:
+                try:
+                    self._set_saved_instruction_for_step4(idx, instruction_new)
+                    self._saved_step4_instruction_cache[idx] = instruction_new
+                except Exception:
+                    pass
+                instruction_use = instruction_new
+            else:
+                instruction_use = saved
+            prepared[int(idx)] = (instruction_use, params)
+
+        if not prepared:
+            QMessageBox.information(self, "提示", "未找到可生成的章节任务。")
+            return
+
+        self._step4_batch_running = True
+        self._step4_batch_stop_requested = False
+        self._step4_batch_total = len(prepared)
+        self._step4_batch_task_meta = {}
+        self.step4_batch_status.setText(f"批量：运行中 0/{self._step4_batch_total}")
+
+        # 标记选中行状态
+        for idx in prepared.keys():
+            row = self._step4_batch_row_by_idx.get(int(idx))
+            if row is None:
+                continue
+            st = self.step4_batch_table.item(row, 1)
+            el = self.step4_batch_table.item(row, 2)
+            if st is not None:
+                st.setText("排队")
+                st.setToolTip("")
+            if el is not None:
+                el.setText("-")
+
+        self._step4_batch_update_timer.start()
+        self._step4_batch_executor = ThreadPoolExecutor(max_workers=max_workers)
+
+        def _submit(chapter_index: int, instruction: str, params: dict):
+            def _task():
+                if self._step4_batch_stop_requested:
+                    raise RuntimeError("batch_stop_requested")
+                self._step4_batch_signals.started.emit(int(chapter_index))
+                start = time.perf_counter()
+                sg = StepGenerator(self.config_manager)
+                res = sg.generate_chapter_detail(instruction, params, conversation=list(conv_seed))
+                elapsed = float(time.perf_counter() - start)
+                return res, elapsed
+
+            def _done(fut):
+                try:
+                    res, elapsed = fut.result()
+                    self._step4_batch_signals.finished.emit(int(chapter_index), res, float(elapsed))
+                except Exception as exc:  # noqa: BLE001
+                    self._step4_batch_signals.failed.emit(int(chapter_index), str(exc))
+
+            future = self._step4_batch_executor.submit(_task)
+            future.add_done_callback(_done)
+
+        for idx, (instruction, params) in prepared.items():
+            _submit(int(idx), instruction, dict(params))
+
+    def stop_step4_batch_generation(self, *, silent: bool = False) -> None:
+        if not self._step4_batch_running:
+            if not silent:
+                QMessageBox.information(self, "提示", "批量生成未在运行。")
+            return
+
+        if not silent:
+            confirm = QMessageBox.question(
+                self,
+                "确认停止批量",
+                "将停止继续排队新章节（已开始的章节可能仍会继续运行至结束）。\n确定要停止吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        self._step4_batch_stop_requested = True
+        try:
+            self.step4_batch_status.setText("批量：停止中")
+        except Exception:
+            pass
+        try:
+            if self._step4_batch_executor is not None:
+                try:
+                    self._step4_batch_executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    self._step4_batch_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        self._step4_batch_executor = None
+        self._step4_batch_running = False
+        try:
+            self._step4_batch_update_timer.stop()
+        except Exception:
+            pass
+
+    def _on_step4_batch_task_started(self, chapter_index: int) -> None:
+        idx = int(chapter_index)
+        self._step4_batch_task_meta[idx] = {
+            "status": "running",
+            "started_at": time.perf_counter(),
+            "elapsed": 0.0,
+        }
+        row = self._step4_batch_row_by_idx.get(idx)
+        if row is None:
+            return
+        st = self.step4_batch_table.item(row, 1)
+        el = self.step4_batch_table.item(row, 2)
+        if st is not None:
+            st.setText("生成中")
+            st.setToolTip("")
+        if el is not None:
+            el.setText("0.0")
+
+    def _on_step4_batch_task_finished(self, chapter_index: int, detail_obj: object, elapsed: float) -> None:
+        idx = int(chapter_index)
+        try:
+            if self.step_generator and isinstance(detail_obj, dict):
+                detail_obj = self.step_generator._normalize_chapter_detail(detail_obj)
+        except Exception:
+            pass
+
+        try:
+            while len(self.chapter_details) <= idx:
+                self.chapter_details.append({})
+            if isinstance(detail_obj, dict):
+                self.chapter_details[idx] = detail_obj
+            self.project_manager.update_generation_step("step4_chapter_details", self.chapter_details)
+        except Exception:
+            pass
+
+        try:
+            if isinstance(detail_obj, dict):
+                conv = detail_obj.get("conversation")
+                if isinstance(conv, list):
+                    gh = self.project_manager.current_project.generation_history if self.project_manager.current_project else None
+                    step4_convs = dict(getattr(gh, "step4_conversations", {}) or {}) if gh else {}
+                    step4_convs[str(idx)] = conv
+                    self.project_manager.update_generation_history_field("step4_conversations", step4_convs)
+        except Exception:
+            pass
+
+        meta = self._step4_batch_task_meta.get(idx) or {}
+        meta["status"] = "success"
+        meta["elapsed"] = float(elapsed or 0.0)
+        self._step4_batch_task_meta[idx] = meta
+
+        row = self._step4_batch_row_by_idx.get(idx)
+        if row is not None:
+            st = self.step4_batch_table.item(row, 1)
+            el = self.step4_batch_table.item(row, 2)
+            if st is not None:
+                st.setText("完成")
+            if el is not None:
+                el.setText(f"{float(elapsed):.1f}")
+
+        self._update_step4_batch_overall_status()
+        self.modified.emit()
+
+    def _on_step4_batch_task_failed(self, chapter_index: int, message: str) -> None:
+        idx = int(chapter_index)
+        meta = self._step4_batch_task_meta.get(idx) or {}
+        meta["status"] = "failed"
+        self._step4_batch_task_meta[idx] = meta
+
+        row = self._step4_batch_row_by_idx.get(idx)
+        if row is not None:
+            st = self.step4_batch_table.item(row, 1)
+            if st is not None:
+                st.setText("失败")
+                st.setToolTip(message or "")
+
+        self._update_step4_batch_overall_status()
+
+    def _update_step4_batch_overall_status(self) -> None:
+        total = int(self._step4_batch_total or 0)
+        done = sum(1 for v in (self._step4_batch_task_meta or {}).values() if v.get("status") in {"success", "failed"})
+        running = sum(1 for v in (self._step4_batch_task_meta or {}).values() if v.get("status") == "running")
+        if self._step4_batch_stop_requested and not self._step4_batch_running:
+            self.step4_batch_status.setText(f"批量：已停止 {done}/{total}")
+            return
+        if total > 0 and done >= total and running == 0:
+            self._step4_batch_running = False
+            try:
+                self._step4_batch_update_timer.stop()
+            except Exception:
+                pass
+            try:
+                if self._step4_batch_executor is not None:
+                    self._step4_batch_executor.shutdown(wait=False, cancel_futures=False)
+            except Exception:
+                pass
+            self._step4_batch_executor = None
+            self.step4_batch_status.setText(f"批量：完成 {done}/{total}")
+        else:
+            self.step4_batch_status.setText(f"批量：运行中 {done}/{total}")
+
+    def _update_step4_batch_elapsed_cells(self) -> None:
+        if not self._step4_batch_task_meta:
+            return
+        now = time.perf_counter()
+        for idx, meta in (self._step4_batch_task_meta or {}).items():
+            if meta.get("status") != "running":
+                continue
+            start = meta.get("started_at")
+            if not isinstance(start, (int, float)):
+                continue
+            elapsed = max(0.0, float(now - float(start)))
+            meta["elapsed"] = elapsed
+            row = self._step4_batch_row_by_idx.get(int(idx))
+            if row is None:
+                continue
+            el = self.step4_batch_table.item(row, 2)
+            if el is not None:
+                el.setText(f"{elapsed:.1f}")
 
     # ==================== 步骤5：待生成列表 ====================
 

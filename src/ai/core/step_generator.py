@@ -1356,6 +1356,307 @@ branch_plan 字段（分支计划）规则（非常重要，必须严格遵守�
             plan_structured["warnings"] = warnings_list
     
     # ==================== 步骤4：生成章节详细内容 ====================
+
+    # ==================== 导入模式：章节全文 -> Step4 结构化报文 ====================
+
+    def prepare_import_chapter_convert_instruction(
+        self,
+        *,
+        chapter_index: int,
+        chapter_info: Dict[str, Any],
+        story_config: Optional[Dict[str, Any]] = None,
+        character_config: Optional[List[Dict[str, Any]]] = None,
+        chapters_plan: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """导入模式 Step3：把“每章完整剧情文本”转换为 Step4 章节报文（JSON）。
+
+        目标：
+        - 输出结构必须兼容现有 Step4 schema（scenes + directives + dialogues + exit）。
+        - 强制单线叙事：禁止 choice/condition；exit 只能是 linear 或 end。
+        """
+
+        story_cfg = story_config or {}
+        chars = character_config or []
+
+        chapter_id = str(
+            chapter_info.get("chapter_id")
+            or chapter_info.get("id")
+            or str(chapter_index + 1)
+        ).strip()
+        chapter_title = str(chapter_info.get("title") or f"第{chapter_index + 1}章").strip()
+        chapter_text = str(chapter_info.get("chapter_text") or "")
+
+        # import 模式强制单线；exit 由系统按章节顺序决定
+        next_chapter_id = ""
+        is_last = False
+        try:
+            if isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list):
+                chs = [c for c in (chapters_plan.get("chapters") or []) if isinstance(c, dict)]
+                ids = [str(c.get("chapter_id") or "").strip() for c in chs]
+                ids = [x for x in ids if x]
+                if chapter_id in ids:
+                    pos = ids.index(chapter_id)
+                    if pos >= len(ids) - 1:
+                        is_last = True
+                    else:
+                        next_chapter_id = ids[pos + 1]
+        except Exception:
+            next_chapter_id = ""
+
+        pov = (story_cfg.get("narrative_pov") or "third").strip().lower()
+        fp_name = story_cfg.get("first_person_name") or "我"
+
+        # Step4：为“非第一人称角色对白 tts_ext 必填”准备可判定集合
+        character_speakers = set()
+        first_person_speakers = set()
+        speaker_to_char_id: Dict[str, str] = {}
+        try:
+            for c in chars:
+                cid = (c.get("char_id") or c.get("id") or "").strip()
+                name = (c.get("char_name") or c.get("name") or "").strip()
+                if name:
+                    character_speakers.add(name)
+                    if cid:
+                        speaker_to_char_id[name] = cid
+                if bool(c.get("is_first_person", False)) and name:
+                    first_person_speakers.add(name)
+                if pov == "first" and bool(c.get("is_player", False)) and name:
+                    first_person_speakers.add(name)
+        except Exception:
+            character_speakers = set()
+            first_person_speakers = set()
+            speaker_to_char_id = {}
+        if pov == "first" and fp_name:
+            first_person_speakers.add(fp_name)
+
+        char_lines = []
+        for c in chars:
+            name = c.get("char_name") or c.get("name") or ""
+            cid = c.get("char_id") or c.get("id") or ""
+            role = c.get("role") or ""
+            kw = (c.get("persona_keywords") or "").strip() if isinstance(c, dict) else ""
+            vt = (c.get("voice_tone") or "").strip() if isinstance(c, dict) else ""
+            extras = []
+            if kw:
+                extras.append(f"关键词:{kw}")
+            if vt:
+                extras.append(f"音色:{vt}")
+            extra_text = (" | " + " | ".join(extras)) if extras else ""
+            if name or cid:
+                char_lines.append(f"- {name} ({cid}) {role}{extra_text}".strip())
+        char_block = "\n".join(char_lines) if char_lines else "(未提供角色列表)"
+
+        exit_hint = (
+            f"exit.type=end（最后一章）" if is_last else f"exit.type=linear 且 next_chapter_id={next_chapter_id}"
+        )
+
+        instruction = f"""你正在把“已写好的完整章节剧情文本”转换成 VNEngine 可执行的章节 JSON 报文。
+
+【输出契约（必须遵守，否则视为失败）】
+1) 仅输出 **一个 JSON 对象**（不要输出解释文字）。建议放在 ```json 代码块中。
+2) 字段名必须与下方 Schema 一致；未用字段可省略，但不要随意改名。
+3) chapter_id 必须等于输入的 chapter_id；不得改写。
+4) 本工程为“导入模式”，强制单线叙事：
+   - scenes 只能使用 type=text（禁止 choice/condition）。
+   - 章节出口 exit 只能是 linear 或 end，且必须满足：{exit_hint}。
+   - 禁止任何跨章节跳转写在 scenes/options/condition 里；跨章节仅由顶层 exit 表达。
+
+【输入（只读）】
+chapter_id: {chapter_id}
+chapter_title: {chapter_title}
+
+【故事设定（只读；用于保持风格一致）】
+story_title: {str(story_cfg.get('title') or '').strip()}
+story_style: {str(story_cfg.get('style') or '').strip()}
+plot_outline: {str(story_cfg.get('plot_outline') or '').strip()}
+narrative_pov: {pov}
+first_person_name: {fp_name if pov == 'first' else ''}
+
+【角色列表（只读；对白 speaker 必须取自此列表；旁白/叙述除外）】
+{char_block}
+
+【本章完整剧情文本（只读；请保持剧情不走样，仅做结构化标注与适度分镜）】
+```text
+{chapter_text}
+```
+
+【媒体标注硬约束】
+- 若在 directives 设置/切换 background/cg/bgm，必须同时提供对应的 *_desc 字段。
+- 若设置/切换 bgm，必须填写 bgm_tags（英文短词逗号分隔，至少10个，建议10~16个；尽量覆盖情绪/曲风/乐器/节奏/空间感，如 'ambient, cinematic, melancholic, piano, strings, slow, soft, warm, airy, reverb, instrumental, loop'）。
+- 所有 voice/bgm 若填写，必须以 .mp3 结尾（也可省略 voice，让系统生成虚拟路径）。
+
+【对白字段硬约束】
+- 对于“非第一人称角色”的对白：dialogues[].emotion 必填；dialogues[].portrait 必填；dialogues[].tts_ext 必填。
+- 旁白/叙述（不在角色列表中的 speaker）不要求 tts_ext。
+
+输出 JSON Schema（字段名必须遵守；未用字段可为空/省略）：
+{{
+  "chapter_id": "string",
+  "chapter_title": "string",
+  "route": "common",
+  "summary": "string (可选：本章简短摘要)",
+  "word_target": "int (可选)",
+  "scenes": [
+    {{
+      "type": "text",
+      "title": "string (可选)",
+      "directives": {{
+        "background": "bg_id_or_path (可选)",
+        "background_desc": "string (当设置/切换 background 时必填)",
+        "cg": "cg_id_or_path (可选)",
+        "cg_desc": "string (当设置/切换 cg 时必填)",
+        "bgm": "bgm_id_or_path (可选)",
+        "bgm_desc": "string (当设置/切换 bgm 时必填)",
+        "bgm_tags": "string (当设置/切换 bgm 时必填)",
+        "stop_bgm": false,
+        "ui_file": "ui_id_or_path (可选)",
+        "video": "video_id_or_path (可选)",
+        "hide_textbox": false
+      }},
+      "dialogues": [
+        {{
+          "speaker": "角色名或旁白",
+          "text": "对白/旁白",
+          "emotion": "happy/angry/sad/afraid/disgusted/melancholic/surprised/calm",
+          "tts_ext": {{"happy": 0, "angry": 0, "sad": 0, "afraid": 0, "disgusted": 0, "melancholic": 0, "surprised": 0, "calm": 1}},
+          "portrait": "resources/portraits/{{char_id}}_stand_neutral.png",
+          "voice": "resources/voices/... .mp3 (可选)"
+        }}
+      ]
+    }}
+  ],
+  "exit": {{
+    "type": "linear|end",
+    "next_chapter_id": "string (当 type=linear 必填)"
+  }}
+}}
+
+注意：为保证 JSON 可解析，在任何字符串字段里不要使用英文双引号(\")；如需引用请使用中文引号「」或『』。
+"""
+
+        parameters = {
+            "chapter_index": chapter_index,
+            "chapter_title": chapter_title,
+            "chapter_id": chapter_id,
+            "import_mode": True,
+            "force_single_route": True,
+            "force_exit_type": "end" if is_last else "linear",
+            "force_next_chapter_id": next_chapter_id,
+            "narrative_pov": pov,
+            "first_person_name": fp_name,
+            "first_person_speakers": sorted(first_person_speakers),
+            "character_speakers": sorted(character_speakers),
+            "speaker_to_char_id": speaker_to_char_id,
+            "enforce_tts_ext_for_non_first_person": True,
+            "enforce_emotion_portrait_for_non_first_person": True,
+            "enforce_audio_mp3": True,
+            "enforce_cn_char_count": False,
+            "has_chapters_plan": bool(isinstance(chapters_plan, dict) and isinstance(chapters_plan.get("chapters"), list)),
+            "chapters_plan": chapters_plan if isinstance(chapters_plan, dict) else None,
+        }
+        return instruction, parameters
+
+    def generate_import_chapter_structured_from_instruction(
+        self,
+        instruction: str,
+        parameters: Dict[str, Any],
+        *,
+        temperature: float = 0.2,
+    ) -> Dict[str, Any]:
+        """导入模式 Step3 执行：把指令发送给 LLM 并返回结构化章节报文。"""
+
+        chapter_index = int((parameters or {}).get("chapter_index") or 0)
+        self.logger.info(f"开始导入转换第{chapter_index + 1}章结构化报文")
+
+        max_tokens = self._resolve_max_tokens(
+            parameters,
+            step_key="step4",
+            default=int(self.DEFAULT_STEP_MAX_TOKENS.get("step4", 64000)),
+        )
+
+        text, structured = self._call_llm(
+            instruction,
+            system=self.STEP4_SYSTEM_PROMPT,
+            max_tokens=max_tokens,
+            temperature=float(temperature),
+        )
+
+        detail: Dict[str, Any] = {
+            "chapter_index": chapter_index,
+            "raw_response": text,
+            "structured": structured,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "parameters": dict(parameters or {}),
+        }
+
+        def _sanitize_import_payload(obj: Any) -> Any:
+            if not isinstance(obj, dict):
+                return obj
+
+            # 强制 chapter_id
+            cid = str((parameters or {}).get("chapter_id") or obj.get("chapter_id") or "").strip()
+            if cid:
+                obj["chapter_id"] = cid
+
+            # 强制单线：scenes 只允许 text
+            scenes = obj.get("scenes")
+            if isinstance(scenes, list):
+                for sc in scenes:
+                    if not isinstance(sc, dict):
+                        continue
+                    st = str(sc.get("type") or "text").strip().lower()
+                    if st != "text":
+                        sc["type"] = "text"
+                        sc.pop("options", None)
+                        sc.pop("condition", None)
+                        self._structured_append_warning(
+                            obj,
+                            {
+                                "type": "import_forced_text_scene",
+                                "message": "导入模式强制单线叙事：已将非 text 的 scene 降级为 text 并移除 options/condition。",
+                            },
+                        )
+
+            # 强制 exit
+            force_type = str((parameters or {}).get("force_exit_type") or "").strip().lower()
+            nxt = str((parameters or {}).get("force_next_chapter_id") or "").strip()
+            if force_type == "end":
+                obj["exit"] = {"type": "end"}
+            else:
+                exit_obj: Dict[str, Any] = {"type": "linear"}
+                if nxt:
+                    exit_obj["next_chapter_id"] = nxt
+                obj["exit"] = exit_obj
+            return obj
+
+        try:
+            detail["structured"] = _sanitize_import_payload(detail.get("structured"))
+        except Exception:
+            pass
+
+        # 归一化：确保 voice/bgm 为 mp3
+        try:
+            detail["structured"] = self._normalize_audio_paths_mp3_in_chapter_struct(detail.get("structured"))
+        except Exception:
+            pass
+
+        # 归一化：确保非第一人称角色对白具备 tts_ext/emotion/portrait（缺失则自动补齐；不中断）
+        try:
+            detail["structured"] = self._ensure_tts_ext_for_non_first_person_dialogues(
+                detail.get("structured"),
+                parameters,
+            )
+        except Exception:
+            pass
+
+        # 清理附属节点（虽然导入模式不应出现 choice/condition，但做一次温和处理）
+        try:
+            detail["structured"] = self._validate_and_sanitize_step4_exit_and_nodes(detail.get("structured"), parameters)
+        except Exception:
+            pass
+
+        self.logger.info(f"导入转换第{chapter_index + 1}章完成")
+        return detail
     
     def prepare_chapter_detail_instruction(
         self,
@@ -1776,7 +2077,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
 
                 "bgm": "bgm_id_or_path (可选，例 bgm_01 或 resources/audios/bgm_01.mp3)",
                 "bgm_desc": "string (当设置/切换 bgm 时必填：BGM 详细描述)",
-                "bgm_tags": "string (当设置/切换 bgm 时必填：Suno 纯音乐 tags；英文短词逗号分隔，3~8个，如 'ambient, cinematic, piano, strings, slow, instrumental')",
+                "bgm_tags": "string (当设置/切换 bgm 时必填：Suno 纯音乐 tags；英文短词逗号分隔，至少10个，建议10~16个；尽量覆盖情绪/曲风/乐器/节奏/空间感，如 'ambient, cinematic, melancholic, piano, strings, slow, soft, warm, airy, reverb, instrumental, loop')",
                 "mood": "string (可选：BGM 情绪关键词，如'紧张、温柔')",
                 "style": "string (可选：BGM 曲风/乐器关键词，如'钢琴、弦乐')",
                 "stop_bgm": false,
@@ -3262,7 +3563,7 @@ Step3 章节规划（只读，必须严格对齐，不要擅自改动/偏离）�
                     continue
                 seen.add(key)
                 uniq.append(p)
-            return ", ".join(uniq[:12])
+            return ", ".join(uniq[:16])
 
         def _pick_tags_from_media_field(media_val: Any) -> str:
             if isinstance(media_val, dict):
